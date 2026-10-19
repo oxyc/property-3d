@@ -29,6 +29,6 @@ uv run python fuse.py walks/<walk> out/<walk> --poses out/<walk>/poses.npz
 uv run python closure.py walks/<walk> out/<walk>/poses.npz   # start-vs-end error, for walks that start and end on a marked spot
 ```
 
-`optimize.py` splits the walk into ~100-frame fragments, finds loop closures by yaw-only ICP between fragments whose paths revisit each other, and prunes bad ones in an Open3D pose graph. `synth.py --drift --frames 440` makes a two-loop walk with accumulating drift for testing.
+`optimize.py` first removes ARKit relocalization snaps (single-frame jumps > 3 m/s): post-snap poses are trusted and the offset is ramped back over the frames since the previous snap. It then splits the walk into ~100-frame fragments, finds loop closures by yaw-only ICP between fragments whose paths revisit each other, and prunes bad ones in an Open3D pose graph. `synth.py --drift --frames 440` makes a two-loop walk with accumulating drift for testing.
 
 `georef_points.ply` stores coordinates minus `offset` from `georef.json`; add it back to get EPSG:5382.
