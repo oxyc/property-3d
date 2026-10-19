@@ -8,6 +8,7 @@ default; SketchUp Free imports only the .stl files (choose metres), paid plans t
 Reads points.ply, mesh.ply and ground.npz from out_dir (fuse.py output) and writes out_dir/sketchup/:
   terrain.dae + terrain.png  COLLADA terrain from the ground grid, textured with a top-down orthophoto
   scene.dae                  TSDF mesh decimated to --max-faces, one plain material
+  terrain.kmz                terrain.dae + terrain.png in one file (texture survives single-file upload), geolocated
   terrain.stl, scene.stl     the same geometry without texture, for SketchUp plans that don't import DAE
   points.las                 LAS 1.4 with RGB, for Scan Essentials
 
@@ -16,9 +17,11 @@ x = east, y = north (= -Z), z = up, in metres (<unit meter="1">). The origin sta
 so the files line up with each other.
 """
 import argparse
+import json
 import time
 import warnings
 import xml.etree.ElementTree as ET
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,6 +29,7 @@ import laspy
 import numpy as np
 import open3d as o3d
 from PIL import Image
+from pyproj import Transformer
 from scipy import ndimage
 
 TERRAIN_MAX_FACES = 100_000
@@ -266,6 +270,25 @@ def write_las(path, pts, cols):
     las.write(str(path))
 
 
+def write_kmz(path, dae, texture, georef):
+    """KMZ = zip of doc.kml + the DAE + its texture, so the texture travels with the model (SketchUp
+    for Web uploads a single file). Placed at the walk start's lat/lon when georef.json exists.
+    DAE axes (x east, y north, z up) are KML model axes, so heading 0."""
+    lon = lat = 0.0
+    if georef.exists():
+        g = json.loads(georef.read_text())
+        lon, lat = Transformer.from_crs(g["crs"], "EPSG:4326", always_xy=True).transform(g["E0"], g["N0"])
+    kml = ('<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark>'
+           f'<name>{dae.stem}</name><Model><altitudeMode>relativeToGround</altitudeMode>'
+           f'<Location><longitude>{lon:.8f}</longitude><latitude>{lat:.8f}</latitude><altitude>0</altitude></Location>'
+           '<Orientation><heading>0</heading><tilt>0</tilt><roll>0</roll></Orientation><Scale><x>1</x><y>1</y><z>1</z></Scale>'
+           f'<Link><href>models/{dae.name}</href></Link></Model></Placemark></kml>\n')
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("doc.kml", kml)
+        z.write(dae, f"models/{dae.name}")
+        z.write(texture, f"models/{texture.name}")  # DAE references it relatively
+
+
 def write_stl(path, verts, tris):
     """Binary STL in metres (STL has no unit field: pick metres when importing)."""
     mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris))
@@ -287,6 +310,7 @@ def export(out, terrain_cell=0.1, max_faces=150_000):
     Image.fromarray(orthophoto(pts, cols, west, north, a.shape[1] * cell, a.shape[0] * cell)).save(dst / "terrain.png")
     write_dae(dst / "terrain.dae", "terrain", verts, tris, uvs, "terrain.png")
     write_stl(dst / "terrain.stl", verts, tris)
+    write_kmz(dst / "terrain.kmz", dst / "terrain.dae", dst / "terrain.png", out / "georef.json")
     print(f"terrain: {len(tris)} faces, {len(verts)} vertices, {cell:.3f} m cells, {a.shape[1] * cell:.0f} x {a.shape[0] * cell:.0f} m")
 
     sv, st = scene_mesh(out / "mesh.ply", max_faces)
