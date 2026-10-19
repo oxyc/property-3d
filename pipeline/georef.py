@@ -32,7 +32,8 @@ from rasterio.transform import from_origin
 CRS = "EPSG:5382"
 
 
-def fit_translation(walk, poses=None):
+def gps_offsets(walk, poses=None):
+    """Per GPS fix: (E - X, N + Z, alt - Y, h_acc, v_acc) with the ARKit position X, Y, Z interpolated to the fix."""
     walk = Path(walk)
     frames = [json.loads(l) for l in (walk / "frames.jsonl").read_text().splitlines() if l]
     ft = np.array([f["t"] for f in frames])
@@ -46,14 +47,21 @@ def fit_translation(walk, poses=None):
     e, n = to_en.transform([g["lon"] for g in gps], [g["lat"] for g in gps])
     gt = np.array([g["t"] for g in gps])
     arkit = np.stack([np.interp(gt, ft, xyz[:, k]) for k in range(3)], 1)
+    return np.stack([e - arkit[:, 0], n - (-arkit[:, 2]), np.array([g["alt"] for g in gps]) - arkit[:, 1],
+                     [g["h_acc"] for g in gps], [g["v_acc"] for g in gps]], 1)
 
-    w = 1 / np.array([g["h_acc"] for g in gps]) ** 2
-    dE, dN = e - arkit[:, 0], n - (-arkit[:, 2])
+
+def fit_translation(walk, poses=None):
+    """walk/poses may be lists (one entry each, all poses in one world frame): their fixes are fitted together."""
+    walks = walk if isinstance(walk, (list, tuple)) else [walk]
+    poses = poses if isinstance(poses, (list, tuple)) else [poses] * len(walks)
+    off = np.vstack([gps_offsets(w, p) for w, p in zip(walks, poses)])
+    dE, dN, dAlt, h_acc, v_acc = off.T
+    w = 1 / h_acc**2
     E0, N0 = np.average(dE, weights=w), np.average(dN, weights=w)
-    wv = 1 / np.array([g["v_acc"] for g in gps]) ** 2
-    dz = np.average(np.array([g["alt"] for g in gps]) - arkit[:, 1], weights=wv)
+    dz = np.average(dAlt, weights=1 / v_acc**2)
     res = np.hypot(dE - E0, dN - N0)
-    return E0, N0, dz, len(gps), float(np.sqrt(np.average(res**2, weights=w)))
+    return E0, N0, dz, len(off), float(np.sqrt(np.average(res**2, weights=w)))
 
 
 def georef(out, walk, poses=None):

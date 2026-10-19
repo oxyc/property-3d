@@ -73,24 +73,26 @@ def project_into_keyframe(pts, kf, kf_img, kf_depth, kf_conf, meta):
     return ok, z, col
 
 
-def colour_points(pcd, walk, meta, kfs):
+def colour_points(pcd, sources):
     """Colour each final point from the keyframe that saw it closest and unoccluded.
-    Done after downsampling so grey fallbacks never get averaged into real colours."""
+    Done after downsampling so grey fallbacks never get averaged into real colours.
+    sources: [(walk, meta, keyframes)], one per walk."""
     pts = np.asarray(pcd.points)
     cols = np.full((len(pts), 3), 0.5)
     best = np.full(len(pts), np.inf)
     tree = o3d.geometry.KDTreeFlann(pcd)
-    for kf in kfs:
-        _, idx, _ = tree.search_radius_vector_3d(kf["T"][:3, 3], MAX_DEPTH)
-        idx = np.asarray(idx)
-        if len(idx) == 0:
-            continue
-        kd, kc = read_depth(walk, meta, kf["i"])
-        img = np.asarray(Image.open(walk / "rgb" / f"{kf['i']:06d}.jpg").convert("RGB"))
-        ok, z, col = project_into_keyframe(pts[idx], kf, img, kd, kc, meta)
-        better = ok & (z < best[idx])
-        best[idx[better]] = z[better]
-        cols[idx[better]] = col[better]
+    for walk, meta, kfs in sources:
+        for kf in kfs:
+            _, idx, _ = tree.search_radius_vector_3d(kf["T"][:3, 3], MAX_DEPTH)
+            idx = np.asarray(idx)
+            if len(idx) == 0:
+                continue
+            kd, kc = read_depth(walk, meta, kf["i"])
+            img = np.asarray(Image.open(walk / "rgb" / f"{kf['i']:06d}.jpg").convert("RGB"))
+            ok, z, col = project_into_keyframe(pts[idx], kf, img, kd, kc, meta)
+            better = ok & (z < best[idx])
+            best[idx[better]] = z[better]
+            cols[idx[better]] = col[better]
     pcd.colors = o3d.utility.Vector3dVector(cols)
     return np.isfinite(best).mean()
 
@@ -129,46 +131,54 @@ def save_preview(height, path):
 
 def fuse(walk, out, voxel=0.02, poses=None):
     """poses: optional poses.npz from optimize.py; its transforms replace the recorded ones."""
-    walk, out = Path(walk), Path(out)
-    out.mkdir(parents=True, exist_ok=True)
-    meta, frames = read_walk(walk)
-    if poses is not None:
-        z = np.load(poses)
-        corrected = dict(zip(z["i"].tolist(), z["T"]))
-        for f in frames:
-            f["T"] = corrected[f["i"]]
-    kfs = [f for f in frames if f["rgb"]]
+    fuse_many([(walk, poses)], out, voxel)
 
-    dw, dh = meta["depth_w"], meta["depth_h"]
-    sx, sy = dw / meta["rgb_w"], dh / meta["rgb_h"]
+
+def fuse_many(walks, out, voxel=0.02):
+    """walks: [(walk_dir, poses.npz or None)], all in one common world frame through their poses.
+    Frame indices only need to be unique within a walk."""
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
     tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
         TSDF_VOXEL, 4 * TSDF_VOXEL, o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
-    dummy_rgb = o3d.geometry.Image(np.zeros((dh, dw, 3), np.uint8))
-
     acc = o3d.geometry.PointCloud()
-    pend = []
-    for n, f in enumerate(frames):
-        if f["tracking"] != "normal":
-            continue
-        depth, conf = read_depth(walk, meta, f["i"])
-        pend.append(unproject(depth, conf, f, meta))
-        if len(pend) == CHUNK or n == len(frames) - 1:
+    sources = []
+    for walk, poses in walks:
+        walk = Path(walk)
+        meta, frames = read_walk(walk)
+        if poses is not None:
+            z = np.load(poses)
+            corrected = dict(zip(z["i"].tolist(), z["T"]))
+            for f in frames:
+                f["T"] = corrected[f["i"]]
+        sources.append((walk, meta, [f for f in frames if f["rgb"]]))
+
+        dw, dh = meta["depth_w"], meta["depth_h"]
+        sx, sy = dw / meta["rgb_w"], dh / meta["rgb_h"]
+        dummy_rgb = o3d.geometry.Image(np.zeros((dh, dw, 3), np.uint8))
+        pend = []
+        for n, f in enumerate(frames):
+            if f["tracking"] != "normal":
+                continue
+            depth, conf = read_depth(walk, meta, f["i"])
+            pend.append(unproject(depth, conf, f, meta))
+            if len(pend) == CHUNK or n == len(frames) - 1:
+                acc = (acc + to_cloud(np.vstack(pend))).voxel_down_sample(voxel)
+                pend = []
+
+            fx, fy, cx, cy = f["intrinsics"]
+            masked = np.where((conf >= 1) & (depth >= MIN_DEPTH), depth, 0).astype(np.float32)
+            rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
+                dummy_rgb, o3d.geometry.Image(masked), depth_scale=1.0, depth_trunc=MAX_DEPTH,
+                convert_rgb_to_intensity=False)
+            intr = o3d.camera.PinholeCameraIntrinsic(dw, dh, fx * sx, fy * sy, cx * sx, cy * sy)
+            tsdf.integrate(rgbd, intr, tsdf_extrinsic(f["T"]))
+
+        if pend:  # tracking-skipped tail
             acc = (acc + to_cloud(np.vstack(pend))).voxel_down_sample(voxel)
-            pend = []
-
-        fx, fy, cx, cy = f["intrinsics"]
-        masked = np.where((conf >= 1) & (depth >= MIN_DEPTH), depth, 0).astype(np.float32)
-        rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            dummy_rgb, o3d.geometry.Image(masked), depth_scale=1.0, depth_trunc=MAX_DEPTH,
-            convert_rgb_to_intensity=False)
-        intr = o3d.camera.PinholeCameraIntrinsic(dw, dh, fx * sx, fy * sy, cx * sx, cy * sy)
-        tsdf.integrate(rgbd, intr, tsdf_extrinsic(f["T"]))
-
-    if pend:  # tracking-skipped tail
-        acc = (acc + to_cloud(np.vstack(pend))).voxel_down_sample(voxel)
     n_before = len(acc.points)
     acc, _ = acc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
-    coloured = colour_points(acc, walk, meta, kfs)
+    coloured = colour_points(acc, sources)
     o3d.io.write_point_cloud(str(out / "points.ply"), acc)
 
     mesh = tsdf.extract_triangle_mesh()
