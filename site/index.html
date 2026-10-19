@@ -52,6 +52,13 @@
   #loader .bar i { display: block; height: 100%; width: 0; background: #5aa2ff; }
   #loader.err { background: #5a1f1f; }
   #toast { bottom: 40px; pointer-events: none; transition: opacity .3s; }
+  #pad { grid-template-columns: auto repeat(4, 34px); align-items: center; gap: 4px; padding: 6px; }
+  #pad .pl { font-size: 11px; color: var(--muted); padding-right: 4px; }
+  #pad button { padding: 6px 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #pad .wide { grid-column: span 2; }
+  #pad, #side .tb { display: grid; }
+  .pivot { position: absolute; left: 0; top: 0; width: 16px; height: 16px; border: 2px solid #fff; border-radius: 50%; box-shadow: 0 0 0 2px rgba(0,0,0,.5); pointer-events: none; animation: fade .9s forwards; }
+  @keyframes fade { to { opacity: 0; } }
   [hidden] { display: none !important; }
   #drop, #help { position: absolute; inset: 0; align-items: center; justify-content: center; }
   #drop { display: none; font-size: 20px; color: #fff; background: rgba(40,90,160,.45); pointer-events: none; }
@@ -81,6 +88,7 @@
     <div class="row">Colour <div class="seg" id="colors"></div></div>
     <label>Point size <input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
     <label><input id="edl" type="checkbox" checked> Depth shading (eye-dome)</label>
+    <label><input id="trackpad" type="checkbox"> Trackpad gestures (off = mouse wheel zooms)</label>
     <label id="meshRow" hidden><input id="mesh" type="checkbox"> Show mesh</label>
     <label class="btn" style="justify-content:center">Open .ply file…<input id="file" type="file" accept=".ply" hidden></label>
     <p class="hint">Drop a .ply file on the page to view it locally — nothing is uploaded.</p>
@@ -97,7 +105,13 @@
     <button id="bFit" title="Fit to model (F)">Fit</button>
     <button id="bMeasure" title="Measure distances (M)" aria-pressed="false">Ruler</button>
     <button id="bClear" title="Clear measurements (Esc)">Clear</button>
-    <button id="bHelp" title="Keyboard shortcuts (?)">?</button>
+    <button id="bNav" title="On-screen navigation buttons" aria-pressed="true">Nav</button>
+    <button id="bHelp" title="Gestures and shortcuts (?)">?</button>
+  </div>
+  <div id="pad" class="card">
+    <span class="pl">Orbit</span><button data-s="ol" aria-label="Orbit left">◀</button><button data-s="ou" aria-label="Orbit up">▲</button><button data-s="od" aria-label="Orbit down">▼</button><button data-s="or" aria-label="Orbit right">▶</button>
+    <span class="pl">Pan</span><button data-s="pl" aria-label="Pan left">◀</button><button data-s="pu" aria-label="Pan up">▲</button><button data-s="pd" aria-label="Pan down">▼</button><button data-s="pr" aria-label="Pan right">▶</button>
+    <span class="pl">Zoom</span><button data-s="zo" aria-label="Zoom out">−</button><button data-s="zi" aria-label="Zoom in">+</button><button class="wide" id="bReset" aria-label="Reset view">Reset</button>
   </div>
 </div>
 
@@ -105,15 +119,15 @@
 <div id="loader" hidden><div></div><div class="bar"><i></i></div></div>
 <div id="toast" hidden></div>
 <div id="drop">Drop .ply to view</div>
-<div id="help" hidden><div class="card"><h3>Shortcuts</h3><dl>
-  <dt>T</dt><dd>Top view (north up)</dd><dt>P</dt><dd>Perspective view</dd><dt>F</dt><dd>Fit to model</dd>
+<div id="help" hidden><div class="card"><h3>Mouse &amp; trackpad</h3><dl id="gestures"></dl><h3 style="margin-top:12px">Shortcuts</h3><dl>
+  <dt>T P F</dt><dd>Top (north up) · Perspective · Fit</dd>
   <dt>M</dt><dd>Measure: click two points</dd><dt>Esc</dt><dd>Cancel / clear measurements</dd>
-  <dt>C</dt><dd>Cycle colour mode</dd><dt>E</dt><dd>Toggle depth shading</dd><dt>?</dt><dd>This help</dd>
-</dl><p class="hint">Drag: orbit · right-drag or two fingers: pan · scroll or pinch: zoom. The URL always holds the current view, so you can share it.</p></div></div>
+  <dt>Arrows</dt><dd>Orbit (Shift: pan)</dd><dt>+ −</dt><dd>Zoom</dd>
+  <dt>C E</dt><dd>Colour mode · depth shading</dd><dt>?</dt><dd>This help</dd>
+</dl><p class="hint">The Nav buttons act like dragging in that direction; hold to repeat. The URL holds the current view, so you can share it.</p></div></div>
 
 <script type="module">
 import * as THREE from "three";
-import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 
 // Entry modes: ?model=<name> (or first entry) from models/index.json (published site);
@@ -132,10 +146,10 @@ const scene = new THREE.Scene();   // cloud (+ mesh), goes through the EDL pass
 const overlay = new THREE.Scene(); // measurements, drawn on top without depth test
 scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
 const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
-const controls = new OrbitControls(camera, renderer.domElement);
-controls.enableDamping = true;
 let dirty = true, anim = null;
 const invalidate = () => { dirty = true; };
+// Camera state: the camera sits at target + off and looks at target (Y-up, so it can't roll).
+const nav = { target: new THREE.Vector3(), off: new THREE.Vector3(0, 0, 10), maxDist: 1000 };
 
 const material = new THREE.PointsMaterial({ size: 0.03, sizeAttenuation: true, vertexColors: true });
 material.onBeforeCompile = (s) => {  // never thinner than ~1.5 css px, so distant points don't vanish
@@ -267,12 +281,11 @@ function show(geom, label, { local, mesh }) {
   camera.updateProjectionMatrix();
   post.uniforms.near.value = camera.near;
   post.uniforms.far.value = camera.far;
-  controls.minDistance = 0.3;
-  controls.maxDistance = r * 10;
+  nav.maxDist = r * 10;
   if (startView && !local) {
-    camera.position.fromArray(startView, 0);
-    controls.target.fromArray(startView, 3);
-    controls.update();
+    nav.target.fromArray(startView, 3);
+    nav.off.fromArray(startView, 0).sub(nav.target);
+    applyNav();
   } else flyTo(center, homeView(), 0);
   startView = null;
   invalidate();
@@ -320,9 +333,9 @@ function fitRadius(top) {
   return 0.45 * s.length() / Math.sin(Math.atan(t * Math.min(1, a)));
 }
 const homeView = () => new THREE.Spherical(fitRadius(false), 0.85, Math.PI / 4);
+const currentSpherical = () => new THREE.Spherical().setFromVector3(nav.off);
 function flyTo(target, to, ms = 700) {
-  const offset = camera.position.clone().sub(controls.target);
-  const from = { t: controls.target.clone(), s: new THREE.Spherical().setFromVector3(offset) };
+  const from = { t: nav.target.clone(), s: currentSpherical() };
   const dth = to.theta - from.s.theta, dth1 = dth - Math.round(dth / (2 * Math.PI)) * 2 * Math.PI;
   anim = { t0: performance.now(), ms, from, to, target, dth: dth1 };
   if (!ms) stepAnim();
@@ -330,39 +343,93 @@ function flyTo(target, to, ms = 700) {
 function stepAnim() {
   const { t0, ms, from, to, target, dth } = anim;
   const k = ms ? Math.min(1, (performance.now() - t0) / ms) : 1, e = k < .5 ? 2 * k * k : 1 - 2 * (1 - k) ** 2;
-  controls.target.lerpVectors(from.t, target, e);
-  const s = new THREE.Spherical(from.s.radius + (to.radius - from.s.radius) * e, from.s.phi + (to.phi - from.s.phi) * e, from.s.theta + dth * e);
-  camera.position.setFromSpherical(s).add(controls.target);
-  controls.update();
-  invalidate();
+  nav.target.lerpVectors(from.t, target, e);
+  nav.off.setFromSpherical(new THREE.Spherical(from.s.radius + (to.radius - from.s.radius) * e, from.s.phi + (to.phi - from.s.phi) * e, from.s.theta + dth * e));
+  applyNav();
   if (k === 1) anim = null;
 }
-controls.addEventListener("start", () => { anim = null; });
 const viewTop = () => cloud && flyTo(cloud.center, new THREE.Spherical(fitRadius(true), 0.0005, 0));
 const viewHome = () => cloud && flyTo(cloud.center, homeView());
 const viewFit = () => {
   if (!cloud) return;
-  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
+  const s = currentSpherical();
   flyTo(cloud.center, new THREE.Spherical(fitRadius(s.phi < 0.2), s.phi, s.theta));
 };
-$("compass").onclick = () => {
-  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
-  flyTo(controls.target.clone(), new THREE.Spherical(s.radius, s.phi, 0));
-};
+$("compass").onclick = () => { const s = currentSpherical(); flyTo(nav.target.clone(), new THREE.Spherical(s.radius, s.phi, 0)); };
 
 function parseHash() {
   const m = /cam=([-\d.,e]+)/.exec(location.hash), v = m && m[1].split(",").map(Number);
   return v && v.length === 6 && v.every(Number.isFinite) ? v : null;
 }
 let hashTimer;
-controls.addEventListener("change", () => {
+function applyNav() {
+  camera.position.copy(nav.target).add(nav.off);
+  camera.lookAt(nav.target);
+  invalidate();
   clearTimeout(hashTimer);
   hashTimer = setTimeout(() => {
     if (!cloud || cloud.local) return;
-    const c = camera.position, t = controls.target;
+    const c = camera.position, t = nav.target;
     history.replaceState(null, "", `${location.pathname}${location.search}#cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`);
   }, 400);
-});
+}
+
+// ---- Navigation primitives (SketchUp-style: orbit about a pivot, zoom toward a point, pan in screen plane)
+const UP = new THREE.Vector3(0, 1, 0), clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+function orbit(dTheta, dPhi, pivot = nav.target) {  // rotate camera+target about pivot; pitch is clamped at the poles
+  pivot = pivot.clone();
+  const phi = Math.acos(clamp(nav.off.y / nav.off.length(), -1, 1)), theta = Math.atan2(nav.off.x, nav.off.z);
+  dPhi = clamp(phi + dPhi, 0.0005, Math.PI - 0.05) - phi;
+  const axis = new THREE.Vector3(Math.cos(theta + dTheta), 0, -Math.sin(theta + dTheta));
+  const rot = (v) => v.applyAxisAngle(UP, dTheta).applyAxisAngle(axis, dPhi);
+  nav.target.sub(pivot);
+  rot(nav.target).add(pivot);
+  rot(nav.off);
+  applyNav();
+}
+function pan(dx, dy) {  // dx, dy: how far the scene is dragged, in screen px
+  const s = 2 * nav.off.length() * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
+  nav.target.addScaledVector(new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion), -dx * s)
+    .addScaledVector(new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion), dy * s);
+  applyNav();
+}
+function zoomAt(f, P) {  // dolly along the ray to P; never closer than 15 cm to it
+  if (!cloud) return;
+  const cam = nav.target.clone().add(nav.off), fwd = nav.off.clone().normalize().negate();
+  if (f < 1) f = Math.max(f, Math.min(1, 0.15 / cam.distanceTo(P)));
+  const cam2 = P.clone().add(cam.sub(P).multiplyScalar(f));
+  if (f > 1 && cam2.distanceTo(cloud.center) > nav.maxDist) return;
+  const d = clamp(P.clone().sub(cam2).dot(fwd), 0.3, nav.maxDist);
+  nav.target.copy(cam2).addScaledVector(fwd, d);
+  nav.off.copy(fwd).multiplyScalar(-d);
+  applyNav();
+}
+// The point under the cursor (nearest cloud point, else the target-depth plane), cached for one gesture.
+let anc = { p: null, t: 0, x: 0, y: 0 };
+function anchor(x, y, showMark) {
+  const now = performance.now();
+  if (!anc.p || now - anc.t > 300 || Math.hypot(x - anc.x, y - anc.y) > 8) {
+    let p = cloud && pick(x, y, 10);
+    if (!p) {
+      const ray = new THREE.Raycaster(), fwd = nav.off.clone().normalize().negate();
+      ray.setFromCamera(new THREE.Vector2(x / innerWidth * 2 - 1, -(y / innerHeight * 2 - 1)), camera);
+      const o = ray.ray.origin, d = ray.ray.direction;
+      p = o.clone().addScaledVector(d, nav.target.clone().sub(o).dot(fwd) / d.dot(fwd));
+    } else if (showMark) showPivot(p);
+    anc = { p, x, y, t: now };
+  }
+  anc.t = now;
+  return anc.p;
+}
+let pivotMark = null;
+function showPivot(p) {
+  pivotMark?.el.remove();
+  const el = Object.assign(document.createElement("div"), { className: "pivot" });
+  $("labels").append(el);
+  const mine = pivotMark = { el, pos: p };
+  setTimeout(() => { el.remove(); if (pivotMark === mine) pivotMark = null; }, 900);
+  invalidate();
+}
 
 // ---- Measuring: pick the nearest cloud point inside a ~7 px cone around the click ray
 const measures = [], labels = [];
@@ -372,11 +439,11 @@ const lineMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false 
 const helperMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4, depthTest: false });
 const markMat = new THREE.PointsMaterial({ color: 0xffd23f, size: 9, sizeAttenuation: false, depthTest: false });
 
-function pick(ev) {
+function pick(x, y, radiusPx = 7) {
   const r = renderer.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
-  ray.setFromCamera(new THREE.Vector2((ev.clientX - r.left) / r.width * 2 - 1, -((ev.clientY - r.top) / r.height * 2 - 1)), camera);
+  ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height * 2 - 1)), camera);
   const o = ray.ray.origin, d = ray.ray.direction, p = cloud.geom.attributes.position.array;
-  const tanPx = 7 * 2 * Math.tan(camera.fov * Math.PI / 360) / r.height;
+  const tanPx = radiusPx * 2 * Math.tan(camera.fov * Math.PI / 360) / r.height;
   let best = -1, bestT = Infinity;
   for (let i = 0; i < p.length; i += 3) {
     const x = p[i] - o.x, y = p[i + 1] - o.y, z = p[i + 2] - o.z, t = x * d.x + y * d.y + z * d.z;
@@ -435,7 +502,7 @@ el.addEventListener("pointerdown", (e) => { down = e.isPrimary ? { x: e.clientX,
 el.addEventListener("pointerup", (e) => {
   if (!measuring || !cloud || !down || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
   if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6 || e.timeStamp - down.t > 600) return;
-  const p = pick(e);
+  const p = pick(e.clientX, e.clientY);
   if (!p) return toast("No points there — click on the cloud");
   if (pending) { measures.push([pending, p]); pending = null; } else pending = p;
   rebuild();
@@ -459,13 +526,13 @@ function render() {
   renderer.clearDepth();
   renderer.render(overlay, camera);
 
-  for (const l of labels) {
+  for (const l of pivotMark ? [...labels, pivotMark] : labels) {
     tmp.copy(l.pos).project(camera);
     l.el.style.display = tmp.z < 1 ? "" : "none";
     l.el.style.transform = `translate(${(tmp.x * .5 + .5) * innerWidth}px, ${(.5 - tmp.y * .5) * innerHeight}px) translate(-50%, -50%)`;
   }
-  $("needle").setAttribute("transform", `rotate(${controls.getAzimuthalAngle() * 180 / Math.PI})`);
-  const mpp = 2 * camera.position.distanceTo(controls.target) * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
+  $("needle").setAttribute("transform", `rotate(${Math.atan2(nav.off.x, nav.off.z) * 180 / Math.PI})`);
+  const mpp = 2 * nav.off.length() * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
   const raw = mpp * 100, p10 = 10 ** Math.floor(Math.log10(raw)), nice = (raw / p10 >= 5 ? 5 : raw / p10 >= 2 ? 2 : 1) * p10;
   const text = nice >= 1 ? `${nice} m` : `${Math.round(nice * 100)} cm`;
   $("scale").firstElementChild.style.width = `${nice / mpp}px`;
@@ -473,7 +540,7 @@ function render() {
 }
 renderer.setAnimationLoop(() => {
   if (anim) stepAnim();
-  if (controls.update() || dirty) { dirty = false; render(); }
+  if (dirty) { dirty = false; render(); }
 });
 
 // ---- UI wiring
@@ -497,8 +564,126 @@ $("bMeasure").onclick = () => setMeasuring(!measuring);
 $("bClear").onclick = onEscape;
 $("bHelp").onclick = () => { $("help").hidden = !$("help").hidden; };
 $("help").onclick = () => { $("help").hidden = true; };
+$("bNav").onclick = () => { const h = $("pad").hidden = !$("pad").hidden; $("bNav").setAttribute("aria-pressed", !h); };
+if (matchMedia("(max-width: 600px)").matches) $("bNav").click();
+$("bReset").onclick = viewHome;
+
+// Mode: trackpad (two-finger scroll orbits, pinch zooms) or mouse (wheel zooms). Remembered; default by platform.
+let trackpad = /Mac/.test(navigator.platform || navigator.userAgent);
+try { const s = localStorage.getItem("trackpad"); if (s !== null) trackpad = s === "1"; } catch {}
+const GESTURES = {
+  trackpad: [["Two-finger scroll", "Orbit"], ["Shift + scroll", "Pan"], ["Pinch", "Zoom to cursor"], ["Drag", "Orbit"], ["Shift / Alt / right drag", "Pan"]],
+  mouse: [["Wheel", "Zoom to cursor"], ["Left / middle drag", "Orbit"], ["Right / Shift drag", "Pan"]],
+};
+function setTrackpad(on) {
+  trackpad = on;
+  $("trackpad").checked = on;
+  try { localStorage.setItem("trackpad", on ? "1" : "0"); } catch {}
+  $("gestures").innerHTML = [...GESTURES[on ? "trackpad" : "mouse"], ["Double-click", "Pivot here"], ["Touch", "1 finger orbit, 2 pan/pinch"]]
+    .map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+}
+$("trackpad").onchange = (e) => setTrackpad(e.target.checked);
+setTrackpad(trackpad);
+
+// Pointer: left/middle drag orbits about the point under the cursor, Shift/Alt/right drag pans, two touches pan + pinch.
+const cv = renderer.domElement, ptrs = new Map(), ORBIT = 0.005;
+let drag = null, pinch = null;
+const pinchState = () => {
+  const [a, b] = [...ptrs.values()];
+  return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, d: Math.hypot(a.x - b.x, a.y - b.y) || 1 };
+};
+cv.addEventListener("contextmenu", (e) => e.preventDefault());
+cv.addEventListener("pointerdown", (e) => {
+  try { cv.setPointerCapture(e.pointerId); } catch {}
+  ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  anim = null;
+  drag = pinch = null;
+  if (ptrs.size === 1) drag = { pan: e.button === 2 || e.shiftKey || e.altKey, sx: e.clientX, sy: e.clientY, started: false };
+  else if (ptrs.size === 2) pinch = pinchState();
+});
+cv.addEventListener("pointermove", (e) => {
+  const p = ptrs.get(e.pointerId);
+  if (!p || !cloud) return;
+  const dx = e.clientX - p.x, dy = e.clientY - p.y;
+  p.x = e.clientX; p.y = e.clientY;
+  if (pinch && ptrs.size === 2) {
+    const s = pinchState();
+    pan(s.cx - pinch.cx, s.cy - pinch.cy);
+    zoomAt(pinch.d / s.d, anchor(s.cx, s.cy));
+    pinch = s;
+  } else if (drag) {
+    if (!drag.started) {  // small dead zone so taps (measuring) aren't drags
+      if (Math.hypot(e.clientX - drag.sx, e.clientY - drag.sy) < 4) return;
+      drag.started = true;
+      drag.pivot = drag.pan ? null : (pick(drag.sx, drag.sy, 10) || nav.target.clone());
+      if (drag.pivot && cloud) showPivot(drag.pivot);
+    }
+    if (drag.pan) pan(dx, dy); else orbit(-dx * ORBIT, -dy * ORBIT, drag.pivot);
+  }
+});
+for (const t of ["pointerup", "pointercancel"]) cv.addEventListener(t, (e) => {
+  ptrs.delete(e.pointerId);
+  pinch = null;
+  if (!ptrs.size) drag = null;
+});
+cv.addEventListener("dblclick", (e) => {
+  const p = !measuring && cloud && pick(e.clientX, e.clientY, 10);
+  if (!p) return;
+  const s = currentSpherical();
+  flyTo(p, new THREE.Spherical(Math.max(s.radius, 0.5), s.phi, s.theta));
+  showPivot(p);
+});
+cv.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  if (!cloud) return;
+  anim = null;
+  const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1, dx = e.deltaX * k, dy = e.deltaY * k;
+  if (e.ctrlKey) zoomAt(Math.exp(clamp(dy * 0.01, -0.4, 0.4)), anchor(e.clientX, e.clientY));  // trackpad pinch
+  else if (!trackpad) zoomAt(Math.exp(clamp((dy || dx) * 0.002, -0.35, 0.35)), anchor(e.clientX, e.clientY));
+  else if (e.shiftKey) pan(-dx, -dy);
+  else orbit(dx * ORBIT, dy * ORBIT, anchor(e.clientX, e.clientY, true));  // scrolling = dragging the scene
+}, { passive: false });
+let gScale = 1;  // Safari reports trackpad pinch as gesture events
+for (const t of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(t, (e) => {
+  e.preventDefault();
+  if (t === "gesturestart") gScale = 1;
+  else if (t === "gesturechange" && cloud) { zoomAt(gScale / e.scale, anchor(e.clientX, e.clientY)); gScale = e.scale; }
+});
+
+// On-screen pad: press and hold to repeat. Directions mirror dragging the scene that way.
+const STEPS = {
+  ol: (t) => orbit(1.2 * t, 0), or: (t) => orbit(-1.2 * t, 0), ou: (t) => orbit(0, 1 * t), od: (t) => orbit(0, -1 * t),
+  pl: (t) => pan(-300 * t, 0), pr: (t) => pan(300 * t, 0), pu: (t) => pan(0, -300 * t), pd: (t) => pan(0, 300 * t),
+  zi: (t) => zoomAt(Math.exp(-1.2 * t), nav.target), zo: (t) => zoomAt(Math.exp(1.2 * t), nav.target),
+};
+let held = null;
+function release() { if (held) { clearTimeout(held.to); cancelAnimationFrame(held.raf); held = null; } }
+document.querySelectorAll("#pad [data-s]").forEach((b) => {
+  b.addEventListener("pointerdown", (e) => {
+    e.preventDefault();
+    release();
+    anim = null;
+    const step = STEPS[b.dataset.s];
+    step(0.12);
+    held = { to: setTimeout(() => {
+      let last = performance.now();
+      const loop = (now) => { step(Math.min(0.05, (now - last) / 1000)); last = now; held.raf = requestAnimationFrame(loop); };
+      held.raf = requestAnimationFrame(loop);
+    }, 300) };
+  });
+  for (const t of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(t, release);
+});
+
 addEventListener("keydown", (e) => {
   if (e.ctrlKey || e.metaKey || e.altKey || /^(SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  const arrow = /^Arrow(Left|Right|Up|Down)$/.exec(e.key);
+  if (arrow && e.target.type !== "range") {
+    e.preventDefault();
+    const [x, y] = { Left: [1, 0], Right: [-1, 0], Up: [0, 1], Down: [0, -1] }[arrow[1]];
+    return e.shiftKey ? pan(-x * 40, -y * 40) : orbit(x * 0.1, y * 0.1);
+  }
+  const zoomKey = { "+": 0.85, "=": 0.85, "-": 1.18, _: 1.18 }[e.key];
+  if (zoomKey) return zoomAt(zoomKey, nav.target);
   ({ t: viewTop, p: viewHome, f: viewFit, m: () => setMeasuring(!measuring), c: cycleColor, e: () => $("edl").click(),
      "?": $("bHelp").onclick, escape: onEscape }[e.key.toLowerCase()])?.();
 });

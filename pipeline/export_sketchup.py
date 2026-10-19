@@ -5,6 +5,7 @@ usage: export_sketchup.py <out_dir> [--terrain-cell 0.1] [--max-faces 150000]
 Reads points.ply, mesh.ply and ground.npz from out_dir (fuse.py output) and writes out_dir/sketchup/:
   terrain.dae + terrain.png  COLLADA terrain from the ground grid, textured with a top-down orthophoto
   scene.dae                  TSDF mesh decimated to --max-faces, one plain material
+  terrain.stl, scene.stl     the same geometry without texture, for SketchUp plans that don't import DAE
   points.las                 LAS 1.4 with RGB, for Scan Essentials
 
 SketchUp is Z-up, so all of it is converted from the world frame (X east, Y up, Z south) to
@@ -262,6 +263,13 @@ def write_las(path, pts, cols):
     las.write(str(path))
 
 
+def write_stl(path, verts, tris):
+    """Binary STL in metres (STL has no unit field: pick metres when importing)."""
+    mesh = o3d.geometry.TriangleMesh(o3d.utility.Vector3dVector(verts), o3d.utility.Vector3iVector(tris))
+    mesh.compute_triangle_normals()
+    o3d.io.write_triangle_mesh(str(path), mesh)
+
+
 def export(out, terrain_cell=0.1, max_faces=150_000):
     out = Path(out)
     dst = out / "sketchup"
@@ -275,10 +283,12 @@ def export(out, terrain_cell=0.1, max_faces=150_000):
     verts, uvs, tris = triangulate(a, west, north, cell)
     Image.fromarray(orthophoto(pts, cols, west, north, a.shape[1] * cell, a.shape[0] * cell)).save(dst / "terrain.png")
     write_dae(dst / "terrain.dae", "terrain", verts, tris, uvs, "terrain.png")
+    write_stl(dst / "terrain.stl", verts, tris)
     print(f"terrain: {len(tris)} faces, {len(verts)} vertices, {cell:.3f} m cells, {a.shape[1] * cell:.0f} x {a.shape[0] * cell:.0f} m")
 
     sv, st = scene_mesh(out / "mesh.ply", max_faces)
     write_dae(dst / "scene.dae", "scene", sv, st)
+    write_stl(dst / "scene.stl", sv, st)
 
     write_las(dst / "points.las", pts, cols)
 
