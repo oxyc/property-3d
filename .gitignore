@@ -3,6 +3,9 @@ walks/
 out/
 data/
 
+# Downloaded third-party binaries (e.g. splat trainer)
+tools/
+
 # Build products
 ios/build/
 ios/WalkScan.xcodeproj/xcuserdata/

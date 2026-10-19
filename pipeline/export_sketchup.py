@@ -1,6 +1,9 @@
 """Export a fused walk for SketchUp: textured terrain, decimated scene mesh and a point cloud.
 
-usage: export_sketchup.py <out_dir> [--terrain-cell 0.1] [--max-faces 150000]
+usage: export_sketchup.py <out_dir> [--terrain-cell 0.1] [--max-faces 40000]
+
+SketchUp turns every triangle into a face plus edges and slows down badly past ~50k faces,
+so the scene mesh defaults to 40k; raise --max-faces only for a fast machine.
 
 Reads points.ply, mesh.ply and ground.npz from out_dir (fuse.py output) and writes out_dir/sketchup/:
   terrain.dae + terrain.png  COLLADA terrain from the ground grid, textured with a top-down orthophoto
@@ -25,7 +28,7 @@ import open3d as o3d
 from PIL import Image
 from scipy import ndimage
 
-TERRAIN_MAX_FACES = 100_000
+TERRAIN_MAX_FACES = 30_000
 OUTLIER = 0.4  # m, a cell this far from the median of its neighbours is dropped
 MAX_HOLE = 1.0  # m^2, bigger unscanned areas stay empty
 ORTHO_PX, ORTHO_MAX = 0.03, 8192  # m per pixel, pixels per side
@@ -270,7 +273,7 @@ def write_stl(path, verts, tris):
     o3d.io.write_triangle_mesh(str(path), mesh)
 
 
-def export(out, terrain_cell=0.1, max_faces=150_000):
+def export(out, terrain_cell=0.1, max_faces=40_000):
     out = Path(out)
     dst = out / "sketchup"
     dst.mkdir(exist_ok=True)
@@ -301,6 +304,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
     ap.add_argument("--terrain-cell", type=float, default=0.1)
-    ap.add_argument("--max-faces", type=int, default=150_000)
+    ap.add_argument("--max-faces", type=int, default=40_000)
     a = ap.parse_args()
     export(a.out_dir, a.terrain_cell, a.max_faces)
