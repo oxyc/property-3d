@@ -31,4 +31,29 @@ uv run python closure.py walks/<walk> out/<walk>/poses.npz   # start-vs-end erro
 
 `optimize.py` first removes ARKit relocalization snaps (single-frame jumps > 3 m/s): post-snap poses are trusted and the offset is ramped back over the frames since the previous snap. It then splits the walk into ~100-frame fragments, finds loop closures by yaw-only ICP between fragments whose paths revisit each other, and prunes bad ones in an Open3D pose graph. `synth.py --drift --frames 440` makes a two-loop walk with accumulating drift for testing.
 
+## Merging walks
+
+```
+uv run python merge.py ../out/merged ../walks/<walk_a> ../walks/<walk_b> [...]   # same outputs as process.py, plus merge.json
+```
+
+Each walk is optimised on its own, then registered into the first walk's frame (GPS guess, yaw/translation search, ICP; yaw + translation only) and tied to it by inter-walk loop closures in a joint pose graph. A walk that cannot be registered confidently keeps its GPS placement and is flagged in `merge.json` and on stderr. Tip: start every walk on the same taped mark and the initial alignment is nearly exact.
+
+## Publishing to the site (GitHub Pages)
+
+```
+uv run python publish.py ../out/<walk> <name> "<title>"   # thins to <=3M points into ../site/models/<name>/, updates the index
+```
+
+Only `points.ply` (local frame, metres from the walk start) is published, never the georeferenced outputs. Commit `site/` and push; the Pages workflow deploys it. The published model is public.
+
+## SketchUp
+
+```
+uv run python export_sketchup.py ../out/<walk>   # sketchup/: terrain.dae+png, scene.dae, terrain.stl, scene.stl, points.las (Z-up, metres)
+uv run python test_export.py                     # synth -> fuse -> export, checks axes, heights, face counts
+```
+
+Paid plans: File > Import > COLLADA for the `.dae` files. SketchUp Free officially imports only `.skp`/`.jpg`/`.png`; try the `.stl` files via Insert as Component (choose metres) and lay `terrain.png` over the terrain. `points.las` is for Scan Essentials (Studio, Windows).
+
 `georef_points.ply` stores coordinates minus `offset` from `georef.json`; add it back to get EPSG:5382.

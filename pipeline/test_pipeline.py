@@ -16,6 +16,7 @@ import open3d as o3d
 sys.path.insert(0, str(Path(__file__).parent))  # not on sys.path when run with -I
 import fuse
 import georef
+import merge
 import optimize
 import synth
 
@@ -174,7 +175,58 @@ def test_snap():
         assert pe_opt[0] < 0.3 * pe_raw[0] and opt[0] < 0.5 * raw[0] and opt[1] < 0.5 * raw[1]
 
 
+def merged_scene_error(out):
+    d = np.abs(synth.scene_sdf(np.asarray(o3d.io.read_point_cloud(str(out / "points.ply")).points)))
+    return pct(d, 50), pct(d, 90)
+
+
+def test_merge():
+    """Two walks of the same scene from different start points, ARKit origins and 4 degrees of compass error, GPS noise
+    as usual: the merge must recover the relative placement and reconstruct about as well as one walk. Walks that do not
+    overlap must come back as a GPS-placement fallback with a warning, not as a confident merge."""
+    quiet = lambda *_: None  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = tmp / "a", tmp / "b"
+        synth.generate(a, 240, seed=0)
+        synth.generate(b, 240, seed=1, phase=2.0, yaw_deg=4.0)
+        frag = 40
+
+        optimize.optimize(a, tmp / "opt_a", frag, log=quiet)
+        single = scene_error(a, tmp / "f_a", tmp / "opt_a" / "poses.npz")
+        stats = merge.merge(tmp / "m", [a, b], frag, log=quiet)
+        both = merged_scene_error(tmp / "m")
+
+        to_scene = np.array(json.loads((b / "truth.json").read_text())["to_scene"]).reshape(4, 4, order="F")
+        rec = np.array([json.loads(l)["transform"][12:15] for l in (b / "frames.jsonl").read_text().splitlines()])
+        got = np.load(tmp / "m" / "walk1" / "poses_merged.npz")["T"][:, :3, 3]
+        pose_err = np.linalg.norm(got - (rec @ to_scene[:3, :3].T + to_scene[:3, 3]), axis=1)
+        w = stats["walks"][1]
+        want_yaw = float(np.degrees(np.arctan2(to_scene[0, 2], to_scene[0, 0])))
+        gps_err = np.linalg.norm(np.array(w["gps_translation_m"]) - to_scene[:3, 3])
+        cons = w["consistency_with_earlier_walks"]
+        print(f"merge:  walk b recovered yaw {w['yaw_deg']:+.2f} deg (true {want_yaw:+.2f}), GPS-only placement was {gps_err:.1f} m off; "
+              f"camera position error mean/max {pose_err.mean() * 100:.1f}/{pose_err.max() * 100:.1f} cm")
+        print(f"merge:  {stats['candidates']} loop candidates, {len(stats['inter_walk_loops'])} accepted, {stats['kept_loops']} kept")
+        print(f"merge:  median gap between the walks in their overlap: GPS {cons['gps_placement']['median_gap_m'] * 100:.1f} cm -> "
+              f"rigid {cons['rigid_walk_transform']['median_gap_m'] * 100:.1f} cm -> joint {cons['joint_graph']['median_gap_m'] * 100:.1f} cm")
+        print(f"merge:  |dist to scene| median/p90 one walk {single[0] * 100:.2f}/{single[1] * 100:.2f} cm -> merged {both[0] * 100:.2f}/{both[1] * 100:.2f} cm")
+        assert w["method"] == "registered" and not stats["warnings"]
+        assert abs(w["yaw_deg"] - want_yaw) < 0.5 and pose_err.max() < 0.1
+        assert both[0] < single[0] + 0.005 and both[1] < single[1] + 0.01
+
+        # a walk 40 m away (ground only, outside the search radius) and one 18 m away (search runs, nothing to match)
+        for name, shift, frames in (("far", (40.0, 0.0), 100), ("near", (18.0, 0.0), 100)):
+            c = tmp / name
+            synth.generate(c, frames, seed=2, shift=shift, yaw_deg=3.0)
+            s = merge.merge(tmp / f"m_{name}", [a, c], frag, log=quiet)
+            w = s["walks"][1]
+            print(f"merge:  non-overlapping walk ({name}): {w['method']}, {w.get('why') or w['attempt']['why']}; warnings: {len(s['warnings'])}")
+            assert w["method"] == "gps_fallback" and len(s["warnings"]) == 1 and not s["inter_walk_loops"]
+            assert np.allclose(w["translation_m"], w["gps_translation_m"]) and w["yaw_deg"] == 0.0
+
+
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge"]:  # optionally just some of them
         globals()[test]()
     print("OK")

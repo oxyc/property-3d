@@ -144,11 +144,13 @@ def render(R, pos, u, v, t_max):
 # ---------------------------------------------------------------- walk
 
 
-def camera_pose(t):
-    a = SPEED * t / LOOP_R
-    x, z = LOOP_CENTRE[0] + LOOP_R * np.sin(a), LOOP_CENTRE[1] + LOOP_R * np.cos(a)
+def camera_pose(t, phase=0.0, shift=(0.0, 0.0)):
+    """Scene-frame pose at time t. phase: where on the loop the walk starts (rad); shift: loop centre offset (x, z)."""
+    a = SPEED * t / LOOP_R + phase
+    centre = LOOP_CENTRE + np.array(shift)
+    x, z = centre[0] + LOOP_R * np.sin(a), centre[1] + LOOP_R * np.cos(a)
     pos = np.array([x, ground_height(x, z) + CAM_HEIGHT, z])
-    d = LOOP_CENTRE - pos[[0, 2]]
+    d = centre - pos[[0, 2]]
     d /= np.linalg.norm(d)
     sway = 0.35 * np.sin(0.8 * t)
     d = np.array([np.cos(sway) * d[0] + np.sin(sway) * d[1], -np.sin(sway) * d[0] + np.cos(sway) * d[1]])
@@ -185,10 +187,10 @@ def simulate_rgb(R, pos, step=4):
     return Image.fromarray(rgb).resize((RGB_W, RGB_H), Image.BICUBIC)
 
 
-def simulate_gps(rng, duration, to_ll):
+def simulate_gps(rng, duration, to_ll, **path):
     rows = []
     for k, t in enumerate(np.arange(0, duration, 1.0)):
-        R, pos, fwd = camera_pose(t)
+        R, pos, fwd = camera_pose(t, **path)
         acc = rng.uniform(3, 5)
         err = rng.normal(size=2) * acc
         if k in (5, 17):  # gross outliers, honestly reported as poor
@@ -214,8 +216,11 @@ def drift_offsets(rng, true_pos):
     return yaw, np.cumsum(rate * step[:, None], axis=0)
 
 
-def generate(out_dir, n_frames=240, seed=0, drift=False):
-    """drift=True records drifted transforms (the true ones go to truth.json) but renders depth from the true poses."""
+def generate(out_dir, n_frames=240, seed=0, drift=False, phase=0.0, yaw_deg=0.0, shift=(0.0, 0.0)):
+    """drift=True records drifted transforms (the true ones go to truth.json) but renders depth from the true poses.
+    phase / shift start the walk elsewhere on the loop / move the loop (a different part of the ground); the recorded
+    ARKit frame then has its origin at the walk's start and is rotated by yaw_deg about +Y (compass error) relative to
+    the scene, while GPS still follows the true position. truth.json gets `to_scene` (recorded frame -> scene frame)."""
     rng = np.random.default_rng(seed)
     out = Path(out_dir)
     for sub in ("depth", "conf", "rgb"):
@@ -223,15 +228,24 @@ def generate(out_dir, n_frames=240, seed=0, drift=False):
 
     true_M = []
     for i in range(n_frames):
-        R, pos, _ = camera_pose(i / HZ)
+        R, pos, _ = camera_pose(i / HZ, phase, shift)
         M = np.eye(4)
         M[:3, :3], M[:3, 3] = R, pos
         true_M.append(M)
     rec_M = true_M
+    to_scene = None
+    if phase or yaw_deg or any(shift):
+        a = np.radians(yaw_deg)
+        D = np.array([[np.cos(a), 0, np.sin(a)], [0, 1, 0], [-np.sin(a), 0, np.cos(a)]])
+        F = np.eye(4)  # scene -> recorded frame
+        F[:3, :3], F[:3, 3] = D, -D @ true_M[0][:3, 3]
+        rec_M = [F @ M for M in true_M]
+        to_scene = np.linalg.inv(F)
+    true_rec = rec_M  # the true poses in the recorded frame
     if drift:
-        yaw, offset = drift_offsets(np.random.default_rng(seed + 1), np.array([M[:3, 3] for M in true_M]))
+        yaw, offset = drift_offsets(np.random.default_rng(seed + 1), np.array([M[:3, 3] for M in true_rec]))
         rec_M = []
-        for M, a, d in zip(true_M, yaw, offset):
+        for M, a, d in zip(true_rec, yaw, offset):
             c, s = np.cos(a), np.sin(a)
             D = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
             rec_M.append(np.block([[D @ M[:3, :3], (D @ M[:3, 3] + d)[:, None]], [np.zeros((1, 3)), np.ones((1, 1))]]))
@@ -252,7 +266,7 @@ def generate(out_dir, n_frames=240, seed=0, drift=False):
     (out / "frames.jsonl").write_text("".join(json.dumps(f) + "\n" for f in frames))
 
     to_ll = Transformer.from_crs("EPSG:5382", "EPSG:4326", always_xy=True)
-    gps = simulate_gps(rng, n_frames / HZ, to_ll)
+    gps = simulate_gps(rng, n_frames / HZ, to_ll, phase=phase, shift=shift)
     (out / "gps.jsonl").write_text("".join(json.dumps(g) + "\n" for g in gps))
     (out / "meta.json").write_text(json.dumps({
         "format_version": 2, "depth_dtype": "f16", "app_version": "synth", "device": "synthetic",
@@ -261,7 +275,9 @@ def generate(out_dir, n_frames=240, seed=0, drift=False):
         "rgb_w": RGB_W, "rgb_h": RGB_H, "frame_count": n_frames}, indent=2))
     truth = {"origin_en": ORIGIN_EN, "origin_alt": ORIGIN_ALT}
     if drift:
-        truth["true_transforms"] = [M.flatten(order="F").tolist() for M in true_M]  # column-major, like frames.jsonl
+        truth["true_transforms"] = [M.flatten(order="F").tolist() for M in true_rec]  # column-major, like frames.jsonl
+    if to_scene is not None:
+        truth["to_scene"] = to_scene.flatten(order="F").tolist()
     (out / "truth.json").write_text(json.dumps(truth))
     print(f"wrote {n_frames} frames, {sum(f['rgb'] for f in frames)} rgb, {len(gps)} gps fixes to {out}")
 
@@ -272,5 +288,8 @@ if __name__ == "__main__":
     ap.add_argument("--frames", type=int, default=240)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--drift", action="store_true", help="record drifted poses (use --frames 440 for two loops)")
+    ap.add_argument("--phase", type=float, default=0.0, help="start angle on the loop, radians")
+    ap.add_argument("--yaw", type=float, default=0.0, help="recorded frame yaw error, degrees")
+    ap.add_argument("--shift", type=float, nargs=2, default=(0.0, 0.0), metavar=("X", "Z"), help="move the loop, metres")
     a = ap.parse_args()
-    generate(a.out_dir, a.frames, a.seed, a.drift)
+    generate(a.out_dir, a.frames, a.seed, a.drift, a.phase, a.yaw, tuple(a.shift))
