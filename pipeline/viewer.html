@@ -178,6 +178,11 @@
         <div class="exb"><button data-x="stl">STL</button><button data-x="obj">OBJ</button><button data-x="glb">GLB</button><button data-x="dae">DAE</button><button data-x="kmz">KMZ</button><button data-x="zip">DAE+PNG</button></div>
         <small id="exEst"></small>
       </div>
+      <div class="exg" id="exPhoto" hidden>
+        <b>Photo model</b>
+        <div class="exb"><button data-x="pglb">GLB</button><button data-x="pkmz">KMZ</button><button data-x="pdae">DAE+JPG</button><button data-x="pobj">OBJ+MTL+JPG</button></div>
+        <small id="exPhotoEst"></small>
+      </div>
       <div class="exg">
         <b>Points</b>
         <div class="exb"><button data-x="ply">PLY</button><button data-x="las">LAS</button></div>
@@ -353,7 +358,7 @@ resize();
 
 // ---- Loading
 const loader = new PLYLoader();
-let cloud = null, surf = null, display = "solid", token = 0, startView = parseHash();
+let cloud = null, surf = null, photo = null, display = "solid", token = 0, startView = parseHash();
 const nextTick = () => new Promise((r) => setTimeout(r, 30));
 const MB = (n) => (n / 1e6).toFixed(1);
 
@@ -408,7 +413,7 @@ async function open(label, getBuffer, opts = {}) {
 function percentile(sorted, p) { return sorted[Math.floor(p * (sorted.length - 1))]; }
 
 // A PLY with faces (a dropped mesh) gives a surface, and its vertices serve as the points.
-function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes }) {
+function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes }) {
   let geom = parsed, meshGeom = null;
   if (parsed.index) {
     meshGeom = parsed;
@@ -419,6 +424,7 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   if (!n) throw new Error("empty");
   if (cloud) { scene.remove(cloud.obj); cloud.geom.dispose(); }
   if (surf) { scene.remove(surf.obj); surf.geom.dispose(); surf = null; }
+  if (photo) { scene.remove(photo.obj); photo = null; }
   plan = false;
   camera = persp;
   $("bPlan").setAttribute("aria-pressed", false);
@@ -439,7 +445,7 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   for (let i = 0; i < m; i++) { const j = 3 * Math.floor(i * n / m); sample.set(a.subarray(j, j + 3), 3 * i); }
   cloud = { geom, obj: new THREE.Points(geom, solid), size, center, local, attrs: { rgb: geom.attributes.color },
     ground: percentile(ys, 0.01), top: percentile(ys, 0.995), spacing, meshUrl, meshBytes, sample, label,
-    fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes };
+    fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes };
   region = null;
   analysis = null;
   selecting = false;
@@ -449,7 +455,9 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   if (meshGeom) surf = makeSurface(meshGeom);
   setColorMode(colorMode);
   const hasSurface = !!(surf || meshUrl), sv = !local && startView;
-  $("displays").lastChild.hidden = !hasSurface;
+  $("displays").children[2].hidden = !hasSurface;
+  $("displays").children[3].hidden = !photoUrl;
+  $("exPhoto").hidden = !photoUrl;
   $("export").hidden = false;
   document.querySelectorAll("#exContent button").forEach((b) => { b.hidden = !hasSurface && b.dataset.m !== "ground"; });
   setContent(hasSurface ? exContent : "ground");
@@ -470,15 +478,44 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   if (sv && sv.m) loadChains(sv.m);
   const want = surf && !sv ? "surface" : sv && sv.d;
   display = null;
-  setDisplay(want in DISPLAYS && (want !== "surface" || hasSurface) ? want : "solid");
+  setDisplay(want in DISPLAYS && (want !== "surface" || hasSurface) && (want !== "photo" || photoUrl) ? want : "solid");
   startView = null;
   updateQualityHint();
   applyQuality(quality);
   invalidate();
 }
 
-// ---- Display modes: dots, solid round splats, or the (lazily loaded) coloured mesh
-const DISPLAYS = { points: "Points", solid: "Solid", surface: "Surface" };
+// ---- Display modes: dots, solid round splats, the (lazily loaded) coloured mesh, or the photo-textured mesh
+const DISPLAYS = { points: "Points", solid: "Solid", surface: "Surface", photo: "Photo" };
+// Photo: an unlit GLB (true photo colours, so no sun shadows here: use Surface for those). Phones and the lower quality
+// presets get the smaller texture. Picking snaps to its vertices, like Surface.
+async function loadPhoto() {
+  const c = cloud, small = quality === "fast" || quality === "balanced" || matchMedia("(max-width: 600px)").matches;
+  const mobile = small && c.photoMobileUrl, url = mobile ? c.photoMobileUrl : c.photoUrl, bytes = mobile ? c.photoMobileBytes : c.photoBytes;
+  try {
+    const buf = await fetchBuffer(url, bytes, (got, total) => setLoader(`Loading photo model${mobile ? " (small)" : ""}`, got, total));
+    if (c !== cloud) return false;
+    setLoader("Preparing photo model");
+    await nextTick();
+    const { GLTFLoader } = await import("three/addons/loaders/GLTFLoader.js"), gltf = await new GLTFLoader().parseAsync(buf, ""), arrays = [];
+    gltf.scene.traverse((o) => {
+      if (!o.isMesh) return;
+      o.material.side = THREE.DoubleSide;
+      if (o.material.map) o.material.map.colorSpace = THREE.NoColorSpace;  // raw photo colours, like everything else here
+      arrays.push(o.geometry.attributes.position.array);
+    });
+    gltf.scene.visible = false;
+    scene.add(gltf.scene);
+    photo = { obj: gltf.scene, pickPos: arrays.length === 1 ? arrays[0] : Float32Array.from(arrays.flatMap((a) => [...a])) };
+    $("loader").hidden = true;
+    return c === cloud;
+  } catch (err) {
+    console.error(err);
+    $("loader").hidden = true;
+    toast("Could not load the photo model");
+    return false;
+  }
+}
 function makeSurface(geom) {
   geom.computeVertexNormals();
   if (!geom.attributes.color) geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(geom.attributes.position.count * 3).fill(0.7), 3));
@@ -513,11 +550,13 @@ async function loadSurface() {
 async function setDisplay(d) {
   if (!cloud || d === display) return;
   if (d === "surface" && !surf && !(cloud.meshUrl && await loadSurface())) return;
+  if (d === "photo" && !photo && !(cloud.photoUrl && await loadPhoto())) return;
   display = d;
   document.querySelectorAll("#displays button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === d));
-  cloud.obj.visible = d !== "surface";
+  cloud.obj.visible = d !== "surface" && d !== "photo";
   cloud.obj.material = d === "points" ? dots : solid;
   if (surf) surf.obj.visible = d === "surface";
+  if (photo) photo.obj.visible = d === "photo";
   renderer.shadowMap.needsUpdate = true;
   syncSunUI();
   scheduleHash();
@@ -530,7 +569,7 @@ for (const [m, text] of Object.entries(DISPLAYS)) {
   $("displays").append(b);
 }
 const cycleDisplay = () => {
-  const k = Object.keys(DISPLAYS).filter((m) => m !== "surface" || surf || cloud?.meshUrl);
+  const k = Object.keys(DISPLAYS).filter((m) => (m !== "surface" || surf || cloud?.meshUrl) && (m !== "photo" || cloud?.photoUrl));
   setDisplay(k[(k.indexOf(display) + 1) % k.length]);
 };
 // Point sizes are world-space diameters (about the point spacing): x1.73 for a perspective camera's `size`,
@@ -1025,7 +1064,7 @@ function pick(x, y, radiusPx = 7) {
   const r = renderer.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
   ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height * 2 - 1)), camera);
   // In Surface mode this snaps to the nearest mesh vertex (a few cm apart) rather than ray-casting 500k triangles.
-  const o = ray.ray.origin, d = ray.ray.direction, p = (display === "surface" && surf ? surf : cloud).geom.attributes.position.array;
+  const o = ray.ray.origin, d = ray.ray.direction, p = display === "photo" && photo ? photo.pickPos : (display === "surface" && surf ? surf : cloud).geom.attributes.position.array;
   const tanPx = radiusPx * 2 * Math.tan(persp.fov * Math.PI / 360) / r.height, widthM = radiusPx * nav.planH / r.height;
   let best = -1, bestT = Infinity;
   for (let i = 0; i < p.length; i += 3) {
@@ -1051,7 +1090,7 @@ function snapAt(x, y, shift) {
   if (!best) for (const c of chains) for (let i = 0; i < c.pts.length - 1 + (c.closed ? 1 : 0); i++) consider(c.pts[i].clone().add(c.pts[(i + 1) % c.pts.length]).multiplyScalar(0.5), "midpoint", tolMid);
   if (!best && cloud) {
     const p = pick(x, y, touch ? 14 : 9);
-    if (p) best = { p, kind: display === "surface" && surf ? "face" : "point", d: 0 };
+    if (p) best = { p, kind: (display === "surface" && surf) || (display === "photo" && photo) ? "face" : "point", d: 0 };
   }
   if (!best) return null;
   if (P0) {
@@ -1412,7 +1451,7 @@ function render() {
   gridMat.uniforms.cell.value = (gq >= 5 ? 5 : gq >= 2 ? 2 : 1) * gp;
   gridMat.uniforms.fade.value = view * 1.6;
   gridMat.uniforms.center.value.copy(nav.target);
-  post.uniforms.strength.value = display === "surface" ? 15 : 60;  // shadows do the work on surfaces
+  post.uniforms.strength.value = display === "surface" || display === "photo" ? 15 : 60;  // meshes need much less edge darkening
   post.uniforms.near.value = camera.near;
   post.uniforms.far.value = camera.far;
   post.uniforms.ortho.value = +plan;
@@ -1769,10 +1808,107 @@ function collada(parts) {  // COLLADA 1.4.1, metres, Z up; one geometry + node p
 const kml = (name) => '<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark>' +
   `<name>${name}</name><Model><altitudeMode>relativeToGround</altitudeMode><Location><longitude>0.00000000</longitude><latitude>0.00000000</latitude><altitude>0</altitude></Location>` +
   `<Orientation><heading>0</heading><tilt>0</tilt><roll>0</roll></Orientation><Scale><x>1</x><y>1</y><z>1</z></Scale><Link><href>models/${name}.dae</href></Link></Model></Placemark></kml>\n`;
-async function kmz(dae, png) {  // doc.kml (placed at 0,0: no real-world location) + DAE + texture in one file
+async function kmz(dae, tex, texName = "terrain.png") {  // doc.kml (placed at 0,0: no real-world location) + DAE + texture in one file
   const { zipSync, strToU8 } = await lib("zip"), files = { "doc.kml": strToU8(kml("model")), "models/model.dae": strToU8(dae) };
-  if (png) files["models/terrain.png"] = [png, { level: 0 }];
+  if (tex) files[`models/${texName}`] = [tex, { level: 0 }];  // PNG / JPEG are compressed already
   return zipSync(files);
+}
+
+// -- Photo model: the published textured GLB, converted in the browser. glTF is Y up with the UV origin top-left;
+// SketchUp (DAE/KMZ) is Z up and OBJ/COLLADA put the UV origin bottom-left.
+function parseGlb(buf) {  // -> {pos, uv, idx, jpeg}
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546c67) throw new Error("not a GLB file");
+  let json, bin;
+  for (let off = 12; off < buf.byteLength;) {
+    const len = dv.getUint32(off, true), type = dv.getUint32(off + 4, true), data = buf.slice(off + 8, off + 8 + len);
+    if (type === 0x4e4f534a) json = JSON.parse(new TextDecoder().decode(data)); else if (type === 0x004e4942) bin = data;
+    off += 8 + len;
+  }
+  const read = (i) => {
+    const a = json.accessors[i], bv = json.bufferViews[a.bufferView], T = { 5126: Float32Array, 5125: Uint32Array, 5123: Uint16Array, 5121: Uint8Array }[a.componentType];
+    const n = { SCALAR: 1, VEC2: 2, VEC3: 3 }[a.type], base = (bv.byteOffset || 0) + (a.byteOffset || 0), stride = bv.byteStride || n * T.BYTES_PER_ELEMENT;
+    if (stride === n * T.BYTES_PER_ELEMENT) return new T(bin.slice(base, base + a.count * n * T.BYTES_PER_ELEMENT));
+    const out = new T(a.count * n), v = new DataView(bin);  // interleaved: copy element by element
+    for (let k = 0; k < a.count; k++) for (let c = 0; c < n; c++) out[k * n + c] = T === Float32Array ? v.getFloat32(base + k * stride + c * 4, true) : T === Uint32Array ? v.getUint32(base + k * stride + c * 4, true) : T === Uint16Array ? v.getUint16(base + k * stride + c * 2, true) : v.getUint8(base + k * stride + c);
+    return out;
+  };
+  const pos = [], uv = [], idx = [];
+  let nv = 0;
+  for (const mesh of json.meshes) for (const prim of mesh.primitives) {
+    const p = read(prim.attributes.POSITION), t = read(prim.attributes.TEXCOORD_0), ind = prim.indices !== undefined ? read(prim.indices) : Uint32Array.from({ length: p.length / 3 }, (_, i) => i);
+    pos.push(p); uv.push(t);
+    idx.push(Uint32Array.from(ind, (i) => i + nv));
+    nv += p.length / 3;
+  }
+  const img = json.images[0], bv = json.bufferViews[img.bufferView];
+  const cat = (arrs, T) => { const o = new T(arrs.reduce((s, a) => s + a.length, 0)); let k = 0; for (const a of arrs) { o.set(a, k); k += a.length; } return o; };
+  return { pos: cat(pos, Float32Array), uv: cat(uv, Float32Array), idx: cat(idx, Uint32Array), jpeg: new Uint8Array(bin.slice(bv.byteOffset || 0, (bv.byteOffset || 0) + bv.byteLength)) };
+}
+function cropPhoto(g, r) {  // keep faces whose centre is inside the world rect; the texture is shared, so it stays whole
+  const keep = [];
+  for (let f = 0; f < g.idx.length; f += 3) {
+    const a = 3 * g.idx[f], b = 3 * g.idx[f + 1], c = 3 * g.idx[f + 2], x = (g.pos[a] + g.pos[b] + g.pos[c]) / 3, z = (g.pos[a + 2] + g.pos[b + 2] + g.pos[c + 2]) / 3;
+    if (x >= r.x0 && x <= r.x1 && z >= r.z0 && z <= r.z1) keep.push(f);
+  }
+  if (!keep.length) throw new Error("no photo model in that area");
+  const map = new Int32Array(g.pos.length / 3).fill(-1), idx = new Uint32Array(3 * keep.length);
+  let nv = 0;
+  keep.forEach((f, k) => { for (let j = 0; j < 3; j++) { const v = g.idx[f + j]; if (map[v] < 0) map[v] = nv++; idx[3 * k + j] = map[v]; } });
+  const pos = new Float32Array(3 * nv), uv = new Float32Array(2 * nv);
+  for (let v = 0; v < map.length; v++) if (map[v] >= 0) { pos.set(g.pos.subarray(3 * v, 3 * v + 3), 3 * map[v]); uv.set(g.uv.subarray(2 * v, 2 * v + 2), 2 * map[v]); }
+  return { pos, uv, idx, jpeg: g.jpeg };
+}
+function glbWrite({ pos, uv, idx, jpeg }) {  // one unlit textured primitive with the JPEG embedded
+  const pad = (n) => (4 - (n % 4)) % 4, jpegLen = jpeg.length, bin = new Uint8Array(pos.byteLength + uv.byteLength + idx.byteLength + jpegLen + pad(jpegLen));
+  bin.set(new Uint8Array(pos.buffer, pos.byteOffset, pos.byteLength), 0);
+  bin.set(new Uint8Array(uv.buffer, uv.byteOffset, uv.byteLength), pos.byteLength);
+  bin.set(new Uint8Array(idx.buffer, idx.byteOffset, idx.byteLength), pos.byteLength + uv.byteLength);
+  bin.set(jpeg, pos.byteLength + uv.byteLength + idx.byteLength);
+  const lo = [Infinity, Infinity, Infinity], hi = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < pos.length; i++) { lo[i % 3] = Math.min(lo[i % 3], pos[i]); hi[i % 3] = Math.max(hi[i % 3], pos[i]); }
+  const json = JSON.stringify({
+    asset: { version: "2.0", generator: "Walk Viewer" }, extensionsUsed: ["KHR_materials_unlit"], scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, TEXCOORD_0: 1 }, indices: 2, material: 0 }] }],
+    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0 }, doubleSided: true, extensions: { KHR_materials_unlit: {} } }],
+    textures: [{ source: 0, sampler: 0 }], samplers: [{ magFilter: 9729, minFilter: 9987, wrapS: 33071, wrapT: 33071 }], images: [{ bufferView: 3, mimeType: "image/jpeg" }],
+    accessors: [{ bufferView: 0, componentType: 5126, count: pos.length / 3, type: "VEC3", min: lo, max: hi }, { bufferView: 1, componentType: 5126, count: uv.length / 2, type: "VEC2" }, { bufferView: 2, componentType: 5125, count: idx.length, type: "SCALAR" }],
+    bufferViews: [{ buffer: 0, byteOffset: 0, byteLength: pos.byteLength }, { buffer: 0, byteOffset: pos.byteLength, byteLength: uv.byteLength }, { buffer: 0, byteOffset: pos.byteLength + uv.byteLength, byteLength: idx.byteLength }, { buffer: 0, byteOffset: pos.byteLength + uv.byteLength + idx.byteLength, byteLength: jpegLen }],
+    buffers: [{ byteLength: bin.length }],
+  });
+  const jb = new TextEncoder().encode(json + " ".repeat(pad(json.length))), out = new Uint8Array(12 + 8 + jb.length + 8 + bin.length), dv = new DataView(out.buffer);
+  dv.setUint32(0, 0x46546c67, true); dv.setUint32(4, 2, true); dv.setUint32(8, out.length, true);
+  dv.setUint32(12, jb.length, true); dv.setUint32(16, 0x4e4f534a, true); out.set(jb, 20);
+  dv.setUint32(20 + jb.length, bin.length, true); dv.setUint32(24 + jb.length, 0x004e4942, true); out.set(bin, 28 + jb.length);
+  return out;
+}
+function photoObj(g) {  // OBJ + MTL, Y up (like the viewer); faces v/vt
+  const chunks = ["# Walk Viewer export: metres, Y up\nmtllib model.mtl\nusemtl photo\n"];
+  let lines = [];
+  const flush = () => { chunks.push(lines.join("\n") + "\n"); lines = []; };
+  for (let i = 0; i < g.pos.length; i += 3) { lines.push(`v ${g.pos[i].toFixed(4)} ${g.pos[i + 1].toFixed(4)} ${g.pos[i + 2].toFixed(4)}`); if (lines.length >= 50000) flush(); }
+  for (let i = 0; i < g.uv.length; i += 2) { lines.push(`vt ${g.uv[i].toFixed(5)} ${(1 - g.uv[i + 1]).toFixed(5)}`); if (lines.length >= 50000) flush(); }
+  for (let i = 0; i < g.idx.length; i += 3) { const [a, b, c] = [g.idx[i] + 1, g.idx[i + 1] + 1, g.idx[i + 2] + 1]; lines.push(`f ${a}/${a} ${b}/${b} ${c}/${c}`); if (lines.length >= 50000) flush(); }
+  flush();
+  return chunks;
+}
+async function exportPhoto(fmt) {
+  progress("Loading the photo model…", 0.05);
+  cloud.photoBuf ||= await fetchBuffer(cloud.photoUrl, cloud.photoBytes, (g, t) => setLoader("Loading the photo model", g, t));  // always the full-size one
+  const name = `${slug()}_photo`;
+  if (fmt === "pglb" && !region) return download(cloud.photoBuf, `${name}.glb`, "model/gltf-binary");
+  progress("Converting…", 0.5);
+  await tick();
+  let g = parseGlb(cloud.photoBuf);
+  if (region) g = cropPhoto(g, region);
+  const { zipSync, strToU8 } = await lib("zip");
+  if (fmt === "pglb") return download(glbWrite(g), `${name}.glb`, "model/gltf-binary");
+  if (fmt === "pobj") {
+    return download(zipSync({ "model.obj": new Uint8Array(await new Blob(photoObj(g)).arrayBuffer()), "model.mtl": strToU8("newmtl photo\nKd 1 1 1\nmap_Kd photo.jpg\n"), "photo.jpg": [g.jpeg, { level: 0 }] }), `${name}_obj.zip`, "application/zip");
+  }
+  const uv = Float32Array.from(g.uv, (v, i) => (i % 2 ? 1 - v : v)), dae = collada([{ name: "photo", verts: su(g.pos), tris: g.idx, uvs: uv, texture: "photo.jpg" }]);
+  if (fmt === "pkmz") download(await kmz(dae, g.jpeg, "photo.jpg"), `${name}.kmz`, "application/vnd.google-earth.kmz");
+  else download(zipSync({ "model.dae": strToU8(dae), "photo.jpg": [g.jpeg, { level: 0 }] }), `${name}_dae.zip`, "application/zip");
 }
 
 // -- points: PLY / LAS writers (pos world xyz, col 0-255 bytes)
@@ -2276,7 +2412,7 @@ async function runExport(fmt) {
   buttons.forEach((b) => { b.disabled = true; });
   const t0 = performance.now();
   try {
-    await (fmt === "ply" || fmt === "las" ? exportPoints(fmt) : exportModel(fmt));
+    await (fmt === "ply" || fmt === "las" ? exportPoints(fmt) : fmt[0] === "p" ? exportPhoto(fmt) : exportModel(fmt));
     toast(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   } catch (err) {
     console.error(err);
@@ -2335,6 +2471,7 @@ function updateExport() {
   const fine = cloud.fullPointsUrl && (exCell() < 0.1 || exPx() < 0.03), big = (fine ? cloud.fullPointsBytes : 0) + (full && cloud.fullMeshUrl && wantS ? cloud.fullMeshBytes : 0) + (exThin() === 0 && cloud.fullPointsUrl && !fine ? cloud.fullPointsBytes : 0);
   if (big) warn.push(`These settings download full-resolution data (${mbs(big)}) when you export.`);
   $("exWarn").textContent = warn.join(" ");
+  if (cloud.photoUrl) $("exPhotoEst").textContent = `The textured mesh (photo atlas shared by all formats): GLB ≈ ${mbs(cloud.photoBytes)} · KMZ / DAE+JPG ≈ ${mbs(cloud.photoBytes * 0.6)} · OBJ+MTL+JPG ≈ ${mbs(cloud.photoBytes * 0.7)}.${region ? " The area crop keeps only its faces; the photo stays whole." : ""} Content (ground / structures) doesn't apply.`;
 }
 function setContent(m) {
   exContent = m;
@@ -2413,6 +2550,7 @@ async function start() {
     for (const b of box.children) b.setAttribute("aria-pressed", b.dataset.name === m.name);
     open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p),
       { ...(m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {}), sunLoc: m.sun_location,
+        ...(m.photo ? { photoUrl: `models/${m.name}/photo.glb`, photoBytes: m.photo_bytes, ...(m.photo_mobile_bytes ? { photoMobileUrl: `models/${m.name}/photo_mobile.glb`, photoMobileBytes: m.photo_mobile_bytes } : {}) } : {}),
         ...(m.points_full ? { fullPointsUrl: `models/${m.name}/points_full.ply`, fullPointsBytes: m.points_full_bytes, fullPointsCount: m.points_full_count } : {}),
         ...(m.mesh_full ? { fullMeshUrl: `models/${m.name}/mesh_full.ply`, fullMeshBytes: m.mesh_full_bytes } : {}) });
   };

@@ -160,6 +160,19 @@ if not a.no_full:
             entry |= {"mesh_full": True, "mesh_full_bytes": n, "mesh_full_faces": faces}
             print(f"mesh_full: {faces:,} faces, {n / 1e6:.1f} MB")
 
+# Photo-textured mesh from texture.py (unlit GLB with an embedded JPEG atlas): a full and a smaller one for phones.
+for src_name, dst_name, key in (("model.glb", "photo.glb", "photo_bytes"), ("model_mobile.glb", "photo_mobile.glb", "photo_mobile_bytes")):
+    (dest / dst_name).unlink(missing_ok=True)
+    src = Path(a.out_dir) / "textured" / src_name
+    if not src.exists():
+        continue
+    if src.stat().st_size > FULL_LIMIT:
+        print(f"WARNING: {src_name} is {src.stat().st_size / 1e6:.0f} MB, skipped")
+        continue
+    shutil.copy(src, dest / dst_name)
+    entry |= {"photo": True, key: src.stat().st_size}
+    print(f"{dst_name}: {src.stat().st_size / 1e6:.1f} MB")
+
 index_path = site / "models" / "index.json"
 index = json.loads(index_path.read_text()) if index_path.exists() else []
 index = [m for m in index if m["name"] != a.name] + [entry]
