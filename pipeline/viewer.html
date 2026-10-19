@@ -16,10 +16,19 @@
   canvas { position: absolute; inset: 0; display: block; }
   summary { cursor: pointer; font-weight: 600; }
   #look > div, #export > div { display: grid; gap: 9px; margin-top: 9px; }
+  #selbox { position: absolute; border: 2px dashed #ffd23f; background: rgba(255,210,63,.14); pointer-events: none; }
+  #exContent button { font-size: 12px; }
+  select { font: inherit; max-width: 11em; }
+  #export label { justify-content: space-between; }
   .exg { display: grid; gap: 5px; }
   .exb { display: flex; flex-wrap: wrap; gap: 4px; }
   .exb button { flex: 1; white-space: nowrap; }
   button:disabled { opacity: .5; cursor: progress; }
+  fieldset { border: 0; padding: 0; margin: 0; min-width: 0; display: grid; gap: 7px; }
+  fieldset:disabled > :not(legend) { opacity: .45; }
+  legend { font-weight: 600; padding: 0; margin-bottom: 7px; }
+  input[type=number], input[type=date] { font: inherit; width: 5.2em; min-width: 0; }
+  input[type=date] { width: auto; }
   output, small { color: var(--muted); font-size: 12px; }
   output { min-width: 4.5em; text-align: right; }
   button, .btn { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
@@ -58,6 +67,16 @@
   .lbl { position: absolute; left: 0; top: 0; background: rgba(20,22,26,.82); color: #fff; padding: 2px 6px; border-radius: 5px; font-size: 12px; white-space: nowrap; text-align: center; }
   .lbl b { display: block; font-size: 14px; color: #ffd23f; }
   .lbl.pt { font-size: 11px; margin-top: -18px; padding: 1px 5px; }
+  .lbl.tip { margin-top: 20px; font-size: 11px; padding: 1px 5px; background: rgba(20,22,26,.9); }
+  .lbl.sum { margin-top: 18px; background: #5a4a00; }
+  .lbl.area { background: rgba(30,90,40,.9); }
+  #loupe { position: absolute; width: 120px; height: 120px; border-radius: 50%; border: 3px solid #fff; box-shadow: 0 2px 12px rgba(0,0,0,.6); pointer-events: none; }
+  body.measuring #scale { bottom: 72px; }
+  body.measuring #toast { bottom: 80px; }
+  #vcb { position: absolute; right: 12px; bottom: 72px; background: rgba(20,22,26,.9); color: #ffd23f; padding: 6px 12px; border-radius: 6px; font: 600 15px ui-monospace, monospace; border: 1px solid #555; pointer-events: none; }
+  #mbar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; gap: 6px; padding: 6px; max-width: calc(100vw - 20px); }
+  #mbar button, #mbar select { min-height: 44px; padding: 0 12px; }
+  #mbar select { font: inherit; }
 
   #loader, #toast { position: absolute; left: 50%; transform: translateX(-50%); background: rgba(20,22,26,.9); color: #eee; border-radius: 10px; padding: 10px 14px; }
   #loader { top: 45%; width: min(340px, calc(100vw - 40px)); text-align: center; }
@@ -92,6 +111,7 @@
 </head>
 <body>
 <div id="labels"></div>
+<div id="selbox" hidden></div>
 
 <div id="panel" class="card">
   <button id="toggle" aria-expanded="true"><span>Walk viewer</span><span class="chev">▾</span></button>
@@ -99,6 +119,8 @@
     <div id="status">Loading…</div>
     <div id="models" hidden></div>
     <div class="row">Display <div class="seg" id="displays"></div></div>
+    <div class="row">Quality <div class="seg" id="quality"></div></div>
+    <small id="qualityHint"></small>
     <div class="row">Colour <div class="seg" id="colors"></div></div>
     <label>Point size <input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
     <label><input id="edl" type="checkbox" checked> Depth shading (eye-dome)</label>
@@ -106,28 +128,49 @@
       <div class="row">Background <div class="seg" id="bgs"></div></div>
       <label><input id="grid" type="checkbox"> Ground grid</label>
       <label><input id="shadows" type="checkbox"> Sun shadows (surface)</label>
-      <label>Sun <input id="sun" type="range" min="0" max="359" value="45" aria-label="Sun direction"></label>
+      <p class="hint" id="sunHint" hidden><b>Sun</b> — it only lights the Surface display. <button id="toSurface" type="button">Switch to Surface</button></p>
+      <fieldset id="sunBox">
+        <legend>Sun</legend>
+        <div class="row"><div class="seg" id="sunModes"></div></div>
+        <div id="solar">
+          <label>Date <input id="sunDate" type="date"></label>
+          <label>Time <input id="sunTime" type="range" min="0" max="1430" step="10" aria-label="Time of day"><output id="sunTimeOut"></output><button id="sunPlay" type="button" aria-label="Animate the day">▶</button></label>
+          <div class="row">Lat <input id="lat" type="number" step="0.1" min="-90" max="90"> Lon <input id="lon" type="number" step="0.1" min="-180" max="180"></div>
+          <div class="row"><label>UTC <input id="utc" type="number" step="0.5" min="-12" max="14"></label><button id="geo" type="button">Use my location</button></div>
+          <small id="sunInfo"></small>
+        </div>
+        <div id="manual" hidden>
+          <label>Azimuth <input id="sunAz" type="range" min="0" max="359" aria-label="Sun azimuth"><output id="sunAzOut"></output></label>
+          <label>Elevation <input id="sunEl" type="range" min="5" max="90" aria-label="Sun elevation"><output id="sunElOut"></output></label>
+        </div>
+      </fieldset>
     </div></details>
     <details id="export" hidden><summary>Export</summary><div>
-      <div class="exg" id="exMesh">
-        <b>Surface mesh</b>
-        <label>Detail <input id="exFaces" type="range" min="0" max="100" value="59" aria-label="Target face count"><output id="exFacesOut"></output></label>
-        <div class="exb"><button data-x="mstl">STL</button><button data-x="mobj">OBJ</button><button data-x="mglb">GLB</button><button data-x="mdae">DAE</button><button data-x="mkmz">KMZ</button></div>
-        <small id="exMeshEst"></small>
+      <div class="exg"><b>Content</b><div class="seg" id="exContent"></div></div>
+      <div class="exg">
+        <b>Area</b>
+        <div class="exb"><button id="exSel" type="button" aria-pressed="false">Select area</button><button id="exVis" type="button">Visible area</button><button id="exClr" type="button">Whole model</button></div>
+        <small id="exArea"></small>
       </div>
       <div class="exg">
-        <b>Terrain for SketchUp</b>
-        <label>Cell <input id="exCell" type="range" min="0.1" max="0.5" step="0.05" value="0.1" aria-label="Terrain cell size"><output id="exCellOut"></output></label>
-        <div class="exb"><button data-x="tkmz">KMZ + photo</button><button data-x="tdae">DAE + PNG</button><button data-x="tstl">STL</button></div>
-        <small id="exTerrainEst"></small>
+        <b>Resolution</b>
+        <label>Terrain cell <select id="exCell"><option value="0">auto (10 cm)</option><option value="0.02">2 cm</option><option value="0.05">5 cm</option><option value="0.1">10 cm</option><option value="0.25">25 cm</option><option value="0.5">50 cm</option></select></label>
+        <label>Terrain photo <select id="exPx"><option value="0.01">1 cm/px</option><option value="0.02">2 cm/px</option><option value="0.03" selected>3 cm/px</option><option value="0.05">5 cm/px</option></select></label>
+        <label>Mesh detail <input id="exFaces" type="range" min="0" max="100" value="58" aria-label="Target face count"><output id="exFacesOut"></output></label>
+        <label>Points <select id="exThin"><option value="-1">as published</option><option value="0">full density</option><option value="1000000">thin to 1M</option><option value="500000">thin to 500k</option><option value="250000">thin to 250k</option></select></label>
+      </div>
+      <div class="exg">
+        <b>Model</b>
+        <div class="exb"><button data-x="stl">STL</button><button data-x="obj">OBJ</button><button data-x="glb">GLB</button><button data-x="dae">DAE</button><button data-x="kmz">KMZ</button><button data-x="zip">DAE+PNG</button></div>
+        <small id="exEst"></small>
       </div>
       <div class="exg">
         <b>Points</b>
-        <label>Thin to <select id="exThin"><option value="0">all points</option><option value="1000000">1M</option><option value="500000">500k</option><option value="250000">250k</option></select></label>
-        <div class="exb"><button data-x="ppl">PLY</button><button data-x="plas">LAS</button></div>
+        <div class="exb"><button data-x="ply">PLY</button><button data-x="las">LAS</button></div>
         <small id="exPointsEst"></small>
       </div>
-      <p class="hint">SketchUp Free: import the STL (choose Meters). SketchUp Pro/Go: the KMZ keeps the photo texture; DAE works too. Points: PLY or LAS for Scan Essentials / CloudCompare. STL, DAE, KMZ and LAS are Z-up with north +Y; OBJ, GLB and PLY are Y-up like the viewer. Only PLY, OBJ and GLB keep vertex colours. Files are built in your browser, nothing is uploaded, and contain no real-world coordinates.</p>
+      <small id="exWarn"></small>
+      <p class="hint">SketchUp Free: import the STL (choose Meters). SketchUp Pro/Go: the KMZ keeps the terrain photo; DAE works too. Points: PLY or LAS for Scan Essentials / CloudCompare. Ground is the terrain surface; Structures are the scanned mesh above it (house, walls, trees, furniture). STL, DAE, KMZ and LAS are Z-up with north +Y; OBJ, GLB and PLY are Y-up like the viewer. Only PLY, OBJ and GLB keep vertex colours; the terrain photo travels with DAE, KMZ and the zip. Phone LiDAR resolves roughly 1–2 cm locally, so cells or photos finer than that only interpolate; the finest settings load the full-resolution data (tens of MB). Files are built in your browser, nothing is uploaded, and they contain no real-world coordinates.</p>
     </div></details>
     <label><input id="trackpad" type="checkbox"> Trackpad gestures (off = mouse wheel zooms)</label>
     <label class="btn" style="justify-content:center">Open .ply file…<input id="file" type="file" accept=".ply" hidden></label>
@@ -157,13 +200,26 @@
 </div>
 
 <div id="scale"><i></i><span></span></div>
+<canvas id="loupe" width="120" height="120" hidden></canvas>
+<div id="vcb" hidden></div>
+<div id="mbar" class="card" hidden>
+  <button id="mUndo" type="button" aria-label="Undo last point">↶ Undo</button>
+  <button id="mDone" type="button" aria-label="Finish this measurement">Done</button>
+  <button id="mClose" type="button" aria-label="Close the shape and measure its area">Close</button>
+  <button id="mCopy" type="button" aria-label="Copy measurements">Copy</button>
+  <select id="mUnit" aria-label="Units"></select>
+</div>
 <div id="loader" hidden><div></div><div class="bar"><i></i></div></div>
 <div id="toast" hidden></div>
 <div id="drop">Drop .ply to view</div>
 <div id="help" hidden><div class="card"><h3>Mouse &amp; trackpad</h3><dl id="gestures"></dl><h3 style="margin-top:12px">Shortcuts</h3><dl>
   <dt>T P L F</dt><dd>Top · Perspective · Plan (orthographic) · Fit</dd>
   <dt>S</dt><dd>Cycle display: points / solid / surface</dd>
-  <dt>M</dt><dd>Measure: click two points</dd><dt>Esc</dt><dd>Cancel / clear measurements</dd>
+  <dt>M</dt><dd>Measure (tape): click points, it snaps to endpoints, midpoints and surfaces, and to the red / green / blue axes</dd>
+  <dt>Shift</dt><dd>While measuring: lock the direction</dd><dt>0-9 Enter</dt><dd>Type a length, Enter places the point</dd>
+  <dt>Enter</dt><dd>Finish a measurement (double-click on the first point closes a shape and shows its area)</dd>
+  <dt>Ctrl Z</dt><dd>Undo the last point</dd><dt>Esc</dt><dd>Cancel / clear measurements</dd>
+  <dt>Touch</dt><dd>Tap to place; press and hold for a magnifier, slide to fine-tune, release to place</dd>
   <dt>Arrows</dt><dd>Orbit (Shift: pan)</dd><dt>+ −</dt><dd>Zoom</dd>
   <dt>C E</dt><dd>Colour mode · depth shading</dd><dt>?</dt><dd>This help</dd>
 </dl><p class="hint">The Nav buttons act like dragging in that direction; hold to repeat. The URL holds the current view, so you can share it.</p></div></div>
@@ -177,7 +233,7 @@ import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
 // World is ARKit's: X east, Y up, Z south (north = -Z), metres. Colours are shown raw (no colour management).
 THREE.ColorManagement.enabled = false;
 const $ = (id) => document.getElementById(id);
-const pr = Math.min(devicePixelRatio, 2);
+let pr = Math.min(devicePixelRatio, 2);  // changes with the quality preset and while the camera moves
 const renderer = new THREE.WebGLRenderer({ antialias: false, alpha: true });  // transparent: the CSS gradient is the background
 renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 renderer.setPixelRatio(pr);
@@ -190,9 +246,11 @@ document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();   // cloud (+ mesh), goes through the EDL pass
 const overlay = new THREE.Scene(); // measurements, drawn on top without depth test
 // Surface lighting is gentle so photo colours survive (intensities are x PI: three's Lambert divides by PI).
-// The photo colours already contain baked lighting, so ambient dominates and the sun only adds relief and shadow.
-scene.add(new THREE.HemisphereLight(0xffffff, 0xbbbbbb, 0.62 * Math.PI));
-const sun = new THREE.DirectionalLight(0xffffff, 0.5 * Math.PI);
+// The photo colours already contain baked lighting, so the sun adds relief and shadow rather than replacing them:
+// a lit up-facing surface comes out near its photo colour, a shadowed one at about half.
+const hemi = new THREE.HemisphereLight(0xffffff, 0xbbbbbb, 0.5 * Math.PI);
+const sun = new THREE.DirectionalLight(0xffffff, 0.7 * Math.PI);
+scene.add(hemi);
 Object.assign(sun.shadow, { bias: -0.0005, normalBias: 0.05 });
 sun.shadow.mapSize.set(2048, 2048);
 scene.add(sun, sun.target);
@@ -335,7 +393,7 @@ async function open(label, getBuffer, opts = {}) {
 function percentile(sorted, p) { return sorted[Math.floor(p * (sorted.length - 1))]; }
 
 // A PLY with faces (a dropped mesh) gives a surface, and its vertices serve as the points.
-function show(parsed, label, { local, meshUrl, meshBytes }) {
+function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes }) {
   let geom = parsed, meshGeom = null;
   if (parsed.index) {
     meshGeom = parsed;
@@ -365,17 +423,22 @@ function show(parsed, label, { local, meshUrl, meshBytes }) {
   const m = Math.min(n, 5000), sample = new Float32Array(3 * m);  // a spread of points, for framing the view
   for (let i = 0; i < m; i++) { const j = 3 * Math.floor(i * n / m); sample.set(a.subarray(j, j + 3), 3 * i); }
   cloud = { geom, obj: new THREE.Points(geom, solid), size, center, local, attrs: { rgb: geom.attributes.color },
-    ground: percentile(ys, 0.01), top: percentile(ys, 0.995), spacing, meshUrl, meshBytes, sample, label };
+    ground: percentile(ys, 0.01), top: percentile(ys, 0.995), spacing, meshUrl, meshBytes, sample, label,
+    fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes };
+  region = null;
+  analysis = null;
+  selecting = false;
   scene.add(cloud.obj);
   grid.position.set(center.x, cloud.ground, center.z);
-  updateSun();
+  setSunLocation(sunLoc);  // also refreshes the sun
   if (meshGeom) surf = makeSurface(meshGeom);
   setColorMode(colorMode);
   const hasSurface = !!(surf || meshUrl), sv = !local && startView;
   $("displays").lastChild.hidden = !hasSurface;
   $("export").hidden = false;
-  $("exMesh").hidden = !hasSurface;
-  updateExport();
+  document.querySelectorAll("#exContent button").forEach((b) => { b.hidden = !hasSurface && b.dataset.m !== "ground"; });
+  setContent(hasSurface ? exContent : "ground");
+  scheduleAnalysis();
   $("status").textContent = `${label} · ${(n / 1e6).toFixed(2)}M points · ${size.x.toFixed(1)} × ${size.z.toFixed(1)} m · ${size.y.toFixed(1)} m tall`;
 
   const r = 0.5 * size.length();
@@ -389,10 +452,13 @@ function show(parsed, label, { local, meshUrl, meshBytes }) {
     applyNav();
     if (sv.z) { setPlan(true); nav.target.fromArray(sv.cam, 3); nav.planH = sv.z; applyNav(); }
   } else goView(0.85, Math.PI / 4, 0);
+  if (sv && sv.m) loadChains(sv.m);
   const want = surf && !sv ? "surface" : sv && sv.d;
   display = null;
   setDisplay(want in DISPLAYS && (want !== "surface" || hasSurface) ? want : "solid");
   startView = null;
+  updateQualityHint();
+  applyQuality(quality);
   invalidate();
 }
 
@@ -405,7 +471,7 @@ function makeSurface(geom) {
   obj.visible = false;
   obj.castShadow = obj.receiveShadow = true;
   scene.add(obj);
-  return { geom, obj, attrs: { rgb: geom.attributes.color } };
+  return { geom, obj, attrs: { rgb: geom.attributes.color }, origIndex: geom.index };  // origIndex: the full face list (quality may thin the drawn one)
 }
 async function loadSurface() {
   const c = cloud;
@@ -418,6 +484,7 @@ async function loadSurface() {
     if (c !== cloud) return false;
     surf ||= makeSurface(loader.parse(buf));
     setColorMode(colorMode);
+    await applySurface(QUALITY[quality]);
     $("loader").hidden = true;
     return true;
   } catch (err) {
@@ -437,6 +504,7 @@ async function setDisplay(d) {
   cloud.obj.material = d === "points" ? dots : solid;
   if (surf) surf.obj.visible = d === "surface";
   renderer.shadowMap.needsUpdate = true;
+  syncSunUI();
   scheduleHash();
   invalidate();
 }
@@ -454,27 +522,175 @@ const cycleDisplay = () => {
 // css px per metre for the orthographic plan view.
 function updatePointSize() {
   if (!cloud) return;
-  const k = +$("size").value * cloud.spacing * (plan ? innerHeight / nav.planH : 1.73);
+  const k = +$("size").value * cloud.spacing * Math.sqrt(strideNow) * (plan ? innerHeight / nav.planH : 1.73);  // thinned points grow to keep coverage
   dots.size = 1.04 * k;
   solid.size = 1.6 * k;
 }
 
-// ---- Look: background, ground grid, sun (soft shadows in Surface mode)
-const look = { bg: "sky", grid: true, shadows: true, sun: 45 };
-try { Object.assign(look, JSON.parse(localStorage.getItem("look") || "{}")); } catch {}
-const BGS = { sky: "Sky", dark: "Dark", light: "Light" };
-function updateSun() {
+// ---- Quality for viewing: pixel ratio, how many points are drawn (every stride-th), mesh detail, shadows.
+// While the camera moves it renders at a lower pixel ratio with half the points, and refines ~200 ms after it stops.
+// Max also loads the full-resolution points / mesh (only then, and the sizes are shown first).
+const QUALITY = {
+  fast: { name: "Fast", pr: 1, stride: 4, mesh: 150000, edl: false, shadow: 1024 },
+  balanced: { name: "Balanced", pr: 1.5, stride: 2, mesh: 300000, edl: true, shadow: 2048 },
+  high: { name: "High", pr: 2, stride: 1, mesh: 0, edl: true, shadow: 2048 },
+  max: { name: "Max", pr: 3, stride: 1, mesh: 0, edl: true, shadow: 4096, full: true },
+};
+let quality = matchMedia("(max-width: 600px)").matches ? "balanced" : "high", strideNow = 1, moving = false, moveTimer, qToken = 0;
+try { const s = localStorage.getItem("quality"); if (QUALITY[s]) quality = s; } catch {}
+function setPointStride(s) {  // draw every s-th point of the current point geometry via an index buffer
+  strideNow = s;
   if (!cloud) return;
-  const az = look.sun * Math.PI / 180, el = 0.95, r = 0.5 * cloud.size.length();
-  const dir = new THREE.Vector3(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
+  const g = cloud.obj.geometry, n = g.attributes.position.count;
+  g.userData.thin ||= {};
+  if (s <= 1) g.setIndex(null);
+  else {
+    g.userData.thin[s] ||= (() => { const a = new Uint32Array(Math.ceil(n / s)); for (let i = 0; i < a.length; i++) a[i] = i * s; return new THREE.BufferAttribute(a, 1); })();
+    g.setIndex(g.userData.thin[s]);
+  }
+  invalidate();
+}
+function applyQualityView() {  // pixel ratio and point budget for the current state (moving or still)
+  const q = QUALITY[quality], want = Math.min(devicePixelRatio, moving ? Math.min(1, q.pr) : q.pr);
+  if (want !== pr) { pr = want; renderer.setPixelRatio(pr); resize(); }
+  setPointStride(moving ? Math.max(2, q.stride * 2) : q.stride);
+}
+function markMoving() {
+  if (!moving) { moving = true; applyQualityView(); }
+  clearTimeout(moveTimer);
+  moveTimer = setTimeout(() => { moving = false; applyQualityView(); }, 200);
+}
+async function applySurface(q) {  // mesh detail: simplified on the fly, the published mesh, or the full-resolution one
+  if (!surf) return;
+  if (q.full && cloud.fullMeshUrl) {
+    if (!surf.fullItem) {
+      const geom = await fetchParsed(cloud.fullMeshUrl, cloud.fullMeshBytes, "full-resolution mesh");
+      geom.computeVertexNormals();
+      surf.fullItem = { geom, attrs: { rgb: geom.attributes.color } };
+      $("loader").hidden = true;
+    }
+    surf.obj.geometry = surf.fullItem.geom;
+    setColorMode(colorMode);
+  } else {
+    surf.obj.geometry = surf.geom;
+    const n = surf.origIndex.count / 3;
+    if (q.mesh && n > q.mesh) {
+      if (!surf.viewIndex?.[q.mesh]) {
+        const { MeshoptSimplifier: S } = await lib("simp");
+        await S.ready;
+        (surf.viewIndex ||= {})[q.mesh] = new THREE.BufferAttribute(S.simplify(Uint32Array.from(surf.origIndex.array), surf.geom.attributes.position.array, 3, q.mesh * 3, 0.5)[0], 1);
+      }
+      surf.geom.setIndex(surf.viewIndex[q.mesh]);
+    } else surf.geom.setIndex(surf.origIndex);
+  }
+  renderer.shadowMap.needsUpdate = true;
+  invalidate();
+}
+async function applyQuality(name) {
+  const my = ++qToken, q = QUALITY[quality = name];
+  try { localStorage.setItem("quality", name); } catch {}
+  document.querySelectorAll("#quality button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === name));
+  $("edl").checked = q.edl;
+  sun.shadow.mapSize.set(q.shadow, q.shadow);
+  sun.shadow.map?.dispose();
+  sun.shadow.map = null;
+  renderer.shadowMap.needsUpdate = true;
+  applyQualityView();
+  if (!cloud) return;
+  try {
+    if (q.full && cloud.fullPointsUrl) {
+      await fullPoints();
+      if (my !== qToken) return;
+      cloud.obj.geometry = cloud.fullItem.geom;
+      setColorMode(colorMode);
+      $("loader").hidden = true;
+    } else cloud.obj.geometry = cloud.geom;
+    setPointStride(moving ? Math.max(2, q.stride * 2) : q.stride);
+    if (my === qToken) await applySurface(q);
+  } catch (err) { console.error(err); toast("Could not load the full-resolution data"); $("loader").hidden = true; }
+  invalidate();
+}
+function updateQualityHint() {
+  const fp = cloud?.fullPointsUrl ? `points ${mbs(cloud.fullPointsBytes)}` : "", fm = cloud?.fullMeshUrl ? `mesh ${mbs(cloud.fullMeshBytes)}` : "";
+  $("qualityHint").textContent = fp || fm ? `Max downloads full-resolution data when chosen: ${[fp, fm].filter(Boolean).join(" + ")}.` : "Max has no extra data for this model.";
+}
+for (const [k, q] of Object.entries(QUALITY)) {
+  const b = Object.assign(document.createElement("button"), { textContent: q.name, title: `${q.name}: ${q.stride > 1 ? `1 in ${q.stride} points, ` : "all points, "}pixel ratio ${q.pr}${q.mesh ? `, mesh ≤ ${q.mesh / 1000}k faces` : ""}${q.full ? ", full-resolution data" : ""}` });
+  b.dataset.m = k;
+  b.onclick = () => applyQuality(k);
+  $("quality").append(b);
+}
+applyQuality(quality);
+
+// ---- Look: background, ground grid, sun (soft shadows in Surface mode)
+const look = { bg: "sky", grid: true, shadows: true, mode: "solar", az: 135, el: 50 };  // az: compass degrees, from north
+try { Object.assign(look, JSON.parse(localStorage.getItem("look") || "{}")); } catch {}
+const BGS = { sky: "Sky", dark: "Dark", light: "Light" }, SUN_MODES = { solar: "Date & time", manual: "Manual" };
+const RAD = Math.PI / 180, fmtTime = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+// Solar position from the NOAA / SunCalc formulas. Returns compass azimuth (degrees clockwise from north) and elevation.
+function sunPosition(ms, lat, lon) {
+  const d = ms / 864e5 - 0.5 + 2440588 - 2451545, M = RAD * (357.5291 + 0.98560028 * d);
+  const L = M + RAD * (1.9148 * Math.sin(M) + 0.02 * Math.sin(2 * M) + 0.0003 * Math.sin(3 * M)) + RAD * 102.9372 + Math.PI;
+  const e = RAD * 23.4397, dec = Math.asin(Math.sin(e) * Math.sin(L)), ra = Math.atan2(Math.sin(L) * Math.cos(e), Math.cos(L));
+  const H = RAD * (280.16 + 360.9856235 * d + lon) - ra, phi = RAD * lat;
+  const az = Math.atan2(Math.sin(H), Math.cos(H) * Math.sin(phi) - Math.tan(dec) * Math.cos(phi)) + Math.PI;  // SunCalc measures from south
+  return { az: (az / RAD + 360) % 360, el: Math.asin(Math.sin(phi) * Math.sin(dec) + Math.cos(phi) * Math.cos(dec) * Math.cos(H)) / RAD };
+}
+const sunInputs = () => ({ lat: parseFloat($("lat").value), lon: parseFloat($("lon").value), date: $("sunDate").value, utc: parseFloat($("utc").value) || 0 });
+const sunMs = ({ date, utc }, minutes) => { const [y, m, d] = date.split("-").map(Number); return Date.UTC(y, m - 1, d) + minutes * 6e4 - utc * 36e5; };
+const sunKnown = (s) => isFinite(s.lat) && isFinite(s.lon) && !!s.date;
+function currentSun() {
+  const s = sunInputs();
+  if (look.mode === "solar" && sunKnown(s)) return { ...sunPosition(sunMs(s, +$("sunTime").value), s.lat, s.lon), solar: true };
+  return { az: look.az, el: look.el, solar: false };
+}
+function updateSun() {  // aim the sun and shadow camera, dim the lights for dusk and night, redo the shadow map
+  if (!cloud) return;
+  const { az, el } = currentSun(), a = az * RAD, e = Math.max(el, 1) * RAD, r = 0.5 * cloud.size.length();
+  const dir = new THREE.Vector3(Math.sin(a) * Math.cos(e), Math.sin(e), -Math.cos(a) * Math.cos(e));  // X east, Z south: north is -Z
   sun.position.copy(cloud.center).addScaledVector(dir, 2 * r);
   sun.target.position.copy(cloud.center);
   sun.target.updateMatrixWorld();
   Object.assign(sun.shadow.camera, { left: -r, right: r, top: r, bottom: -r, near: 0.1, far: 4 * r });
   sun.shadow.camera.updateProjectionMatrix();
-  sun.castShadow = look.shadows;
+  const day = THREE.MathUtils.smoothstep(el, 0, 12);  // 0 at the horizon, 1 above ~12 degrees
+  sun.intensity = 0.7 * Math.PI * day;
+  sun.color.setRGB(1, 0.72 + 0.28 * day, 0.5 + 0.5 * day);  // warm when low
+  hemi.intensity = Math.PI * (0.16 + 0.34 * THREE.MathUtils.smoothstep(el, -6, 8));
+  sun.castShadow = look.shadows && el > 0.5;
   renderer.shadowMap.needsUpdate = true;
   invalidate();
+}
+// Keep the time slider within sunrise..sunset for the date and place, and refresh the readouts.
+function refreshSun() {
+  const s = sunInputs();
+  if (sunKnown(s)) {
+    let lo = -1, hi = -1;
+    for (let t = 0; t < 1440; t += 10) if (sunPosition(sunMs(s, t), s.lat, s.lon).el > 0) { if (lo < 0) lo = t; hi = t; }
+    if (lo < 0) { lo = 0; hi = 1430; }  // polar night / midnight sun
+    $("sunTime").min = lo; $("sunTime").max = hi;
+    $("sunTime").value = Math.min(hi, Math.max(lo, +$("sunTime").value));
+  }
+  const cur = currentSun(), compass = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(cur.az / 45) % 8];
+  $("sunTimeOut").textContent = fmtTime(+$("sunTime").value);
+  $("sunAzOut").textContent = `${look.az}° ${["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(look.az / 45) % 8]}`;
+  $("sunElOut").textContent = `${look.el}°`;
+  const off = (s.utc >= 0 ? "+" : "") + s.utc;
+  $("sunInfo").textContent = cur.solar
+    ? `Sun ${cur.az.toFixed(0)}° ${compass}, elevation ${cur.el.toFixed(0)}°${cur.el <= 0 ? " (night)" : ""} · local time at UTC${off} (${sunTzNote})`
+    : look.mode === "solar" ? "Enter a latitude, longitude and date (or use your location). Showing the manual sun meanwhile." : "";
+  updateSun();
+}
+let sunTzNote = "your browser's time zone";
+function syncSunUI() {  // the sun only lights the Surface display
+  const on = display === "surface";
+  $("sunBox").disabled = !on;
+  $("shadows").disabled = !on;
+  $("sunHint").hidden = on;
+  $("toSurface").hidden = !(surf || cloud?.meshUrl);
+  document.querySelectorAll("#sunModes button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === look.mode));
+  $("solar").hidden = look.mode !== "solar";
+  $("manual").hidden = look.mode !== "manual";
 }
 function applyLook() {
   document.body.dataset.bg = look.bg;
@@ -483,11 +699,58 @@ function applyLook() {
   grid.visible = look.grid;
   $("grid").checked = look.grid;
   $("shadows").checked = look.shadows;
-  $("sun").value = look.sun;
-  updateSun();
+  $("sunAz").value = look.az;
+  $("sunEl").value = look.el;
+  syncSunUI();
+  refreshSun();
   try { localStorage.setItem("look", JSON.stringify(look)); } catch {}
   invalidate();
 }
+// Defaults: today, the browser's UTC offset, no location until a model (or the user) provides one.
+$("sunDate").value = new Date().toLocaleDateString("en-CA");
+$("utc").value = -new Date().getTimezoneOffset() / 60;
+$("sunTime").value = 14 * 60;
+function setSunLocation(loc) {  // a published model's rounded location
+  if (loc) {
+    $("lat").value = loc.lat;
+    $("lon").value = loc.lon;
+    // Political zones stray from lon/15 (Uruguay is UTC−3, not −4), so prefer an explicit offset,
+    // then the viewer's own zone when it's plausibly the same region, then the longitude estimate.
+    const browser = -new Date().getTimezoneOffset() / 60, guess = loc.lon / 15;
+    if (loc.utc != null) [$("utc").value, sunTzNote] = [loc.utc, "from the model"];
+    else if (Math.abs(browser - guess) <= 1.5) [$("utc").value, sunTzNote] = [browser, "your time zone, edit if needed"];
+    else [$("utc").value, sunTzNote] = [Math.round(guess), "estimated from the longitude, edit if needed"];
+  }
+  refreshSun();
+}
+for (const [m, text] of Object.entries(SUN_MODES)) {
+  const b = Object.assign(document.createElement("button"), { textContent: text });
+  b.dataset.m = m;
+  b.onclick = () => { look.mode = m; applyLook(); };
+  $("sunModes").append(b);
+}
+for (const id of ["lat", "lon", "sunDate", "utc"]) $(id).oninput = () => { if (id === "utc") sunTzNote = "set by you"; refreshSun(); };
+$("sunTime").oninput = refreshSun;
+$("sunAz").oninput = (e) => { look.az = +e.target.value; applyLook(); };
+$("sunEl").oninput = (e) => { look.el = +e.target.value; applyLook(); };
+$("toSurface").onclick = () => setDisplay("surface");
+let sunTimer = null;
+$("sunPlay").onclick = () => {  // animate the day: 10 minutes every 120 ms
+  if (sunTimer) { clearInterval(sunTimer); sunTimer = null; $("sunPlay").textContent = "▶"; return; }
+  $("sunPlay").textContent = "❚❚";
+  sunTimer = setInterval(() => {
+    const t = $("sunTime"), next = +t.value + 10;
+    t.value = next > +t.max ? t.min : next;
+    refreshSun();
+  }, 120);
+};
+$("geo").onclick = () => navigator.geolocation?.getCurrentPosition((p) => {  // only on click; never stored or sent anywhere
+  $("lat").value = p.coords.latitude.toFixed(2);
+  $("lon").value = p.coords.longitude.toFixed(2);
+  $("utc").value = -new Date().getTimezoneOffset() / 60;
+  sunTzNote = "your browser's time zone";
+  refreshSun();
+}, () => toast("Could not get your location"));
 for (const [m, text] of Object.entries(BGS)) {
   const b = Object.assign(document.createElement("button"), { textContent: text });
   b.dataset.m = m;
@@ -496,7 +759,6 @@ for (const [m, text] of Object.entries(BGS)) {
 }
 $("grid").onchange = (e) => { look.grid = e.target.checked; applyLook(); };
 $("shadows").onchange = (e) => { look.shadows = e.target.checked; applyLook(); };
-$("sun").oninput = (e) => { look.sun = +e.target.value; applyLook(); };
 applyLook();
 
 // ---- Colour modes
@@ -511,7 +773,7 @@ for (let i = 0; i < 256; i++) {
 function setColorMode(m) {  // applies to the points and, once loaded, the surface
   colorMode = m;
   document.querySelectorAll("#colors button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === m));
-  for (const item of cloud ? [cloud, surf] : []) {
+  for (const item of cloud ? [cloud, cloud.fullItem, surf, surf?.fullItem] : []) {
     if (!item) continue;
     if (!item.attrs[m]) {
       const p = item.geom.attributes.position.array, n = p.length / 3, c = new Float32Array(n * 3);
@@ -619,7 +881,7 @@ function setPlan(on) {
 
 function parseHash() {
   const q = new URLSearchParams(location.hash.slice(1)), v = (q.get("cam") || "").split(",").map(Number);
-  return { cam: v.length === 6 && v.every(Number.isFinite) ? v : null, d: q.get("d"), z: +q.get("z") || 0 };
+  return { cam: v.length === 6 && v.every(Number.isFinite) ? v : null, d: q.get("d"), z: +q.get("z") || 0, m: q.get("m") };
 }
 let hashTimer;
 function scheduleHash() {
@@ -630,10 +892,13 @@ function scheduleHash() {
     const c = camera.position, t = nav.target;
     const q = [`cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`, `d=${display}`];
     if (plan) q.push(`z=${+nav.planH.toFixed(2)}`);
+    const m = chainsToHash();
+    if (m && m.length < 1500) q.push(`m=${m}`);  // measurements travel with the link while they stay short
     history.replaceState(null, "", `${location.pathname}${location.search}#${q.join("&")}`);
   }, 400);
 }
 function applyNav() {
+  markMoving();
   if (plan) updateOrtho();
   camera.position.copy(nav.target).add(nav.off);
   camera.lookAt(nav.target);
@@ -707,13 +972,35 @@ function showPivot(p) {
   invalidate();
 }
 
-// ---- Measuring: pick the nearest cloud point inside a ~7 px cone around the click ray
-const measures = [], labels = [];
-let measuring = false, pending = null;
-const fmt = (v) => `${Math.abs(v).toFixed(Math.abs(v) < 10 ? 2 : 1)} m`;
+// ---- Measuring, SketchUp tape-measure style: snaps to endpoints, midpoints and the surface, infers the red / green /
+// blue axes, shows a live rubber band, takes a typed length, chains points into polylines and closes areas.
+const chains = [], labels = [], live = [];  // chains: {pts: [Vector3], closed, done}; live: labels that follow the cursor
+let measuring = false, hover = null, vcb = "", lockDir = null;
+let unit = "m";
+try { unit = localStorage.getItem("unit") || "m"; } catch {}
+const UNITS = { m: "m / cm", mm: "mm", ft: "ft / in" };
+const fmt = (v) => {  // a length in the chosen unit
+  const a = Math.abs(v);
+  if (unit === "mm") return `${Math.round(a * 1000)} mm`;
+  if (unit === "ft") { const inch = a / 0.0254, ft = Math.floor(inch / 12); return `${ft}' ${(inch - 12 * ft).toFixed(1)}"`; }
+  return `${a.toFixed(a < 10 ? 2 : 1)} m`;
+};
+const fmtArea = (v) => (unit === "ft" ? `${(v * 10.7639).toFixed(1)} ft²` : `${v.toFixed(v < 100 ? 2 : 1)} m²`);
+const AXES = { x: { v: new THREE.Vector3(1, 0, 0), color: 0xff4d4d, name: "red" }, z: { v: new THREE.Vector3(0, 0, 1), color: 0x4ddb4d, name: "green" }, y: { v: new THREE.Vector3(0, 1, 0), color: 0x4d8dff, name: "blue" } };
+const KINDS = { endpoint: ["Endpoint", 0x4ddb4d], midpoint: ["Midpoint", 0x3fd8e8], face: ["On face", 0xffffff], point: ["On point", 0xffffff] };
 const lineMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
-const helperMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4, depthTest: false });
+const helperMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.35, depthTest: false });
 const markMat = new THREE.PointsMaterial({ color: 0xffd23f, size: 9, sizeAttenuation: false, depthTest: false });
+const measureGroup = new THREE.Group();
+const rubLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false }));
+const rubMark = new THREE.Points(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3()]), new THREE.PointsMaterial({ color: 0xffffff, size: 13, sizeAttenuation: false, depthTest: false }));
+for (const o of [measureGroup, rubLine, rubMark]) { o.frustumCulled = false; overlay.add(o); }
+rubLine.visible = rubMark.visible = false;
+const mkLabel = (cls) => { const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}` }); el.hidden = true; $("labels").append(el); return { el, pos: new THREE.Vector3() }; };
+const rubLbl = mkLabel(""), tip = mkLabel("tip");
+live.push(rubLbl, tip);
+const openChain = () => { const c = chains[chains.length - 1]; return c && !c.closed && !c.done ? c : null; };
+const lastPoint = () => { const c = openChain(); return c ? c.pts[c.pts.length - 1] : null; };
 
 function pick(x, y, radiusPx = 7) {
   const r = renderer.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
@@ -731,60 +1018,253 @@ function pick(x, y, radiusPx = 7) {
   return best < 0 ? null : new THREE.Vector3(p[best], p[best + 1], p[best + 2]);
 }
 
-function addLabel(pos, html, cls = "") {
-  const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}`, innerHTML: html });
-  $("labels").append(el);
-  labels.push({ el, pos });
+const toScreen = (p) => { tmp.copy(p).project(camera); return tmp.z < 1 ? [(tmp.x * 0.5 + 0.5) * innerWidth, (0.5 - tmp.y * 0.5) * innerHeight] : null; };
+// What the cursor is on, best first: an existing endpoint, a midpoint, then the surface / cloud point. When a first
+// point exists, a direction within ~3 degrees of an axis snaps onto that axis. Shift locks the current direction.
+function snapAt(x, y, shift) {
+  const P0 = lastPoint(), touch = lastPointerType === "touch", tolEnd = touch ? 22 : 13, tolMid = touch ? 18 : 11;
+  let best = null;
+  const consider = (p, kind, tol) => {
+    const s = toScreen(p), d = s && Math.hypot(s[0] - x, s[1] - y);
+    if (s && d <= tol && (!best || d < best.d)) best = { p: p.clone(), kind, d };
+  };
+  for (const c of chains) for (const p of c.pts) consider(p, "endpoint", tolEnd);
+  if (!best) for (const c of chains) for (let i = 0; i < c.pts.length - 1 + (c.closed ? 1 : 0); i++) consider(c.pts[i].clone().add(c.pts[(i + 1) % c.pts.length]).multiplyScalar(0.5), "midpoint", tolMid);
+  if (!best && cloud) {
+    const p = pick(x, y, touch ? 14 : 9);
+    if (p) best = { p, kind: display === "surface" && surf ? "face" : "point", d: 0 };
+  }
+  if (!best) return null;
+  if (P0) {
+    const dir = best.p.clone().sub(P0), L = dir.length();
+    if (shift && lockDir) { best.p = P0.clone().addScaledVector(lockDir, dir.dot(lockDir)); best.locked = true; }
+    else if (L > 0.02) {
+      for (const [k, a] of Object.entries(AXES)) {
+        if (Math.abs(dir.dot(a.v)) / L > Math.cos(3 * RAD)) {  // within 3 degrees of this axis
+          if (best.kind !== "endpoint" && best.kind !== "midpoint") best.p = P0.clone().addScaledVector(a.v, dir.dot(a.v));
+          best.axis = k;
+          break;
+        }
+      }
+    }
+  }
+  return best;
 }
-
-function rebuild() {
-  overlay.traverse((o) => o.geometry?.dispose());
-  overlay.clear();
-  labels.splice(0).forEach((l) => l.el.remove());
-  const main = [], helper = [], pts = [];
-  const mark = (p) => { pts.push(p); addLabel(p, `↑ ${fmt(p.y - cloud.ground)}`, "pt"); };
-  for (const [a, b] of measures) {
-    const c = new THREE.Vector3(b.x, a.y, b.z), horiz = Math.hypot(b.x - a.x, b.z - a.z);
-    main.push(a, b);
-    helper.push(a, c, c, b);
-    mark(a); mark(b);
-    addLabel(a.clone().add(b).multiplyScalar(0.5), `<b>${fmt(a.distanceTo(b))}</b>↔ ${fmt(horiz)} · ↕ ${fmt(b.y - a.y)}`);
+let lastPointerType = "mouse", hoverPos = null, hoverQueued = false, loupe = null;
+function updateHover(x, y, shift) {  // throttled to one pick per frame
+  hoverPos = { x, y, shift };
+  if (hoverQueued) return;
+  hoverQueued = true;
+  requestAnimationFrame(() => {
+    hoverQueued = false;
+    if (!measuring || !cloud || !hoverPos) return;
+    hover = snapAt(hoverPos.x, hoverPos.y, hoverPos.shift);
+    updateRubber();
+  });
+}
+function updateRubber() {  // the rubber band, the inference marker and their labels
+  const P0 = lastPoint(), h = hover;
+  rubMark.visible = !!h;
+  rubLine.visible = !!(h && P0);
+  rubLbl.el.hidden = tip.el.hidden = !h;
+  if (h) {
+    rubMark.geometry.setFromPoints([h.p]);
+    rubMark.material.color.setHex(h.axis ? AXES[h.axis].color : KINDS[h.kind][1]);
+    tip.pos.copy(h.p);
+    tip.el.textContent = h.locked ? "Direction locked" : h.axis && P0 ? `On ${AXES[h.axis].name} axis` : KINDS[h.kind][0];
+    tip.el.style.color = h.axis ? `#${AXES[h.axis].color.toString(16)}` : "";
   }
-  if (pending) mark(pending);
-  const geo = (v) => new THREE.BufferGeometry().setFromPoints(v);
-  for (const [Cls, v, m] of [[THREE.LineSegments, helper, helperMat], [THREE.LineSegments, main, lineMat], [THREE.Points, pts, markMat]]) {
-    const o = new Cls(geo(v), m);
-    o.frustumCulled = false;
-    overlay.add(o);
-  }
+  if (h && P0) {
+    rubLine.geometry.setFromPoints([P0, h.p]);
+    rubLine.material.color.setHex(h.axis ? AXES[h.axis].color : 0xffd23f);
+    rubLbl.pos.copy(P0).add(h.p).multiplyScalar(0.5);
+    const horiz = Math.hypot(h.p.x - P0.x, h.p.z - P0.z);
+    rubLbl.el.innerHTML = `<b>${fmt(P0.distanceTo(h.p))}</b>↔ ${fmt(horiz)} · ↕ ${fmt(h.p.y - P0.y)}`;
+    showVcb();
+  } else { rubLbl.el.hidden = true; showVcb(); }
   invalidate();
 }
-function clearMeasures() { measures.length = 0; pending = null; if (cloud) rebuild(); }
+function showVcb() {  // SketchUp's measurements box: the live length, or what you are typing
+  const P0 = lastPoint(), box = $("vcb");
+  box.hidden = !(measuring && P0);
+  if (!box.hidden) box.textContent = vcb ? `Length  ${vcb}▏` : hover ? `Length  ${fmt(P0.distanceTo(hover.p))}` : "Length";
+}
+function parseLength(s) {  // "1.5", "150" (in the current unit) or 5'3"
+  s = s.replace(",", ".");
+  if (/['"]/.test(s)) { const m = /^(?:(\d+(?:\.\d+)?)')?\s*(?:(\d+(?:\.\d+)?)")?$/.exec(s); return m ? ((+m[1] || 0) * 12 + (+m[2] || 0)) * 0.0254 : NaN; }
+  const v = parseFloat(s);
+  return unit === "mm" ? v / 1000 : unit === "ft" ? v * 0.3048 : v;
+}
+function addPoint(p) {
+  let c = openChain();
+  if (!c) { c = { pts: [], closed: false, done: false }; chains.push(c); }
+  const last = c.pts[c.pts.length - 1];
+  if (last && last.distanceTo(p) < 0.002) return;  // the second click of a double-click
+  c.pts.push(p.clone());
+  vcb = ""; lockDir = null;
+  rebuild();
+}
+function finishChain(close) {
+  const c = openChain();
+  if (!c) return;
+  if (c.pts.length < 2) chains.pop();
+  else { c.closed = close && c.pts.length >= 3; c.done = true; }
+  hover = null; vcb = ""; lockDir = null;
+  rebuild();
+  updateRubber();
+}
+function undo() {
+  const c = chains[chains.length - 1];
+  if (!c) return;
+  if (c.closed) c.closed = false; else c.pts.pop();
+  c.done = false;
+  if (!c.pts.length) chains.pop();
+  rebuild();
+  updateRubber();
+}
+const areaOf = (pts) => {  // horizontal (plan) area by the shoelace formula, m²
+  let s = 0;
+  for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; s += a.x * b.z - b.x * a.z; }
+  return Math.abs(s) / 2;
+};
+function rebuild() {
+  measureGroup.traverse((o) => o.geometry?.dispose());
+  measureGroup.clear();
+  labels.splice(0).forEach((l) => l.el.remove());
+  const add = (text, pos, cls = "") => { const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}`, innerHTML: text }); $("labels").append(el); labels.push({ el, pos }); };
+  const main = [], helper = [], pts = [];
+  for (const c of chains) {
+    const n = c.pts.length, segs = n - 1 + (c.closed ? 1 : 0);
+    let total = 0;
+    for (let i = 0; i < segs; i++) {
+      const a = c.pts[i], b = c.pts[(i + 1) % n], corner = new THREE.Vector3(b.x, a.y, b.z);
+      total += a.distanceTo(b);
+      main.push(a, b);
+      helper.push(a, corner, corner, b);
+      add(`<b>${fmt(a.distanceTo(b))}</b>↔ ${fmt(Math.hypot(b.x - a.x, b.z - a.z))} · ↕ ${fmt(b.y - a.y)}`, a.clone().add(b).multiplyScalar(0.5));
+    }
+    for (const p of c.pts) { pts.push(p); add(`↑ ${fmt(p.y - cloud.ground)}`, p, "pt"); }
+    if (segs > 1) add(`Σ ${fmt(total)}`, c.pts[c.pts.length - 1], "sum");
+    if (c.closed) add(`<b>${fmtArea(areaOf(c.pts))}</b>`, c.pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(n), "area");
+  }
+  for (const [Cls, v, m] of [[THREE.LineSegments, helper, helperMat], [THREE.LineSegments, main, lineMat], [THREE.Points, pts, markMat]]) {
+    const o = new Cls(new THREE.BufferGeometry().setFromPoints(v), m);
+    o.frustumCulled = false;
+    measureGroup.add(o);
+  }
+  scheduleHash();
+  invalidate();
+}
+function clearMeasures() { chains.length = 0; hover = null; vcb = ""; if (cloud) { rebuild(); updateRubber(); } }
 function setMeasuring(on) {
   measuring = on;
   $("bMeasure").setAttribute("aria-pressed", on);
+  $("mbar").hidden = !on;
+  document.body.classList.toggle("measuring", on);
   renderer.domElement.style.cursor = on ? "crosshair" : "";
-  if (on) toast("Click two points to measure · Esc clears");
-  else { pending = null; rebuild(); }
+  if (on) toast("Click to place points · Enter or double-click to finish · type a length · Esc");
+  else { finishChain(false); hover = null; loupe = null; $("loupe").hidden = true; updateRubber(); }
 }
 function onEscape() {
-  if (!$("help").hidden) $("help").hidden = true;
-  else if (pending) { pending = null; rebuild(); }
-  else if (measures.length) clearMeasures();
+  if (selecting) setSelecting(false);
+  else if (!$("help").hidden) $("help").hidden = true;
+  else if (vcb) { vcb = ""; showVcb(); }
+  else if (openChain()) finishChain(false);
+  else if (chains.length) clearMeasures();
   else if (measuring) setMeasuring(false);
 }
-
-let down = null;
-const el = renderer.domElement;
-el.addEventListener("pointerdown", (e) => { down = e.isPrimary ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null; });
-el.addEventListener("pointerup", (e) => {
-  if (!measuring || !cloud || !down || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
-  if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6 || e.timeStamp - down.t > 600) return;
-  const p = pick(e.clientX, e.clientY);
-  if (!p) return toast("No points there — click on the cloud");
-  if (pending) { measures.push([pending, p]); pending = null; } else pending = p;
+function chainsToHash() {  // x,y,z;x,y,z[c] chains joined by ~ (a trailing c marks a closed shape)
+  return chains.map((c) => c.pts.map((p) => [p.x, p.y, p.z].map((v) => +v.toFixed(2)).join(",")).join(";") + (c.closed ? "c" : "")).join("~");
+}
+function loadChains(s) {
+  chains.length = 0;
+  for (const part of s.split("~")) {
+    const closed = part.endsWith("c"), pts = part.replace(/c$/, "").split(";").map((t) => new THREE.Vector3(...t.split(",").map(Number)));
+    if (pts.length > 1 && pts.every((p) => [p.x, p.y, p.z].every(Number.isFinite))) chains.push({ pts, closed, done: true });
+  }
   rebuild();
+}
+function measurementsText() {  // CSV in the SketchUp frame (east, north, up) relative to the walk start
+  const rows = ["chain,point,x_east,y_north,z_up,segment_m,running_m,area_m2"];
+  chains.forEach((c, ci) => {
+    let run = 0;
+    c.pts.forEach((p, i) => {
+      const seg = i ? p.distanceTo(c.pts[i - 1]) : 0;
+      run += seg;
+      rows.push([ci + 1, i + 1, p.x.toFixed(3), (-p.z).toFixed(3), p.y.toFixed(3), seg.toFixed(3), run.toFixed(3), c.closed && i === c.pts.length - 1 ? areaOf(c.pts).toFixed(3) : ""].join(","));
+    });
+    if (c.closed) rows.push([ci + 1, "closing", "", "", "", c.pts[c.pts.length - 1].distanceTo(c.pts[0]).toFixed(3), (run + c.pts[c.pts.length - 1].distanceTo(c.pts[0])).toFixed(3), ""].join(","));
+  });
+  return rows.join("\n");
+}
+
+// Pointer: hover shows the rubber band; a click or tap places a point. On touch a press-and-hold shows a loupe and lets
+// the finger fine-tune the spot (no orbiting) before the release places it.
+let down = null, hold = null;
+const el = renderer.domElement;
+function placeAt(x, y, shift) {
+  const s = snapAt(x, y, shift);
+  if (!s) return toast("Nothing there — aim at the model");
+  addPoint(s.p);
+  hover = s;
+  updateRubber();
+}
+function showLoupe(x, y) {
+  loupe = { x, y };
+  const box = $("loupe");
+  box.hidden = false;
+  Object.assign(box.style, { left: `${clamp(x - 60, 4, innerWidth - 124)}px`, top: `${y > 190 ? y - 170 : y + 50}px` });
+  invalidate();
+}
+el.addEventListener("pointerdown", (e) => {
+  lastPointerType = e.pointerType;
+  down = e.isPrimary ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+  if (!measuring || e.pointerType !== "touch" || !e.isPrimary) return;
+  hold = { x: e.clientX, y: e.clientY, precise: false };
+  hold.timer = setTimeout(() => { if (hold) { hold.precise = true; showLoupe(hold.x, hold.y); updateHover(hold.x, hold.y, false); } }, 350);
+}, true);
+el.addEventListener("pointermove", (e) => {
+  lastPointerType = e.pointerType;
+  if (hold) {
+    if (hold.precise) { e.stopImmediatePropagation(); hold.x = e.clientX; hold.y = e.clientY; showLoupe(hold.x, hold.y); updateHover(hold.x, hold.y, false); }
+    else if (Math.hypot(e.clientX - hold.x, e.clientY - hold.y) > 8) { clearTimeout(hold.timer); hold = null; }
+  } else if (measuring && cloud && e.buttons === 0 && e.pointerType !== "touch") updateHover(e.clientX, e.clientY, e.shiftKey);
+}, true);
+for (const t of ["pointerup", "pointercancel"]) el.addEventListener(t, (e) => {
+  if (t === "pointerup" && measuring && cloud && hold?.precise) placeAt(hold.x, hold.y, false);
+  else if (t === "pointerup" && measuring && cloud && down && e.isPrimary && !(e.pointerType === "mouse" && e.button !== 0)
+    && Math.hypot(e.clientX - down.x, e.clientY - down.y) <= 6 && e.timeStamp - down.t <= 600) placeAt(e.clientX, e.clientY, e.shiftKey);
+  if (hold) { clearTimeout(hold.timer); hold = null; }
+  loupe = null;
+  $("loupe").hidden = true;
 });
+function drawLoupe() {  // called right after a render, while the canvas still holds the frame
+  if (!loupe) return;
+  const cv2 = $("loupe"), ctx = cv2.getContext("2d"), size = cv2.width, src = size / 3 * renderer.getPixelRatio();
+  ctx.clearRect(0, 0, size, size);
+  ctx.drawImage(renderer.domElement, loupe.x * renderer.getPixelRatio() - src / 2, loupe.y * renderer.getPixelRatio() - src / 2, src, src, 0, 0, size, size);
+  ctx.strokeStyle = hover ? "#" + (hover.axis ? AXES[hover.axis].color : KINDS[hover.kind][1]).toString(16).padStart(6, "0") : "#ffd23f";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(size / 2 - 14, size / 2); ctx.lineTo(size / 2 + 14, size / 2);
+  ctx.moveTo(size / 2, size / 2 - 14); ctx.lineTo(size / 2, size / 2 + 14);
+  ctx.stroke();
+}
+el.addEventListener("dblclick", (e) => {
+  if (!measuring || !cloud) return;
+  const c = openChain(), first = c?.pts[0], last = c?.pts[c.pts.length - 1];
+  if (c && c.pts.length >= 3 && last.distanceTo(first) < 0.02) { c.pts.pop(); finishChain(true); }  // double-click on the first point closes the shape
+  else finishChain(false);
+});
+$("mUndo").onclick = undo;
+$("mDone").onclick = () => finishChain(false);
+$("mClose").onclick = () => finishChain(true);
+$("mCopy").onclick = async () => {
+  try { await navigator.clipboard.writeText(measurementsText()); toast("Measurements copied as CSV"); }
+  catch { toast("Could not copy — your browser blocked the clipboard"); }
+};
+for (const [u, text] of Object.entries(UNITS)) $("mUnit").add(new Option(text, u, false, u === unit));
+$("mUnit").onchange = (e) => { unit = e.target.value; try { localStorage.setItem("unit", unit); } catch {} rebuild(); updateRubber(); };
 
 // ---- Render loop and HUD
 const tmp = new THREE.Vector3();
@@ -813,12 +1293,14 @@ function render() {
   }
   renderer.clearDepth();
   renderer.render(overlay, camera);
+  drawLoupe();
 
-  for (const l of pivotMark ? [...labels, pivotMark] : labels) {
+  for (const l of [...labels, ...live, ...(pivotMark ? [pivotMark] : [])]) {
     tmp.copy(l.pos).project(camera);
     l.el.style.display = tmp.z < 1 ? "" : "none";
     l.el.style.transform = `translate(${(tmp.x * .5 + .5) * innerWidth}px, ${(.5 - tmp.y * .5) * innerHeight}px) translate(-50%, -50%)`;
   }
+  updateSelBox();
   $("needle").setAttribute("transform", `rotate(${Math.atan2(nav.off.x, nav.off.z) * 180 / Math.PI})`);
   const mpp = plan ? nav.planH / innerHeight : 2 * nav.off.length() * Math.tan(persp.fov * Math.PI / 360) / innerHeight;
   const raw = mpp * 100, p10 = 10 ** Math.floor(Math.log10(raw)), nice = (raw / p10 >= 5 ? 5 : raw / p10 >= 2 ? 2 : 1) * p10;
@@ -965,8 +1447,25 @@ document.querySelectorAll("#pad [data-s]").forEach((b) => {
   for (const t of ["pointerup", "pointerleave", "pointercancel"]) b.addEventListener(t, release);
 });
 
+addEventListener("keyup", (e) => { if (e.key === "Shift") { lockDir = null; if (measuring && hoverPos) updateHover(hoverPos.x, hoverPos.y, false); } });
 addEventListener("keydown", (e) => {
-  if (e.ctrlKey || e.metaKey || e.altKey || /^(SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  if (/^(SELECT|TEXTAREA)$/.test(e.target.tagName) || (e.target.tagName === "INPUT" && !/^(range|checkbox)$/.test(e.target.type))) return;
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && chains.length) { e.preventDefault(); return undo(); }
+  if (measuring && !e.ctrlKey && !e.metaKey) {  // SketchUp-style: Shift locks the direction, digits + Enter set the length
+    const P0 = lastPoint();
+    if (e.key === "Shift" && !lockDir && hover && P0 && hover.p.distanceTo(P0) > 0.01) lockDir = hover.p.clone().sub(P0).normalize();
+    if (P0 && /^[0-9.,'"]$/.test(e.key)) { vcb += e.key; showVcb(); return; }
+    if (P0 && e.key === "Backspace" && vcb) { vcb = vcb.slice(0, -1); showVcb(); return; }
+    if (e.key === "Enter") {
+      if (!vcb) finishChain(false);
+      else if (P0 && hover && parseLength(vcb) > 0) { addPoint(P0.clone().addScaledVector(hover.p.clone().sub(P0).normalize(), parseLength(vcb))); hover = null; updateRubber(); }
+      else toast("Aim the direction first, then type a length");
+      vcb = "";
+      showVcb();
+      return;
+    }
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
   const arrow = /^Arrow(Left|Right|Up|Down)$/.exec(e.key);
   if (arrow && e.target.type !== "range") {
     e.preventDefault();
@@ -1001,7 +1500,9 @@ const tick = () => new Promise((r) => setTimeout(r, 16));
 const mbs = (b) => (b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(b / 1e3))} kB`);
 const slug = () => (cloud.label || "model").replace(/\.ply$/i, "").replace(/[^A-Za-z0-9]+/g, "_").slice(0, 32).replace(/^_|_$/g, "") || "model";
 const TERRAIN_MAX_FACES = 100000, OUTLIER = 0.4, BUMP = 0.25, BUMP_WINDOW = 1.5, MAX_SLOPE = 1.0, MAX_HOLE = 4.0;
-const GROUND_BAND = [-0.15, 0.3], ORTHO_PX = 0.03, ORTHO_MAX = 4096, ORTHO_FILL = 1.0;
+const GROUND_BAND = [-0.15, 0.3], ORTHO_MAX = 8192, ORTHO_FILL = 1.0, STRUCTURE_ABOVE = 0.25;
+// The terrain kernel (functions from here to `classify`) also runs in a Web Worker: it is stringified into the
+// worker's source, so these functions must stay free of DOM and viewer state.
 // k-th smallest of a[0..n) by quickselect (leaves a partitioned around k)
 function nth(a, n, k) {
   let lo = 0, hi = n - 1;
@@ -1059,60 +1560,86 @@ function stlBytes(v, idx) {  // binary STL, no unit field: import as metres
   }
   return dv.buffer;
 }
-function objText(pos, col, idx) {  // Y up; "v x y z r g b" is the common vertex-colour extension
-  const out = ["# Walk Viewer export: metres, Y up, vertex colours"];
-  for (let i = 0; i < pos.length; i += 3)
-    out.push(`v ${pos[i].toFixed(4)} ${pos[i + 1].toFixed(4)} ${pos[i + 2].toFixed(4)} ${(col[i] / 255).toFixed(3)} ${(col[i + 1] / 255).toFixed(3)} ${(col[i + 2] / 255).toFixed(3)}`);
-  for (let i = 0; i < idx.length; i += 3) out.push(`f ${idx[i] + 1} ${idx[i + 1] + 1} ${idx[i + 2] + 1}`);
-  return out.join("\n");
+// Parts are {name, verts (SketchUp frame), tris, uvs?, col? (0-255 per vertex), texture? (file name)}.
+const yUp = (v) => { const o = new Float32Array(v.length); for (let i = 0; i < v.length; i += 3) { o[i] = v[i]; o[i + 1] = v[i + 2]; o[i + 2] = -v[i + 1]; } return o; };  // SketchUp -> Y up
+function mergeParts(parts) {  // one vertex/index array for STL
+  const nv = parts.reduce((s, p) => s + p.verts.length, 0), nt = parts.reduce((s, p) => s + p.tris.length, 0), verts = new Float32Array(nv), tris = new Uint32Array(nt);
+  for (let i = 0, v = 0, t = 0; i < parts.length; i++) {
+    verts.set(parts[i].verts, v);
+    for (let k = 0; k < parts[i].tris.length; k++) tris[t + k] = parts[i].tris[k] + v / 3;
+    v += parts[i].verts.length; t += parts[i].tris.length;
+  }
+  return [verts, tris];
 }
-async function glbBytes(pos, col, idx) {  // Y up; glTF vertex colours are linear, ours are sRGB bytes
+function objChunks(parts) {  // Y up; "v x y z r g b" is the common vertex-colour extension. Chunked so huge meshes don't make one giant string.
+  const chunks = ["# Walk Viewer export: metres, Y up, vertex colours\n"];
+  let off = 0;
+  for (const part of parts) {
+    const v = yUp(part.verts), col = part.col;
+    let lines = [`o ${part.name}`];
+    const flush = () => { chunks.push(lines.join("\n") + "\n"); lines = []; };
+    for (let i = 0; i < v.length; i += 3) {
+      lines.push(`v ${v[i].toFixed(4)} ${v[i + 1].toFixed(4)} ${v[i + 2].toFixed(4)} ${(col[i] / 255).toFixed(3)} ${(col[i + 1] / 255).toFixed(3)} ${(col[i + 2] / 255).toFixed(3)}`);
+      if (lines.length >= 50000) flush();
+    }
+    for (let i = 0; i < part.tris.length; i += 3) {
+      lines.push(`f ${part.tris[i] + 1 + off} ${part.tris[i + 1] + 1 + off} ${part.tris[i + 2] + 1 + off}`);
+      if (lines.length >= 50000) flush();
+    }
+    flush();
+    off += v.length / 3;
+  }
+  return chunks;
+}
+async function glbBytes(parts) {  // Y up; glTF vertex colours are linear, ours are sRGB bytes
   const { GLTFExporter } = await lib("gltf"), lin = new Float32Array(256).map((_, i) => { const c = i / 255; return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4; });
-  const g = new THREE.BufferGeometry();
-  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-  g.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(col, (c) => lin[c]), 3));
-  g.setIndex(new THREE.BufferAttribute(idx, 1));
-  return new GLTFExporter().parseAsync(new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 1, metalness: 0 })), { binary: true });
+  const group = new THREE.Group();
+  for (const p of parts) {
+    const g = new THREE.BufferGeometry();
+    g.setAttribute("position", new THREE.BufferAttribute(yUp(p.verts), 3));
+    g.setAttribute("color", new THREE.BufferAttribute(Float32Array.from(p.col, (c) => lin[c]), 3));
+    g.setIndex(new THREE.BufferAttribute(p.tris, 1));
+    const mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, side: THREE.DoubleSide, roughness: 1, metalness: 0 }));
+    mesh.name = p.name;
+    group.add(mesh);
+  }
+  return new GLTFExporter().parseAsync(group, { binary: true });
 }
 const floatSource = (id, a, params) =>
   `<source id="${id}"><float_array id="${id}-arr" count="${a.length}">${Array.from(a, (x) => x.toFixed(5)).join(" ")}</float_array>` +
   `<technique_common><accessor source="#${id}-arr" count="${a.length / params.length}" stride="${params.length}">${params.map((p) => `<param name="${p}" type="float"/>`).join("")}</accessor></technique_common></source>`;
-function collada(name, verts, tris, uvs, texture) {  // COLLADA 1.4.1, metres, Z up; textured when uvs + texture are given
-  const now = new Date().toISOString().slice(0, 19) + "Z", tex = uvs && texture;
-  const fx = tex ? '<newparam sid="surf"><surface type="2D"><init_from>tex</init_from></surface></newparam><newparam sid="samp"><sampler2D><source>surf</source></sampler2D></newparam>' : "";
-  const diffuse = tex ? '<texture texture="samp" texcoord="UV"/>' : "<color>0.78 0.76 0.72 1</color>";
-  const images = tex ? `<library_images><image id="tex" name="tex"><init_from>${texture}</init_from></image></library_images>` : "";
+function collada(parts) {  // COLLADA 1.4.1, metres, Z up; one geometry + node per part, textured where a part has uvs + texture
+  const now = new Date().toISOString().slice(0, 19) + "Z", tex = parts.find((p) => p.uvs && p.texture)?.texture;
+  const effect = (id, fx, diffuse) => `<effect id="${id}"><profile_COMMON>${fx}<technique sid="common"><phong><diffuse>${diffuse}</diffuse></phong></technique></profile_COMMON></effect>`;
+  const geos = parts.map((p, i) => {
+    const t = p.uvs && p.texture;
+    return `<geometry id="geo${i}" name="${p.name}"><mesh>${floatSource(`pos${i}`, p.verts, ["X", "Y", "Z"])}${t ? floatSource(`uv${i}`, p.uvs, ["S", "T"]) : ""}` +
+      `<vertices id="vtx${i}"><input semantic="POSITION" source="#pos${i}"/></vertices><triangles material="sym" count="${p.tris.length / 3}"><input semantic="VERTEX" source="#vtx${i}" offset="0"/>` +
+      `${t ? `<input semantic="TEXCOORD" source="#uv${i}" offset="0" set="0"/>` : ""}<p>${Array.from(p.tris).join(" ")}</p></triangles></mesh></geometry>`;
+  }).join("");
+  const nodes = parts.map((p, i) => `<node id="node${i}" name="${p.name}"><instance_geometry url="#geo${i}"><bind_material><technique_common>` +
+    `<instance_material symbol="sym" target="#${p.uvs && p.texture ? "matTex" : "matPlain"}"/></technique_common></bind_material></instance_geometry></node>`).join("");
   return '<?xml version="1.0" encoding="utf-8"?>\n' +
     `<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1"><asset><contributor><authoring_tool>Walk Viewer</authoring_tool></contributor>` +
-    `<created>${now}</created><modified>${now}</modified><unit meter="1" name="meter"/><up_axis>Z_UP</up_axis></asset>${images}` +
-    `<library_effects><effect id="fx"><profile_COMMON>${fx}<technique sid="common"><phong><diffuse>${diffuse}</diffuse></phong></technique></profile_COMMON></effect></library_effects>` +
-    `<library_materials><material id="mat" name="${name}"><instance_effect url="#fx"/></material></library_materials>` +
-    `<library_geometries><geometry id="geo" name="${name}"><mesh>${floatSource("pos", verts, ["X", "Y", "Z"])}${tex ? floatSource("uv", uvs, ["S", "T"]) : ""}` +
-    `<vertices id="vtx"><input semantic="POSITION" source="#pos"/></vertices><triangles material="sym" count="${tris.length / 3}"><input semantic="VERTEX" source="#vtx" offset="0"/>` +
-    `${tex ? '<input semantic="TEXCOORD" source="#uv" offset="0" set="0"/>' : ""}<p>${Array.from(tris).join(" ")}</p></triangles></mesh></geometry></library_geometries>` +
-    `<library_visual_scenes><visual_scene id="scene"><node id="node" name="${name}"><instance_geometry url="#geo"><bind_material><technique_common>` +
-    `<instance_material symbol="sym" target="#mat"/></technique_common></bind_material></instance_geometry></node></visual_scene></library_visual_scenes>` +
+    `<created>${now}</created><modified>${now}</modified><unit meter="1" name="meter"/><up_axis>Z_UP</up_axis></asset>` +
+    (tex ? `<library_images><image id="tex" name="tex"><init_from>${tex}</init_from></image></library_images>` : "") +
+    `<library_effects>${effect("fxPlain", "", "<color>0.78 0.76 0.72 1</color>")}` +
+    (tex ? effect("fxTex", '<newparam sid="surf"><surface type="2D"><init_from>tex</init_from></surface></newparam><newparam sid="samp"><sampler2D><source>surf</source></sampler2D></newparam>', '<texture texture="samp" texcoord="UV"/>') : "") +
+    `</library_effects><library_materials><material id="matPlain" name="plain"><instance_effect url="#fxPlain"/></material>` +
+    (tex ? '<material id="matTex" name="photo"><instance_effect url="#fxTex"/></material>' : "") + `</library_materials>` +
+    `<library_geometries>${geos}</library_geometries><library_visual_scenes><visual_scene id="scene">${nodes}</visual_scene></library_visual_scenes>` +
     `<scene><instance_visual_scene url="#scene"/></scene></COLLADA>\n`;
 }
 const kml = (name) => '<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark>' +
   `<name>${name}</name><Model><altitudeMode>relativeToGround</altitudeMode><Location><longitude>0.00000000</longitude><latitude>0.00000000</latitude><altitude>0</altitude></Location>` +
   `<Orientation><heading>0</heading><tilt>0</tilt><roll>0</roll></Orientation><Scale><x>1</x><y>1</y><z>1</z></Scale><Link><href>models/${name}.dae</href></Link></Model></Placemark></kml>\n`;
-async function kmz(name, dae, png) {  // doc.kml (placed at 0,0: no real-world location) + DAE + texture in one file
-  const { zipSync, strToU8 } = await lib("zip"), files = { "doc.kml": strToU8(kml(name)), [`models/${name}.dae`]: strToU8(dae) };
-  if (png) files[`models/${name}.png`] = [png, { level: 0 }];
+async function kmz(dae, png) {  // doc.kml (placed at 0,0: no real-world location) + DAE + texture in one file
+  const { zipSync, strToU8 } = await lib("zip"), files = { "doc.kml": strToU8(kml("model")), "models/model.dae": strToU8(dae) };
+  if (png) files["models/terrain.png"] = [png, { level: 0 }];
   return zipSync(files);
 }
 
-// -- points: a spread of the cloud (optionally thinned) with 0-255 colours
-function pointData(limit) {
-  const p = cloud.geom.attributes.position.array, c = cloud.attrs.rgb, f = c.array instanceof Float32Array ? 255 : 1, n = p.length / 3;
-  const N = limit && limit < n ? limit : n, pos = new Float32Array(3 * N), col = new Uint8Array(3 * N);
-  for (let i = 0; i < N; i++) {
-    const j = Math.floor(i * n / N);
-    for (let k = 0; k < 3; k++) { pos[3 * i + k] = p[3 * j + k]; col[3 * i + k] = Math.round(c.array[3 * j + k] * f); }
-  }
-  return { pos, col, N };
-}
+// -- points: PLY / LAS writers (pos world xyz, col 0-255 bytes)
 function plyBytes({ pos, col, N }) {  // world frame (Y up), like the published points.ply
   const head = new TextEncoder().encode(`ply\nformat binary_little_endian 1.0\nelement vertex ${N}\nproperty float x\nproperty float y\nproperty float z\nproperty uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n`);
   const out = new Uint8Array(head.length + 15 * N), dv = new DataView(out.buffer);
@@ -1142,43 +1669,16 @@ function lasBytes({ pos, col, N }) {  // LAS 1.2, point format 2 (XYZ + RGB), Sk
   return buf;
 }
 
-// -- surface mesh: meshoptimizer simplification keeps original vertices, so vertex colours survive
-let meshCache = null;
-const exFaces = () => Math.round(10 ** (4 + 1.7 * +$("exFaces").value / 100) / 1000) * 1000;
-async function meshData() {
-  progress("Loading surface…", 0.05);
-  if (!surf && !(cloud.meshUrl && await loadSurface())) throw new Error("no surface mesh available");
-  const target = exFaces();
-  if (meshCache && meshCache.surf === surf && meshCache.target === target) return meshCache;
-  const pos = surf.geom.attributes.position, rgb = surf.attrs.rgb;
-  let idx = Uint32Array.from(surf.geom.index.array);
-  if (target * 3 < idx.length) {
-    progress("Simplifying mesh…", 0.3);
-    await tick();
-    const { MeshoptSimplifier: S } = await lib("simp");
-    await S.ready;
-    idx = S.simplify(idx, pos.array, 3, target * 3, 0.5)[0];
-  }
-  progress("Preparing mesh…", 0.7);
-  await tick();
-  const map = new Int32Array(pos.count).fill(-1);
-  let nv = 0;
-  for (let j = 0; j < idx.length; j++) { if (map[idx[j]] < 0) map[idx[j]] = nv++; idx[j] = map[idx[j]]; }
-  const P = new Float32Array(3 * nv), C = new Uint8Array(3 * nv);
-  for (let i = 0; i < pos.count; i++) {
-    const m = map[i];
-    if (m < 0) continue;
-    P[3 * m] = pos.getX(i); P[3 * m + 1] = pos.getY(i); P[3 * m + 2] = pos.getZ(i);
-    C[3 * m] = Math.round(rgb.getX(i) * 255); C[3 * m + 1] = Math.round(rgb.getY(i) * 255); C[3 * m + 2] = Math.round(rgb.getZ(i) * 255);
-  }
-  return (meshCache = { surf, target, pos: P, col: C, idx });
-}
 
 // -- terrain: lowest point per cell -> clean -> triangulate -> orthophoto (port of export_sketchup.py)
-function lowestGrid(cell) {
-  const p = cloud.geom.attributes.position.array, bb = cloud.geom.boundingBox, north = -bb.min.z, west = bb.min.x;
-  const nc = Math.ceil((bb.max.x - west) / cell) + 1, nr = Math.ceil((north + bb.max.z) / cell) + 1, a = new Float32Array(nr * nc).fill(NaN);
+// p: world xyz; b: cloud bounds {minx, maxx, minz, maxz}; region: world rect {x0, x1, z0, z1} or null (a margin is
+// kept around it so cleaning is right at its edge).
+function lowestGrid(p, b, region, cell) {
+  const m = region ? 0.8 : 0, x0 = Math.max(b.minx, (region ? region.x0 : b.minx) - m), x1 = Math.min(b.maxx, (region ? region.x1 : b.maxx) + m);
+  const z0 = Math.max(b.minz, (region ? region.z0 : b.minz) - m), z1 = Math.min(b.maxz, (region ? region.z1 : b.maxz) + m);
+  const west = x0, north = -z0, nc = Math.ceil((x1 - x0) / cell) + 1, nr = Math.ceil((z1 - z0) / cell) + 1, a = new Float32Array(nr * nc).fill(NaN);
   for (let i = 0; i < p.length; i += 3) {
+    if (p[i] < x0 || p[i] > x1 || p[i + 2] < z0 || p[i + 2] > z1) continue;
     const k = Math.floor((north + p[i + 2]) / cell) * nc + Math.floor((p[i] - west) / cell);
     if (!(a[k] <= p[i + 1])) a[k] = p[i + 1];
   }
@@ -1274,7 +1774,7 @@ function triangulate({ a, nr, nc, west, north, cell }) {  // SketchUp-frame vert
 }
 // Nearest set pixel for every pixel (exact Euclidean feature transform, Felzenszwalb): returns squared distance and source index.
 function nearestSet(set, W, H) {
-  const INF = 1e12, g = new Float64Array(W * H), src = new Int32Array(W * H), dist = new Float64Array(W * H);
+  const INF = 1e9, g = new Float32Array(W * H), src = new Int32Array(W * H), dist = new Float32Array(W * H);
   for (let x = 0; x < W; x++) {  // pass 1: nearest set pixel within each column
     let last = -1;
     for (let y = 0; y < H; y++) { if (set[y * W + x]) last = y; src[y * W + x] = last; g[y * W + x] = last < 0 ? INF : (y - last) ** 2; }
@@ -1309,10 +1809,10 @@ function nearestSet(set, W, H) {
 }
 // Top-down image over the terrain: the highest coloured point within the ground band of the terrain per pixel,
 // empty pixels on terrain take the nearest ground colour up to ORTHO_FILL.
-async function orthophoto({ a: grid, nr, nc, west, north, cell }) {
-  const w = nc * cell, h = nr * cell, px = Math.max(ORTHO_PX, Math.max(w, h) / ORTHO_MAX), W = Math.ceil(w / px), H = Math.ceil(h / px);
+function orthophoto({ a: grid, nr, nc, west, north, cell }, p, c, f, pxWanted) {
+  const w = nc * cell, h = nr * cell, px = Math.max(pxWanted, Math.max(w, h) / ORTHO_MAX), W = Math.ceil(w / px), H = Math.ceil(h / px);
   const top = new Float32Array(W * H).fill(-Infinity), img = new Uint8ClampedArray(4 * W * H), set = new Uint8Array(W * H);
-  const p = cloud.geom.attributes.position.array, c = cloud.attrs.rgb.array, f = c instanceof Float32Array ? 255 : 1;
+  progress("Terrain: painting the photo…", 0.6);
   for (let i = 0; i < p.length; i += 3) {
     const col = Math.floor((p[i] - west) / px), row = Math.floor((north + p[i + 2]) / px);
     if (col < 0 || row < 0 || col >= W || row >= H || p[i + 1] <= top[row * W + col]) continue;
@@ -1324,66 +1824,299 @@ async function orthophoto({ a: grid, nr, nc, west, north, cell }) {
     top[k] = p[i + 1]; set[k] = 1;
     img.set([r, g, b, 255], 4 * k);
   }
-  progress("Terrain: filling gaps in the photo…", 0.6);
-  await tick();
-  const near = nearestSet(set, W, H), maxD2 = (ORTHO_FILL / px) ** 2, filled = img.slice();
+  progress("Terrain: filling gaps in the photo…", 0.8);
+  const near = nearestSet(set, W, H), maxD2 = (ORTHO_FILL / px) ** 2;
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
     const k = y * W + x;
     if (set[k]) continue;
     const on = grid[Math.min(nr - 1, Math.floor(y * px / cell)) * nc + Math.min(nc - 1, Math.floor(x * px / cell))];
-    if (on === on && near.dist[k] <= maxD2) filled.copyWithin(4 * k, 4 * near.src[k], 4 * near.src[k] + 4), set[k] = 1;
+    if (on === on && near.dist[k] <= maxD2) img.copyWithin(4 * k, 4 * near.src[k], 4 * near.src[k] + 4), set[k] = 1;  // sources are original pixels
   }
-  img.set(filled);
   for (let k = 0; k < W * H; k++) if (!set[k]) img.set([110, 110, 100, 255], 4 * k);
-  const canvas = Object.assign(document.createElement("canvas"), { width: W, height: H });
-  canvas.getContext("2d").putImageData(new ImageData(img, W, H), 0, 0);
-  const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
-  return { png: new Uint8Array(await blob.arrayBuffer()), W, H, px };
+  return { img, W, H, px, capped: px > pxWanted + 1e-9 };
 }
-let terrainCache = null;
-async function terrain() {
-  const cell0 = +$("exCell").value;
-  if (terrainCache && terrainCache.cloud === cloud && terrainCache.cell0 === cell0) return terrainCache;
-  progress("Terrain: finding the ground…", 0.1);
-  await tick();
-  let cell = cell0, g, t;
-  for (;;) {  // coarsen by 25% until it fits the face budget
-    g = cleanGrid(lowestGrid(cell));
-    t = triangulate(g);
-    if (t.tris.length / 3 <= TERRAIN_MAX_FACES) break;
-    cell *= 1.25;
-    await tick();
+function groundAt(g, x, y) {  // terrain height at SketchUp-frame (x, y), NaN where there is none
+  const c = Math.floor((x - g.west) / g.cell), r = Math.floor((g.north - y) / g.cell);
+  return r < 0 || c < 0 || r >= g.nr || c >= g.nc ? NaN : g.a[r * g.nc + c];
+}
+function countFaces(g) {
+  let n = 0;
+  for (let r = 0; r < g.nr - 1; r++) for (let c = 0; c < g.nc - 1; c++) {
+    const k = r * g.nc + c;
+    if (g.a[k] === g.a[k] && g.a[k + 1] === g.a[k + 1] && g.a[k + g.nc] === g.a[k + g.nc] && g.a[k + g.nc + 1] === g.a[k + g.nc + 1]) n += 2;
   }
-  progress("Terrain: building the photo…", 0.4);
-  await tick();
-  return (terrainCache = { cloud, cell0, cell, ...t, ...(await orthophoto(g)) });
+  return n;
+}
+function maskRegion(g, region) {  // NaN every cell whose centre is outside the world rect
+  for (let r = 0; r < g.nr; r++) for (let c = 0; c < g.nc; c++) {
+    const x = g.west + (c + 0.5) * g.cell, z = -(g.north - (r + 0.5) * g.cell);
+    if (x < region.x0 || x > region.x1 || z < region.z0 || z > region.z1) g.a[r * g.nc + c] = NaN;
+  }
+  return g;
+}
+function cropGrid({ a, nr, nc, west, north, cell }) {
+  let r0 = nr, r1 = -1, c0 = nc, c1 = -1;
+  for (let r = 0; r < nr; r++) for (let c = 0; c < nc; c++) if (a[r * nc + c] === a[r * nc + c]) { r0 = Math.min(r0, r); r1 = Math.max(r1, r); c0 = Math.min(c0, c); c1 = Math.max(c1, c); }
+  if (r1 < 0) throw new Error("no ground found in that area");
+  const h = r1 - r0 + 1, w = c1 - c0 + 1, out = new Float32Array(h * w);
+  for (let r = 0; r < h; r++) out.set(a.subarray((r + r0) * nc + c0, (r + r0) * nc + c0 + w), r * w);
+  return { a: out, nr: h, nc: w, west: west + c0 * cell, north: north - r0 * cell, cell };
+}
+// Finer than the point spacing supports: bilinear between base cell centres, then snap to the lowest point within 6 cm.
+function upsampleGrid(g, f, p) {
+  const b = g.cell, nr = Math.ceil(g.nr * b / f - 1e-9), nc = Math.ceil(g.nc * b / f - 1e-9), a = new Float32Array(nr * nc).fill(NaN);
+  const cl = (i, n) => Math.min(n - 1, Math.max(0, i));
+  for (let r = 0; r < nr; r++) {
+    const v = (r + 0.5) * f / b - 0.5, j0 = Math.floor(v), tj = v - j0, ja = cl(j0, g.nr) * g.nc, jb = cl(j0 + 1, g.nr) * g.nc;
+    for (let c = 0; c < nc; c++) {
+      const u = (c + 0.5) * f / b - 0.5, i0 = Math.floor(u), ti = u - i0, ia = cl(i0, g.nc), ib = cl(i0 + 1, g.nc);
+      const v00 = g.a[ja + ia], v01 = g.a[ja + ib], v10 = g.a[jb + ia], v11 = g.a[jb + ib];
+      if (v00 === v00 && v01 === v01 && v10 === v10 && v11 === v11) a[r * nc + c] = (v00 * (1 - ti) + v01 * ti) * (1 - tj) + (v10 * (1 - ti) + v11 * ti) * tj;
+    }
+  }
+  const low = new Float32Array(nr * nc).fill(Infinity);
+  for (let i = 0; i < p.length; i += 3) {
+    const c = Math.floor((p[i] - g.west) / f), r = Math.floor((g.north + p[i + 2]) / f);
+    if (r < 0 || c < 0 || r >= nr || c >= nc) continue;
+    const k = r * nc + c;
+    if (a[k] === a[k] && Math.abs(p[i + 1] - a[k]) <= 0.06 && p[i + 1] < low[k]) low[k] = p[i + 1];
+  }
+  for (let k = 0; k < a.length; k++) if (low[k] < Infinity) a[k] = low[k];
+  return { a, nr, nc, west: g.west, north: g.north, cell: f };
+}
+// Terrain from points: lowest point per cell, cleaned at >= 10 cm (what the data supports), optionally refined finer.
+// `auto` coarsens the cell until it fits TERRAIN_MAX_FACES; an explicit cell is kept as asked.
+function buildTerrain({ p, c, f, bounds, region, cell, auto, px, photo }) {
+  let base = Math.max(cell, 0.1), g;
+  for (;;) {
+    progress("Terrain: finding the ground…", 0.1);
+    g = cleanGrid(lowestGrid(p, bounds, region, base));
+    if (region) g = cropGrid(maskRegion(g, region));
+    if (!auto || countFaces(g) <= TERRAIN_MAX_FACES) break;
+    base *= 1.25;
+  }
+  const baseFaces = countFaces(g), baseCell = g.cell;
+  if (cell < baseCell - 1e-9) {
+    progress("Terrain: refining…", 0.4);
+    g = upsampleGrid(g, cell, p);
+    if (region) g = cropGrid(maskRegion(g, region));
+  }
+  progress("Terrain: meshing…", 0.5);
+  const out = { ...triangulate(g), grid: g, baseFaces, baseCell };
+  return photo ? Object.assign(out, orthophoto(g, p, c, f, px)) : out;
+}
+// Flags per point (m.idx null) or per face: 0 outside the region, 1 ground, 2 structure (above the terrain or where
+// there is none), 3 below the ground (points only). Points: ground band as for the photo; faces: centroid > 25 cm above.
+function classify(m) {
+  const n = m.idx ? m.idx.length / 3 : m.pos.length / 3, out = new Uint8Array(n), g = m.grid, r = m.region;
+  for (let i = 0; i < n; i++) {
+    let x, y, z;
+    if (m.idx) {
+      const a = 3 * m.idx[3 * i], b = 3 * m.idx[3 * i + 1], c = 3 * m.idx[3 * i + 2];
+      x = (m.pos[a] + m.pos[b] + m.pos[c]) / 3; y = (m.pos[a + 1] + m.pos[b + 1] + m.pos[c + 1]) / 3; z = (m.pos[a + 2] + m.pos[b + 2] + m.pos[c + 2]) / 3;
+    } else { x = m.pos[3 * i]; y = m.pos[3 * i + 1]; z = m.pos[3 * i + 2]; }
+    if (r && (x < r.x0 || x > r.x1 || z < r.z0 || z > r.z1)) continue;
+    const dz = y - groundAt(g, x, -z);
+    out[i] = m.idx ? (dz === dz && dz <= STRUCTURE_ABOVE ? 1 : 2) : !(dz === dz) || dz > GROUND_BAND[1] ? 2 : dz >= GROUND_BAND[0] ? 1 : 3;
+  }
+  return out;
 }
 
-// -- UI
-const EXPORTS = {
-  async mstl() { const m = await meshData(); download(stlBytes(su(m.pos), m.idx), `${slug()}_mesh.stl`); },
-  async mobj() { const m = await meshData(); download(objText(m.pos, m.col, m.idx), `${slug()}_mesh.obj`); },
-  async mglb() { const m = await meshData(); progress("Writing GLB…", 0.85); download(await glbBytes(m.pos, m.col, m.idx), `${slug()}_mesh.glb`, "model/gltf-binary"); },
-  async mdae() { const m = await meshData(); download(collada("scene", su(m.pos), m.idx), `${slug()}_mesh.dae`, "model/vnd.collada+xml"); },
-  async mkmz() { const m = await meshData(); download(await kmz("scene", collada("scene", su(m.pos), m.idx)), `${slug()}_mesh.kmz`, "application/vnd.google-earth.kmz"); },
-  async tkmz() { const t = await terrain(); download(await kmz("terrain", collada("terrain", t.verts, t.tris, t.uvs, "terrain.png"), t.png), `${slug()}_terrain.kmz`, "application/vnd.google-earth.kmz"); },
-  async tdae() {
-    const t = await terrain(), { zipSync, strToU8 } = await lib("zip");
-    download(zipSync({ "terrain.dae": strToU8(collada("terrain", t.verts, t.tris, t.uvs, "terrain.png")), "terrain.png": [t.png, { level: 0 }] }), `${slug()}_terrain_dae.zip`, "application/zip");
-  },
-  async tstl() { const t = await terrain(); download(stlBytes(t.verts, t.tris), `${slug()}_terrain.stl`); },
-  async ppl() { progress("Writing PLY…", 0.5); await tick(); download(plyBytes(pointData(+$("exThin").value)), `${slug()}_points.ply`); },
-  async plas() { progress("Writing LAS…", 0.5); await tick(); download(lasBytes(pointData(+$("exThin").value)), `${slug()}_points.las`); },
-};
+// -- Worker: the terrain kernel runs off the main thread so fine resolutions don't freeze the page
+const KERNEL = [nth, medianOf, lowestGrid, cleanGrid, cropGrid, maskRegion, upsampleGrid, triangulate, nearestSet, orthophoto, groundAt, countFaces, buildTerrain, classify];
+function kernelSource() {
+  const consts = { TERRAIN_MAX_FACES, OUTLIER, BUMP, BUMP_WINDOW, MAX_SLOPE, MAX_HOLE, GROUND_BAND, ORTHO_MAX, ORTHO_FILL, STRUCTURE_ABOVE, D8, D4 };
+  return `const ${Object.entries(consts).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(", ")};\n` +
+    "const progress = (text, f) => postMessage({ id: self.job, progress: f, text });\n" + KERNEL.map(String).join("\n") + `
+const bufs = (o) => Object.values(o).flatMap((v) => ArrayBuffer.isView(v) ? [v.buffer] : v && typeof v === "object" ? bufs(v) : []);
+onmessage = (e) => {
+  const { id, op, ...m } = e.data;
+  self.job = id;
+  try { const r = op === "terrain" ? buildTerrain(m) : classify(m); postMessage({ id, result: r }, [...new Set(bufs(r))]); }
+  catch (err) { postMessage({ id, error: err.message }); }
+};`;
+}
+let kernelWorker = null, jobSeq = 0;
+function kernel(op, msg, onProgress) {
+  kernelWorker ||= new Worker(URL.createObjectURL(new Blob([kernelSource()], { type: "text/javascript" })));
+  const id = ++jobSeq;
+  return new Promise((resolve, reject) => {
+    const on = (e) => {
+      if (e.data.id !== id) return;
+      if (e.data.progress !== undefined) return onProgress?.(e.data.text, e.data.progress);
+      kernelWorker.removeEventListener("message", on);
+      if (e.data.error) reject(new Error(e.data.error)); else resolve(e.data.result);
+    };
+    kernelWorker.addEventListener("message", on);
+    kernelWorker.postMessage({ id, op, ...msg });
+  });
+}
+
+// -- Data sources: the loaded points / mesh, or the full-resolution files fetched on demand
+async function fetchParsed(url, bytes, what) {
+  const buf = await fetchBuffer(url, bytes, (g, t) => setLoader(`Loading ${what}`, g, t));
+  setLoader(`Preparing ${what}`);
+  await tick();
+  return loader.parse(buf);
+}
+function pointSource(full) {
+  if (full && cloud.full) return cloud.full;
+  const c = cloud.attrs.rgb.array;
+  return { p: cloud.geom.attributes.position.array, c, f: c instanceof Float32Array ? 255 : 1 };
+}
+async function fullPoints() {
+  if (cloud.full || !cloud.fullPointsUrl) return cloud.full || null;
+  const c = cloud, geom = await fetchParsed(c.fullPointsUrl, c.fullPointsBytes, "full-resolution points"), col = geom.attributes.color.array;
+  c.fullItem = { geom, attrs: { rgb: geom.attributes.color } };  // also what Max quality draws
+  return (c.full = { p: geom.attributes.position.array, c: col, f: col instanceof Float32Array ? 255 : 1 });
+}
+async function surfSource(full) {  // {pos, idx (copy), rgb attribute} of the published mesh or the full-resolution one
+  let geom, rgb;
+  if (full && cloud.fullMeshUrl) {
+    cloud.meshFull ||= await fetchParsed(cloud.fullMeshUrl, cloud.fullMeshBytes, "full-resolution mesh");
+    geom = cloud.meshFull;
+    rgb = geom.attributes.color;
+  } else {
+    if (!surf && !(cloud.meshUrl && await loadSurface())) throw new Error("no surface mesh available");
+    geom = surf.geom;
+    rgb = surf.attrs.rgb;
+  }
+  return { pos: geom.attributes.position.array, idx: Uint32Array.from((surf && geom === surf.geom ? surf.origIndex : geom.index).array), rgb };
+}
+
+// -- Export options and the parts they produce
+const CONTENT = { ground: "Ground", structures: "Structures & plants", both: "Both" };
+let exContent = "both", region = null;  // region: world rect {x0, x1, z0, z1} (X east, Z south) or null for the whole model
+const exAuto = () => !+$("exCell").value, exCell = () => +$("exCell").value || 0.1, exPx = () => +$("exPx").value, exThin = () => +$("exThin").value;
+const exFull = () => +$("exFaces").value >= 100;
+const exFaces = () => Math.round(10 ** (4 + 1.7 * Math.min(+$("exFaces").value, 99) / 99) / 1000) * 1000;
+
+async function terrainData({ photo, baseOnly, quiet }) {  // cached; baseOnly: clean at >= 10 cm only (estimates, classification)
+  const cell = baseOnly ? Math.max(exCell(), 0.1) : exCell(), px = exPx();
+  const full = !baseOnly && !!cloud.fullPointsUrl && (cell < 0.1 - 1e-9 || (photo && px < 0.03 - 1e-9));
+  const key = JSON.stringify([exAuto(), cell, photo ? px : 0, region, full]);
+  cloud.cache ||= new Map();
+  if (cloud.cache.has(key)) return cloud.cache.get(key);
+  const src = full ? await fullPoints() : pointSource(false), bb = cloud.geom.boundingBox;
+  const bounds = { minx: bb.min.x - 0.1, maxx: bb.max.x + 0.1, minz: bb.min.z - 0.1, maxz: bb.max.z + 0.1 };
+  const t = await kernel("terrain", { p: src.p, c: src.c, f: src.f, bounds, region, cell, auto: exAuto(), px, photo }, quiet ? undefined : progress);
+  if (cloud.cache.size >= 2) cloud.cache.delete(cloud.cache.keys().next().value);  // the photo can be large: keep two
+  cloud.cache.set(key, t);
+  return t;
+}
+async function pngOf(t) {
+  if (t.png) return t.png;
+  const canvas = Object.assign(document.createElement("canvas"), { width: t.W, height: t.H });
+  canvas.getContext("2d").putImageData(new ImageData(t.img, t.W, t.H), 0, 0);
+  const blob = await new Promise((r) => canvas.toBlob(r, "image/png"));
+  return (t.png = new Uint8Array(await blob.arrayBuffer()));
+}
+function photoColours(t) {  // vertex colours sampled from the terrain photo, for OBJ / GLB
+  const n = t.verts.length / 3, col = new Uint8Array(3 * n);
+  for (let i = 0; i < n; i++) {
+    const x = Math.min(t.W - 1, Math.max(0, Math.floor(t.uvs[2 * i] * t.W))), y = Math.min(t.H - 1, Math.max(0, Math.floor((1 - t.uvs[2 * i + 1]) * t.H))), o = 4 * (y * t.W + x);
+    col[3 * i] = t.img[o]; col[3 * i + 1] = t.img[o + 1]; col[3 * i + 2] = t.img[o + 2];
+  }
+  return col;
+}
+// Mesh faces more than 25 cm above the terrain (or where there is none) are structures; meshoptimizer simplification
+// keeps original vertices, so vertex colours survive.
+async function structurePart(grid) {
+  const src = await surfSource(exFull());
+  progress("Splitting structures from the ground…", 0.55);
+  const flags = await kernel("classify", { pos: src.pos, idx: src.idx, grid, region });
+  let n = 0;
+  for (const f of flags) if (f === 2) n++;
+  if (!n) throw new Error("no structures in that area");
+  let idx = new Uint32Array(3 * n);
+  for (let f = 0, k = 0; f < flags.length; f++) if (flags[f] === 2) idx.set(src.idx.subarray(3 * f, 3 * f + 3), 3 * k++);
+  const target = exFull() ? Infinity : exFaces();
+  if (n > target) {
+    progress("Simplifying the mesh…", 0.7);
+    await tick();
+    const { MeshoptSimplifier: S } = await lib("simp");
+    await S.ready;
+    idx = S.simplify(idx, src.pos, 3, target * 3, 0.5)[0];
+  }
+  progress("Preparing the mesh…", 0.85);
+  await tick();
+  const map = new Int32Array(src.pos.length / 3).fill(-1);
+  let nv = 0;
+  for (let j = 0; j < idx.length; j++) { if (map[idx[j]] < 0) map[idx[j]] = nv++; idx[j] = map[idx[j]]; }
+  const P = new Float32Array(3 * nv), C = new Uint8Array(3 * nv);
+  for (let i = 0; i < map.length; i++) {
+    const m = map[i];
+    if (m < 0) continue;
+    P.set(src.pos.subarray(3 * i, 3 * i + 3), 3 * m);
+    C[3 * m] = Math.round(src.rgb.getX(i) * 255); C[3 * m + 1] = Math.round(src.rgb.getY(i) * 255); C[3 * m + 2] = Math.round(src.rgb.getZ(i) * 255);
+  }
+  return { name: "structures", verts: su(P), tris: idx, col: C };
+}
+async function buildParts(content, photo) {
+  const parts = [];
+  let t = null;
+  if (content !== "structures") {
+    t = await terrainData({ photo });
+    parts.push({ name: "ground", verts: t.verts, tris: t.tris, uvs: photo ? t.uvs : null, texture: photo ? "terrain.png" : null, t });
+  }
+  if (content !== "ground") parts.push(await structurePart((t || await terrainData({ photo: false, baseOnly: true })).grid));
+  return parts;
+}
+
+// -- Exporters
+async function exportModel(fmt) {
+  const textured = fmt === "kmz" || fmt === "zip", coloured = fmt === "obj" || fmt === "glb";
+  const parts = await buildParts(exContent, (textured || coloured) && exContent !== "structures"), ground = parts.find((p) => p.t), name = `${slug()}_${exContent}`;
+  progress("Writing the file…", 0.92);
+  await tick();
+  if (coloured && ground) ground.col = photoColours(ground.t);
+  const png = textured && ground ? await pngOf(ground.t) : null;
+  if (fmt === "stl") { const [v, t] = mergeParts(parts); download(stlBytes(v, t), `${name}.stl`); }
+  else if (fmt === "obj") download(new Blob(objChunks(parts)), `${name}.obj`);
+  else if (fmt === "glb") download(await glbBytes(parts), `${name}.glb`, "model/gltf-binary");
+  else if (fmt === "dae") download(collada(parts), `${name}.dae`, "model/vnd.collada+xml");
+  else if (fmt === "kmz") download(await kmz(collada(parts), png), `${name}.kmz`, "application/vnd.google-earth.kmz");
+  else {
+    const { zipSync, strToU8 } = await lib("zip"), files = { "model.dae": strToU8(collada(parts)) };
+    if (png) files["terrain.png"] = [png, { level: 0 }];
+    download(zipSync(files), `${name}_dae.zip`, "application/zip");
+  }
+}
+async function exportPoints(fmt) {  // content and area apply here too: ground band / above it / everything
+  const full = exThin() === 0 && !!cloud.fullPointsUrl, src = full ? await fullPoints() : pointSource(false), n = src.p.length / 3;
+  let flags = null;
+  if (exContent !== "both" || region) {
+    const grid = (await terrainData({ photo: false, baseOnly: true })).grid;
+    progress("Selecting points…", 0.6);
+    flags = await kernel("classify", { pos: src.p, idx: null, grid, region });
+  }
+  const want = (f) => (exContent === "both" ? f !== 0 : f === (exContent === "ground" ? 1 : 2));
+  let count = 0;
+  for (let i = 0; i < n; i++) if (!flags || want(flags[i])) count++;
+  if (!count) throw new Error("no points in that selection");
+  const N = Math.min(count, exThin() > 0 ? exThin() : count), pos = new Float32Array(3 * N), col = new Uint8Array(3 * N);
+  for (let i = 0, seen = 0, o = 0; i < n; i++) {  // keep N evenly spread points
+    if (flags && !want(flags[i])) continue;
+    const keep = Math.floor((seen + 1) * N / count) > Math.floor(seen * N / count);
+    seen++;
+    if (!keep) continue;
+    for (let k = 0; k < 3; k++) { pos[3 * o + k] = src.p[3 * i + k]; col[3 * o + k] = Math.round(src.c[3 * i + k] * src.f); }
+    o++;
+  }
+  progress("Writing the file…", 0.9);
+  await tick();
+  const name = `${slug()}_${exContent}_points`;
+  if (fmt === "ply") download(plyBytes({ pos, col, N }), `${name}.ply`); else download(lasBytes({ pos, col, N }), `${name}.las`);
+}
 let exporting = false;
-async function runExport(name) {
+async function runExport(fmt) {
   if (exporting) return;
   exporting = true;
   const buttons = document.querySelectorAll("#export button");
   buttons.forEach((b) => { b.disabled = true; });
   const t0 = performance.now();
   try {
-    await EXPORTS[name]();
+    await (fmt === "ply" || fmt === "las" ? exportPoints(fmt) : exportModel(fmt));
     toast(`Done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
   } catch (err) {
     console.error(err);
@@ -1392,20 +2125,122 @@ async function runExport(name) {
     $("loader").hidden = true;
     buttons.forEach((b) => { b.disabled = false; });
     exporting = false;
+    scheduleAnalysis();
   }
 }
-function updateExport() {  // rough size estimates, shown before generating
-  if (!cloud) return;
-  const F = exFaces(), cell = +$("exCell").value, n = cloud.geom.attributes.position.count, N = Math.min(n, +$("exThin").value || n);
-  const T = Math.round(cloud.size.x * cloud.size.z / cell ** 2 * 1.1), png = Math.min(cloud.size.x * cloud.size.z / ORTHO_PX ** 2, ORTHO_MAX ** 2) * 1.3;
-  $("exFacesOut").textContent = `${F / 1000}k faces`;
-  $("exCellOut").textContent = `${cell.toFixed(2)} m`;
-  $("exMeshEst").textContent = `≈ STL ${mbs(50 * F)} · OBJ ${mbs(40 * F)} · GLB ${mbs(20 * F)} · DAE ${mbs(45 * F)} · KMZ ${mbs(15 * F)}`;
-  $("exTerrainEst").textContent = `≈ ${Math.round(T / 1000)}k faces: KMZ ${mbs(15 * T + png)} · DAE+PNG ${mbs(15 * T + png)} · STL ${mbs(50 * T)}`;
-  $("exPointsEst").textContent = `${(N / 1e6).toFixed(2)}M points ≈ PLY ${mbs(15 * N)} · LAS ${mbs(26 * N)}`;
+
+// -- Live estimates: ground faces from a quick 10 cm analysis of the selection, structure faces once the surface is loaded
+let analysis = null, analyseTimer;
+const areaDims = () => (region ? [region.x1 - region.x0, region.z1 - region.z0] : [cloud.size.x, cloud.size.z]);
+function photoDims() {
+  const [w, h] = areaDims(), px = Math.max(exPx(), Math.max(w, h) / ORTHO_MAX);
+  return { W: Math.ceil(w / px), H: Math.ceil(h / px), px, capped: px > exPx() + 1e-9 };
 }
+function scheduleAnalysis() { clearTimeout(analyseTimer); analyseTimer = setTimeout(analyse, 350); }
+async function analyse() {
+  if (!cloud || !$("export").open || exporting) return;
+  const c = cloud, key = JSON.stringify([exAuto(), Math.max(exCell(), 0.1), region, !!surf]);
+  if (analysis?.cloud === c && analysis.key === key) return;
+  try {
+    const t = await terrainData({ photo: false, baseOnly: true, quiet: true }), src = pointSource(false), a = { cloud: c, key, baseFaces: t.baseFaces, baseCell: t.baseCell, pts: [0, 0, 0, 0] };
+    for (const f of await kernel("classify", { pos: src.p, idx: null, grid: t.grid, region })) a.pts[f]++;
+    if (surf) {
+      a.struct = 0;
+      for (const f of await kernel("classify", { pos: surf.geom.attributes.position.array, idx: surf.origIndex.array, grid: t.grid, region })) if (f === 2) a.struct++;
+    }
+    if (c === cloud) { analysis = a; updateExport(); }
+  } catch (err) { console.warn(err); }
+}
+function updateExport() {
+  if (!cloud) return;
+  const a = analysis?.cloud === cloud ? analysis : null, wantG = exContent !== "structures", wantS = exContent !== "ground";
+  const full = exFull(), nPts = cloud.geom.attributes.position.count, pd = photoDims();
+  $("exFacesOut").textContent = full ? "full" : `${exFaces() / 1000}k`;
+  $("exArea").textContent = region ? `${(region.x1 - region.x0).toFixed(1)} × ${(region.z1 - region.z0).toFixed(1)} m selected` : "Whole model";
+  const cellEff = exAuto() && a ? a.baseCell : exCell();
+  const G = wantG && a ? Math.round(a.baseFaces * (a.baseCell / cellEff) ** 2) : 0;
+  const Sall = a?.struct ?? Math.round(0.45 * (cloud.meshBytes || 0) / 22), S = wantS && cloud.meshBytes !== undefined ? (full ? Sall : Math.min(Sall, exFaces())) : 0;
+  const png = wantG ? pd.W * pd.H * 1.75 : 0, F = G + S, zip = (28 * G + 33 * S) * 0.31 + png;
+  $("exEst").textContent = a || !wantG
+    ? `${wantG ? `ground ${(G / 1000).toFixed(0)}k` : ""}${wantG && wantS ? " + " : ""}${wantS ? `structures ${(S / 1000).toFixed(0)}k${a?.struct === undefined ? " (est.)" : ""}` : ""} faces ≈ STL ${mbs(84 + 50 * F)} · OBJ ${mbs(45 * F)} · GLB ${mbs(26 * F)} · DAE ${mbs(30 * F)} · KMZ/zip ${mbs(zip)}`
+    : "Estimating…";
+  const ptsOf = (a?.pts ?? [nPts, nPts, 0, 0]);
+  const count = (exContent === "both" ? ptsOf[1] + ptsOf[2] + ptsOf[3] : ptsOf[exContent === "ground" ? 1 : 2]) * (exThin() === 0 && cloud.fullPointsCount ? cloud.fullPointsCount / nPts : 1);
+  const N = Math.min(count, exThin() > 0 ? exThin() : count);
+  $("exPointsEst").textContent = `${(N / 1e6).toFixed(2)}M points ≈ PLY ${mbs(15 * N)} · LAS ${mbs(26 * N)}`;
+  const warn = [];
+  if (F > 300000) warn.push(`⚠ ${(F / 1e6).toFixed(2)}M faces: heavy for SketchUp`);
+  if (wantG && pd.capped) warn.push(`⚠ photo capped at ${ORTHO_MAX} px, ${(pd.px * 100).toFixed(1)} cm/px`);
+  if (wantG && pd.W * pd.H > 3e7) warn.push("⚠ very large photo: needs a lot of memory");
+  const fine = cloud.fullPointsUrl && (exCell() < 0.1 || exPx() < 0.03), big = (fine ? cloud.fullPointsBytes : 0) + (full && cloud.fullMeshUrl && wantS ? cloud.fullMeshBytes : 0) + (exThin() === 0 && cloud.fullPointsUrl && !fine ? cloud.fullPointsBytes : 0);
+  if (big) warn.push(`These settings download full-resolution data (${mbs(big)}) when you export.`);
+  $("exWarn").textContent = warn.join(" ");
+}
+function setContent(m) {
+  exContent = m;
+  document.querySelectorAll("#exContent button").forEach((x) => x.setAttribute("aria-pressed", x.dataset.m === m));
+  updateExport();
+}
+for (const [m, text] of Object.entries(CONTENT)) {
+  const b = Object.assign(document.createElement("button"), { textContent: text });
+  b.dataset.m = m;
+  b.onclick = () => setContent(m);
+  $("exContent").append(b);
+}
+setContent(exContent);
 document.querySelectorAll("#export [data-x]").forEach((b) => { b.onclick = () => runExport(b.dataset.x); });
-for (const id of ["exFaces", "exCell", "exThin"]) $(id).oninput = updateExport;
+for (const id of ["exCell", "exPx", "exFaces", "exThin"]) $(id).oninput = () => { updateExport(); scheduleAnalysis(); };
+$("export").ontoggle = scheduleAnalysis;
+
+// -- Area selection: drag a rectangle on the plan; it limits every export. The outline follows the view.
+let selecting = false, selStart = null;
+function screenToWorld(x, y) {  // plan (orthographic) view: X east, Z south
+  camera.updateMatrixWorld();
+  const v = new THREE.Vector3(x / innerWidth * 2 - 1, -(y / innerHeight * 2 - 1), 0).unproject(camera);
+  return { x: v.x, z: v.z };
+}
+function setRegionFromScreen(x1, y1, x2, y2) {
+  const a = screenToWorld(x1, y1), b = screenToWorld(x2, y2), bb = cloud.geom.boundingBox;
+  region = { x0: Math.max(bb.min.x, Math.min(a.x, b.x)), x1: Math.min(bb.max.x, Math.max(a.x, b.x)), z0: Math.max(bb.min.z, Math.min(a.z, b.z)), z1: Math.min(bb.max.z, Math.max(a.z, b.z)) };
+  invalidate();
+  updateExport();
+  scheduleAnalysis();
+}
+function setSelecting(on) {
+  selecting = on;
+  selStart = null;
+  $("exSel").setAttribute("aria-pressed", on);
+  renderer.domElement.style.cursor = on ? "crosshair" : "";
+  if (on) { setPlan(true); toast("Drag a rectangle on the plan"); }
+}
+for (const t of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) cv.addEventListener(t, (e) => {  // capture phase: runs before navigation and measuring
+  if (!selecting) return;
+  e.stopImmediatePropagation();
+  if (t === "pointerdown") { selStart = { x: e.clientX, y: e.clientY }; try { cv.setPointerCapture(e.pointerId); } catch {} }
+  else if (t === "pointercancel") selStart = null;
+  else if (selStart) {
+    setRegionFromScreen(selStart.x, selStart.y, e.clientX, e.clientY);
+    if (t === "pointerup") {
+      setSelecting(false);
+      if (region.x1 - region.x0 < 0.3 || region.z1 - region.z0 < 0.3) { region = null; toast("Area too small"); updateExport(); invalidate(); }
+    }
+  }
+}, true);
+$("exSel").onclick = () => setSelecting(!selecting);
+$("exVis").onclick = () => { setPlan(true); const [l, r] = insets(); setRegionFromScreen(l, 0, innerWidth - r, innerHeight); };
+$("exClr").onclick = () => { region = null; invalidate(); updateExport(); scheduleAnalysis(); };
+function updateSelBox() {  // called from render()
+  const box = $("selbox");
+  box.hidden = !region;
+  if (!region) return;
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const [x, z] of [[region.x0, region.z0], [region.x1, region.z0], [region.x1, region.z1], [region.x0, region.z1]]) {
+    tmp.set(x, cloud.ground, z).project(camera);
+    const sx = (tmp.x * 0.5 + 0.5) * innerWidth, sy = (0.5 - tmp.y * 0.5) * innerHeight;
+    x0 = Math.min(x0, sx); x1 = Math.max(x1, sx); y0 = Math.min(y0, sy); y1 = Math.max(y1, sy);
+  }
+  Object.assign(box.style, { left: `${x0}px`, top: `${y0}px`, width: `${x1 - x0}px`, height: `${y1 - y0}px` });
+}
 
 async function start() {
   const index = await fetch("models/index.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
@@ -1417,7 +2252,9 @@ async function start() {
   const select = (m) => {
     for (const b of box.children) b.setAttribute("aria-pressed", b.dataset.name === m.name);
     open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p),
-      m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {});
+      { ...(m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {}), sunLoc: m.sun_location,
+        ...(m.points_full ? { fullPointsUrl: `models/${m.name}/points_full.ply`, fullPointsBytes: m.points_full_bytes, fullPointsCount: m.points_full_count } : {}),
+        ...(m.mesh_full ? { fullMeshUrl: `models/${m.name}/mesh_full.ply`, fullMeshBytes: m.mesh_full_bytes } : {}) });
   };
   for (const m of index) {
     const b = Object.assign(document.createElement("button"), {
