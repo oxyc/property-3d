@@ -34,9 +34,12 @@ from scipy import ndimage
 
 TERRAIN_MAX_FACES = 100_000
 OUTLIER = 0.4  # m, a cell this far from the median of its neighbours is dropped
-MAX_HOLE = 1.0  # m^2, bigger unscanned areas stay empty
+BUMP, BUMP_WINDOW = 0.25, 1.5  # m: cells this far above the local 1.5 m median are vegetation/clutter, not ground
+MAX_SLOPE = 1.0  # rise/run (45°); steeper cells are walls or hedges at the edge, not ground
+MAX_HOLE = 4.0  # m^2, interior holes up to this (e.g. under a removed bush) are filled; bigger stay empty
+GROUND_BAND = (-0.15, 0.3)  # m around the terrain: only these points colour the orthophoto
 ORTHO_PX, ORTHO_MAX = 0.03, 8192  # m per pixel, pixels per side
-ORTHO_FILL = 0.3  # m, empty ortho pixels take the colour of the nearest point up to this far
+ORTHO_FILL = 1.0  # m, empty ortho pixels take the colour of the nearest ground point up to this far
 NS = "{http://www.collada.org/2005/11/COLLADASchema}"
 
 
@@ -89,6 +92,15 @@ def clean_grid(a, cell):
     spike = ~np.isnan(a) & ((np.isfinite(nb).sum(0) < 3) | (np.abs(a - med) > OUTLIER))
     a = np.where(spike, np.nan, a)
 
+    # Lowest points under dense bushes and along walls are not ground: drop bumps above the local
+    # median surface and steep cells, a few passes so edge ramps erode away.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        for _ in range(3):
+            local = ndimage.generic_filter(a, np.nanmedian, size=max(3, int(BUMP_WINDOW / cell) | 1), mode="constant", cval=np.nan)
+            slope = np.nanmax(np.abs(neighbours(a) - a), axis=0) / cell
+            a = np.where((a - local > BUMP) | (slope > MAX_SLOPE), np.nan, a)
+
     lab, n = ndimage.label(np.isnan(np.pad(a, 1, constant_values=np.nan)))  # padding joins the outside into one label
     size = np.bincount(lab.ravel(), minlength=n + 1)
     small = (size <= MAX_HOLE / cell**2) & (np.arange(n + 1) != lab[0, 0]) & (np.arange(n + 1) > 0)
@@ -137,12 +149,20 @@ def triangulate(a, west, north, cell):
     return np.stack([x, y, a[rows, cols]], 1), np.stack([(x - xmin) / w, (y - ymin) / h], 1), tris
 
 
-def orthophoto(pts, cols, west, north, w, h):
-    """Top-down image over [west, west+w] x [north-h, north]: the highest coloured point in each pixel."""
+def orthophoto(pts, cols, west, north, w, h, ground=None):
+    """Top-down image over [west, west+w] x [north-h, north]: the highest coloured point in each pixel.
+    With ground=(grid, cell) only points within GROUND_BAND of the terrain count, so bushes and walls
+    aren't painted onto it."""
     px = max(ORTHO_PX, max(w, h) / ORTHO_MAX)
     W, H = int(np.ceil(w / px)), int(np.ceil(h / px))
-    coloured = np.abs(cols * 255 - 127.5).max(1) > 1.5  # fuse.py colours uncovered points grey
-    p, c = pts[coloured], cols[coloured]
+    keep = np.abs(cols * 255 - 127.5).max(1) > 1.5  # fuse.py colours uncovered points grey
+    if ground is not None:
+        a, cell = ground
+        gc = np.clip(((pts[:, 0] - west) / cell).astype(int), 0, a.shape[1] - 1)
+        gr = np.clip(((north - pts[:, 1]) / cell).astype(int), 0, a.shape[0] - 1)
+        dz = pts[:, 2] - a[gr, gc]
+        keep &= (dz >= GROUND_BAND[0]) & (dz <= GROUND_BAND[1])  # NaN terrain -> False
+    p, c = pts[keep], cols[keep]
     col, row = ((p[:, 0] - west) / px).astype(int), ((north - p[:, 1]) / px).astype(int)
     inside = (col >= 0) & (col < W) & (row >= 0) & (row < H)
     p, c, col, row = p[inside], c[inside], col[inside], row[inside]
@@ -155,6 +175,11 @@ def orthophoto(pts, cols, west, north, w, h):
     empty[r, k] = False
     dist, (ir, ic) = ndimage.distance_transform_edt(empty, return_indices=True)
     near = empty & (dist * px <= ORTHO_FILL)
+    if ground is not None:  # only fill pixels that lie on terrain geometry
+        yy, xx = np.mgrid[0:H, 0:W]
+        on = ~np.isnan(a[np.clip((yy * px / cell).astype(int), 0, a.shape[0] - 1),
+                         np.clip((xx * px / cell).astype(int), 0, a.shape[1] - 1)])
+        near &= on
     img[near] = img[ir[near], ic[near]]
     print(f"terrain: orthophoto {W}x{H} px at {px * 100:.1f} cm, {1 - empty.mean():.0%} covered by points, "
           f"{near.sum() / empty.sum() if empty.any() else 0:.0%} of the rest filled from neighbours")
@@ -307,7 +332,7 @@ def export(out, terrain_cell=0.1, max_faces=150_000):
     g = np.load(out / "ground.npz")
     a, west, north, cell = terrain_grid(g, terrain_cell)
     verts, uvs, tris = triangulate(a, west, north, cell)
-    Image.fromarray(orthophoto(pts, cols, west, north, a.shape[1] * cell, a.shape[0] * cell)).save(dst / "terrain.png")
+    Image.fromarray(orthophoto(pts, cols, west, north, a.shape[1] * cell, a.shape[0] * cell, (a, cell))).save(dst / "terrain.png")
     write_dae(dst / "terrain.dae", "terrain", verts, tris, uvs, "terrain.png")
     write_stl(dst / "terrain.stl", verts, tris)
     write_kmz(dst / "terrain.kmz", dst / "terrain.dae", dst / "terrain.png", out / "georef.json")
