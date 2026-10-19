@@ -29,7 +29,7 @@ def test_export():
         max_faces = 20_000
         export_sketchup.export(out, 0.25, max_faces)
         sk = out / "sketchup"
-        for name in ("terrain.dae", "terrain.png", "scene.dae", "points.las"):
+        for name in ("terrain.dae", "terrain.png", "scene.dae", "terrain.stl", "scene.stl", "points.las"):
             assert (sk / name).stat().st_size > 0, name
 
         # --- terrain: heights, orientation, texture
