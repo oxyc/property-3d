@@ -16,6 +16,9 @@
   "points_full_count": 3026646,
   "mesh_full": true,
   "mesh_full_bytes": 50483501,
-  "mesh_full_faces": 2424130
+  "mesh_full_faces": 2424130,
+  "photo": true,
+  "photo_bytes": 17851776,
+  "photo_mobile_bytes": 14364068
  }
 ]
