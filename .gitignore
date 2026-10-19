@@ -1,0 +1,12 @@
+# Recordings and derived output contain real places (and GPS); never publish them.
+walks/
+out/
+data/
+
+# Build products
+ios/build/
+ios/WalkScan.xcodeproj/xcuserdata/
+ios/WalkScan.xcodeproj/project.xcworkspace/xcuserdata/
+.venv/
+__pycache__/
+.DS_Store
