@@ -2,7 +2,15 @@
 name = "property-3d-pipeline"
 version = "0.1.0"
 requires-python = ">=3.11,<3.13"  # open3d wheels lag new Python releases
-dependencies = ["numpy", "open3d==0.19.0", "pillow", "pyproj", "rasterio"]
+dependencies = [
+    "laspy>=2.7.0",
+    "numpy",
+    "open3d==0.19.0",
+    "pillow",
+    "pyproj",
+    "rasterio",
+    "scipy>=1.17.1",
+]
 
 [tool.uv]
 package = false

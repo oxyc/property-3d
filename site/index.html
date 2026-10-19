@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Walk Viewer</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1d2127; --muted: #667085; --line: #d8dce2; --btn: #eef0f3; --accent: #1769e0; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1f24; --fg: #e6e8eb; --muted: #9aa3ad; --line: #343a42; --btn: #2a2f36; --accent: #5aa2ff; } }
+  html, body { margin: 0; height: 100%; background: #111; color: var(--fg); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { position: absolute; inset: 0; display: block; }
+  button, .btn { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  button:hover, .btn:hover { border-color: var(--accent); }
+  button.on, button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+
+  #panel { position: absolute; top: 10px; left: 10px; width: min(300px, calc(100vw - 88px)); }
+  #toggle { display: flex; justify-content: space-between; width: 100%; border: 0; background: none; font-weight: 600; padding: 9px 12px; }
+  #panel.collapsed .body { display: none; }
+  #panel.collapsed .chev { transform: rotate(-90deg); }
+  .body { padding: 0 12px 12px; display: grid; gap: 9px; max-height: calc(100vh - 80px); overflow: auto; }
+  #status { color: var(--muted); }
+  #models { display: grid; gap: 4px; }
+  #models button { text-align: left; display: grid; }
+  #models small { opacity: .75; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .seg { display: flex; flex: 1; }
+  .seg button { flex: 1; border-radius: 0; margin-left: -1px; padding: 5px 4px; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; margin: 0; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; }
+  label { display: flex; align-items: center; gap: 8px; }
+  input[type=range] { flex: 1; min-width: 0; }
+  .hint { color: var(--muted); font-size: 12px; margin: 0; }
+
+  #side { position: absolute; top: 10px; right: 10px; display: grid; gap: 6px; justify-items: end; }
+  #compass { width: 56px; height: 56px; padding: 0; border-radius: 50%; background: rgba(20,22,26,.7); border-color: #555; }
+  #compass svg { width: 100%; height: 100%; display: block; }
+  #side .tb { display: grid; gap: 6px; padding: 6px; }
+  #side .tb button { width: 52px; padding: 8px 0; }
+
+  #scale { position: absolute; left: 12px; bottom: 14px; color: #eee; font-size: 12px; text-shadow: 0 0 3px #000; pointer-events: none; }
+  #scale i { display: block; height: 6px; border: 2px solid #eee; border-top: 0; margin-bottom: 2px; box-sizing: border-box; }
+  #labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+  .lbl { position: absolute; left: 0; top: 0; background: rgba(20,22,26,.82); color: #fff; padding: 2px 6px; border-radius: 5px; font-size: 12px; white-space: nowrap; text-align: center; }
+  .lbl b { display: block; font-size: 14px; color: #ffd23f; }
+  .lbl.pt { font-size: 11px; margin-top: -18px; padding: 1px 5px; }
+
+  #loader, #toast { position: absolute; left: 50%; transform: translateX(-50%); background: rgba(20,22,26,.9); color: #eee; border-radius: 10px; padding: 10px 14px; }
+  #loader { top: 45%; width: min(340px, calc(100vw - 40px)); text-align: center; }
+  #loader .bar { height: 6px; background: #444; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  #loader .bar i { display: block; height: 100%; width: 0; background: #5aa2ff; }
+  #loader.err { background: #5a1f1f; }
+  #toast { bottom: 40px; pointer-events: none; transition: opacity .3s; }
+  [hidden] { display: none !important; }
+  #drop, #help { position: absolute; inset: 0; align-items: center; justify-content: center; }
+  #drop { display: none; font-size: 20px; color: #fff; background: rgba(40,90,160,.45); pointer-events: none; }
+  body.dragging #drop { display: flex; }
+  #help { display: flex; background: rgba(0,0,0,.55); }
+  #help .card { padding: 14px 18px; max-width: 320px; }
+  #help h3 { margin: 0 0 8px; }
+  #help dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; }
+  #help dt { font-weight: 600; font-family: ui-monospace, monospace; }
+  #help dd { margin: 0; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="labels"></div>
+
+<div id="panel" class="card">
+  <button id="toggle" aria-expanded="true"><span>Walk viewer</span><span class="chev">▾</span></button>
+  <div class="body">
+    <div id="status">Loading…</div>
+    <div id="models" hidden></div>
+    <div class="row">Colour <div class="seg" id="colors"></div></div>
+    <label>Point size <input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
+    <label><input id="edl" type="checkbox" checked> Depth shading (eye-dome)</label>
+    <label id="meshRow" hidden><input id="mesh" type="checkbox"> Show mesh</label>
+    <label class="btn" style="justify-content:center">Open .ply file…<input id="file" type="file" accept=".ply" hidden></label>
+    <p class="hint">Drop a .ply file on the page to view it locally — nothing is uploaded.</p>
+  </div>
+</div>
+
+<div id="side">
+  <button id="compass" title="North — click to face north" aria-label="Face north">
+    <svg viewBox="-28 -28 56 56"><g id="needle"><path d="M0-21 6 2H-6Z" fill="#e5484d"/><path d="M0 21 6-2H-6Z" fill="#9aa3ad"/><text y="-9" fill="#fff" font-size="9" font-weight="700" text-anchor="middle" font-family="system-ui">N</text></g></svg>
+  </button>
+  <div class="tb card">
+    <button id="bTop" title="Top view, north up (T)">Top</button>
+    <button id="bHome" title="Perspective view (P)">3D</button>
+    <button id="bFit" title="Fit to model (F)">Fit</button>
+    <button id="bMeasure" title="Measure distances (M)" aria-pressed="false">Ruler</button>
+    <button id="bClear" title="Clear measurements (Esc)">Clear</button>
+    <button id="bHelp" title="Keyboard shortcuts (?)">?</button>
+  </div>
+</div>
+
+<div id="scale"><i></i><span></span></div>
+<div id="loader" hidden><div></div><div class="bar"><i></i></div></div>
+<div id="toast" hidden></div>
+<div id="drop">Drop .ply to view</div>
+<div id="help" hidden><div class="card"><h3>Shortcuts</h3><dl>
+  <dt>T</dt><dd>Top view (north up)</dd><dt>P</dt><dd>Perspective view</dd><dt>F</dt><dd>Fit to model</dd>
+  <dt>M</dt><dd>Measure: click two points</dd><dt>Esc</dt><dd>Cancel / clear measurements</dd>
+  <dt>C</dt><dd>Cycle colour mode</dd><dt>E</dt><dd>Toggle depth shading</dd><dt>?</dt><dd>This help</dd>
+</dl><p class="hint">Drag: orbit · right-drag or two fingers: pan · scroll or pinch: zoom. The URL always holds the current view, so you can share it.</p></div></div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+
+// Entry modes: ?model=<name> (or first entry) from models/index.json (published site);
+// points.ply next to this file (pipeline output folder); a dropped / opened local .ply.
+// World is ARKit's: X east, Y up, Z south (north = -Z), metres. Colours are shown raw (no colour management).
+THREE.ColorManagement.enabled = false;
+const $ = (id) => document.getElementById(id);
+const pr = Math.min(devicePixelRatio, 2);
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+renderer.setPixelRatio(pr);
+renderer.setClearColor(0x111111);
+renderer.autoClear = false;
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();   // cloud (+ mesh), goes through the EDL pass
+const overlay = new THREE.Scene(); // measurements, drawn on top without depth test
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+let dirty = true, anim = null;
+const invalidate = () => { dirty = true; };
+
+const material = new THREE.PointsMaterial({ size: 0.03, sizeAttenuation: true, vertexColors: true });
+material.onBeforeCompile = (s) => {  // never thinner than ~1.5 css px, so distant points don't vanish
+  s.vertexShader = s.vertexShader.replace("#include <fog_vertex>",
+    `#include <fog_vertex>\n gl_PointSize = max(gl_PointSize, ${(1.5 * pr).toFixed(1)});`);
+};
+
+// ---- Eye-dome lighting: render to a colour+depth target, darken pixels that sit behind closer neighbours.
+let rt;
+const post = new THREE.ShaderMaterial({
+  uniforms: { tColor: {}, tDepth: {}, texel: { value: new THREE.Vector2() }, near: { value: 0.1 }, far: { value: 100 }, strength: { value: 60 } },
+  vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }",
+  fragmentShader: `uniform sampler2D tColor, tDepth; uniform vec2 texel; uniform float near, far, strength; varying vec2 vUv;
+    float lin(vec2 uv) { float d = texture2D(tDepth, uv).x; return d >= 1. ? -1. : 2. * near * far / (far + near - (d * 2. - 1.) * (far - near)); }
+    float ob(vec2 o, float lz) { float n = lin(vUv + o * texel); return n < 0. ? 0. : max(0., lz - log2(n)); }
+    void main() {
+      vec4 c = texture2D(tColor, vUv); float z = lin(vUv);
+      if (z > 0.) { float lz = log2(z); c.rgb *= exp(-.25 * strength * (ob(vec2(1,0), lz) + ob(vec2(-1,0), lz) + ob(vec2(0,1), lz) + ob(vec2(0,-1), lz))); }
+      gl_FragColor = vec4(c.rgb, 1.);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const postScene = new THREE.Scene();
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post);
+quad.frustumCulled = false;
+postScene.add(quad);
+const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  if (rt) { rt.dispose(); rt.depthTexture.dispose(); }
+  const s = renderer.getDrawingBufferSize(new THREE.Vector2());
+  rt = new THREE.WebGLRenderTarget(s.x, s.y, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthTexture: new THREE.DepthTexture(s.x, s.y) });
+  post.uniforms.tColor.value = rt.texture;
+  post.uniforms.tDepth.value = rt.depthTexture;
+  post.uniforms.texel.value.set(1.5 * pr / s.x, 1.5 * pr / s.y);
+  invalidate();
+}
+addEventListener("resize", resize);
+resize();
+
+// ---- Loading
+const loader = new PLYLoader();
+let cloud = null, meshObj = null, token = 0, startView = parseHash();
+const nextTick = () => new Promise((r) => setTimeout(r, 30));
+const MB = (n) => (n / 1e6).toFixed(1);
+
+async function fetchBuffer(url, hint, onProgress) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  let total = +r.headers.get("content-length") || hint || 0;
+  if (!r.body) return r.arrayBuffer();
+  const reader = r.body.getReader(), chunks = [];
+  for (let got = 0; ;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (got > total) total = 0;  // content-encoding made the size unreliable
+    onProgress?.(got, total);
+  }
+  return new Blob(chunks).arrayBuffer();
+}
+
+function setLoader(text, got, total, err) {
+  const el = $("loader");
+  el.hidden = false;
+  el.classList.toggle("err", !!err);
+  el.firstElementChild.textContent = text + (got ? ` — ${MB(got)}${total ? ` / ${MB(total)}` : ""} MB` : "");
+  el.lastElementChild.hidden = !!err;
+  el.lastElementChild.firstElementChild.style.width = total ? `${(100 * got / total).toFixed(0)}%` : "0";
+  if (err) el.onclick = () => { el.hidden = true; };
+}
+
+async function open(label, getBuffer, opts = {}) {
+  const my = ++token;
+  try {
+    setLoader(`Loading ${label}`);
+    const buf = await getBuffer((got, total) => my === token && setLoader(`Loading ${label}`, got, total));
+    if (my !== token) return;
+    setLoader(`Preparing ${label}`);
+    await nextTick();
+    if (my !== token) return;
+    show(loader.parse(buf), label, opts);
+    $("loader").hidden = true;
+  } catch (err) {
+    if (my !== token) return;
+    console.error(err);
+    const net = err instanceof TypeError || /HTTP/.test(err.message);
+    setLoader(net
+      ? `Could not load ${label}. If you opened this page as a file, serve the folder (python3 -m http.server) or drop the .ply onto the page. Click to dismiss.`
+      : `${label} could not be read as a PLY point cloud. Click to dismiss.`, 0, 0, true);
+  }
+}
+
+function percentile(sorted, p) { return sorted[Math.floor(p * (sorted.length - 1))]; }
+
+function show(geom, label, { local, mesh }) {
+  const pos = geom.attributes.position, n = pos.count;
+  if (!n) throw new Error("empty");
+  if (cloud) { scene.remove(cloud.obj); cloud.geom.dispose(); }
+  if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; $("mesh").checked = false; }
+  clearMeasures();
+  if (!geom.attributes.color) geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.7), 3));
+  geom.computeBoundingBox();
+  const box = geom.boundingBox, size = box.getSize(new THREE.Vector3()), center = box.getCenter(new THREE.Vector3());
+  // Robust height range: 1st..99.5th percentile of Y (the "ground" is the low end, outliers ignored).
+  const ys = new Float32Array(Math.min(n, 100000));
+  for (let i = 0, k = n / ys.length; i < ys.length; i++) ys[i] = pos.getY(Math.floor(i * k));
+  ys.sort();
+  // Surface point spacing from 25 cm voxel occupancy -> a world-space point size that just closes gaps.
+  const cell = 0.25, step = Math.max(1, Math.floor(n / 400000)), seen = new Set(), a = pos.array;
+  for (let i = 0; i < n; i += step)
+    seen.add(((Math.floor(a[3 * i] / cell) + 4096) * 8192 + Math.floor(a[3 * i + 2] / cell) + 4096) * 8192 + Math.floor(a[3 * i + 1] / cell) + 4096);
+  const spacing = Math.min(0.08, Math.max(0.004, Math.sqrt(1.5 * seen.size * cell * cell / n)));
+  cloud = { geom, obj: new THREE.Points(geom, material), size, center, local, attrs: { rgb: geom.attributes.color },
+    ground: percentile(ys, 0.01), top: percentile(ys, 0.995), baseSize: 1.8 * spacing };
+  scene.add(cloud.obj);
+  setColorMode(colorMode);
+  material.size = cloud.baseSize * +$("size").value;
+  $("meshRow").hidden = !mesh;
+  $("status").textContent = `${label} · ${(n / 1e6).toFixed(2)}M points · ${size.x.toFixed(1)} × ${size.z.toFixed(1)} m · ${size.y.toFixed(1)} m tall`;
+
+  const r = 0.5 * size.length();
+  camera.near = Math.max(0.02, r / 1000);
+  camera.far = r * 40;
+  camera.updateProjectionMatrix();
+  post.uniforms.near.value = camera.near;
+  post.uniforms.far.value = camera.far;
+  controls.minDistance = 0.3;
+  controls.maxDistance = r * 10;
+  if (startView && !local) {
+    camera.position.fromArray(startView, 0);
+    controls.target.fromArray(startView, 3);
+    controls.update();
+  } else flyTo(center, homeView(), 0);
+  startView = null;
+  invalidate();
+}
+
+// ---- Colour modes
+const MODES = { rgb: "RGB", height: "Height", grey: "Grey" };
+let colorMode = "rgb";
+const RAMP = [[.19, .07, .55], [.1, .55, .9], [.15, .8, .45], [.95, .85, .2], [.9, .2, .1]];
+const LUT = new Float32Array(256 * 3);
+for (let i = 0; i < 256; i++) {
+  const t = i / 255 * (RAMP.length - 1), j = Math.min(Math.floor(t), RAMP.length - 2);
+  for (let k = 0; k < 3; k++) LUT[3 * i + k] = RAMP[j][k] + (RAMP[j + 1][k] - RAMP[j][k]) * (t - j);
+}
+function setColorMode(m) {
+  colorMode = m;
+  document.querySelectorAll("#colors button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === m));
+  if (!cloud) return;
+  if (!cloud.attrs[m]) {
+    const p = cloud.geom.attributes.position.array, n = p.length / 3, c = new Float32Array(n * 3);
+    if (m === "grey") c.fill(0.75);
+    else for (let i = 0; i < n; i++) {
+      const t = Math.min(1, Math.max(0, (p[3 * i + 1] - cloud.ground) / (cloud.top - cloud.ground || 1)));
+      c.set(LUT.subarray(3 * Math.round(t * 255), 3 * Math.round(t * 255) + 3), 3 * i);
+    }
+    cloud.attrs[m] = new THREE.BufferAttribute(c, 3);
+  }
+  cloud.geom.setAttribute("color", cloud.attrs[m]);
+  invalidate();
+}
+for (const [m, text] of Object.entries(MODES)) {
+  const b = Object.assign(document.createElement("button"), { textContent: text });
+  b.dataset.m = m;
+  b.onclick = () => setColorMode(m);
+  $("colors").append(b);
+}
+const cycleColor = () => { const k = Object.keys(MODES); setColorMode(k[(k.indexOf(colorMode) + 1) % k.length]); };
+$("size").oninput = (e) => { if (cloud) { material.size = cloud.baseSize * +e.target.value; invalidate(); } };
+$("edl").onchange = invalidate;
+
+// ---- Camera: views, smooth transitions, share link
+function fitRadius(top) {
+  const t = Math.tan(camera.fov * Math.PI / 360), a = camera.aspect, s = cloud.size;
+  if (top) return 1.05 * Math.max(s.z / 2 / t, s.x / 2 / (t * a)) + s.y / 2;
+  return 0.45 * s.length() / Math.sin(Math.atan(t * Math.min(1, a)));
+}
+const homeView = () => new THREE.Spherical(fitRadius(false), 0.85, Math.PI / 4);
+function flyTo(target, to, ms = 700) {
+  const offset = camera.position.clone().sub(controls.target);
+  const from = { t: controls.target.clone(), s: new THREE.Spherical().setFromVector3(offset) };
+  const dth = to.theta - from.s.theta, dth1 = dth - Math.round(dth / (2 * Math.PI)) * 2 * Math.PI;
+  anim = { t0: performance.now(), ms, from, to, target, dth: dth1 };
+  if (!ms) stepAnim();
+}
+function stepAnim() {
+  const { t0, ms, from, to, target, dth } = anim;
+  const k = ms ? Math.min(1, (performance.now() - t0) / ms) : 1, e = k < .5 ? 2 * k * k : 1 - 2 * (1 - k) ** 2;
+  controls.target.lerpVectors(from.t, target, e);
+  const s = new THREE.Spherical(from.s.radius + (to.radius - from.s.radius) * e, from.s.phi + (to.phi - from.s.phi) * e, from.s.theta + dth * e);
+  camera.position.setFromSpherical(s).add(controls.target);
+  controls.update();
+  invalidate();
+  if (k === 1) anim = null;
+}
+controls.addEventListener("start", () => { anim = null; });
+const viewTop = () => cloud && flyTo(cloud.center, new THREE.Spherical(fitRadius(true), 0.0005, 0));
+const viewHome = () => cloud && flyTo(cloud.center, homeView());
+const viewFit = () => {
+  if (!cloud) return;
+  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
+  flyTo(cloud.center, new THREE.Spherical(fitRadius(s.phi < 0.2), s.phi, s.theta));
+};
+$("compass").onclick = () => {
+  const s = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
+  flyTo(controls.target.clone(), new THREE.Spherical(s.radius, s.phi, 0));
+};
+
+function parseHash() {
+  const m = /cam=([-\d.,e]+)/.exec(location.hash), v = m && m[1].split(",").map(Number);
+  return v && v.length === 6 && v.every(Number.isFinite) ? v : null;
+}
+let hashTimer;
+controls.addEventListener("change", () => {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    if (!cloud || cloud.local) return;
+    const c = camera.position, t = controls.target;
+    history.replaceState(null, "", `${location.pathname}${location.search}#cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`);
+  }, 400);
+});
+
+// ---- Measuring: pick the nearest cloud point inside a ~7 px cone around the click ray
+const measures = [], labels = [];
+let measuring = false, pending = null;
+const fmt = (v) => `${Math.abs(v).toFixed(Math.abs(v) < 10 ? 2 : 1)} m`;
+const lineMat = new THREE.LineBasicMaterial({ color: 0xffd23f, depthTest: false });
+const helperMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.4, depthTest: false });
+const markMat = new THREE.PointsMaterial({ color: 0xffd23f, size: 9, sizeAttenuation: false, depthTest: false });
+
+function pick(ev) {
+  const r = renderer.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
+  ray.setFromCamera(new THREE.Vector2((ev.clientX - r.left) / r.width * 2 - 1, -((ev.clientY - r.top) / r.height * 2 - 1)), camera);
+  const o = ray.ray.origin, d = ray.ray.direction, p = cloud.geom.attributes.position.array;
+  const tanPx = 7 * 2 * Math.tan(camera.fov * Math.PI / 360) / r.height;
+  let best = -1, bestT = Infinity;
+  for (let i = 0; i < p.length; i += 3) {
+    const x = p[i] - o.x, y = p[i + 1] - o.y, z = p[i + 2] - o.z, t = x * d.x + y * d.y + z * d.z;
+    if (t < camera.near || t >= bestT) continue;
+    if (x * x + y * y + z * z - t * t < t * t * tanPx * tanPx) { best = i; bestT = t; }
+  }
+  return best < 0 ? null : new THREE.Vector3(p[best], p[best + 1], p[best + 2]);
+}
+
+function addLabel(pos, html, cls = "") {
+  const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}`, innerHTML: html });
+  $("labels").append(el);
+  labels.push({ el, pos });
+}
+
+function rebuild() {
+  overlay.traverse((o) => o.geometry?.dispose());
+  overlay.clear();
+  labels.splice(0).forEach((l) => l.el.remove());
+  const main = [], helper = [], pts = [];
+  const mark = (p) => { pts.push(p); addLabel(p, `↑ ${fmt(p.y - cloud.ground)}`, "pt"); };
+  for (const [a, b] of measures) {
+    const c = new THREE.Vector3(b.x, a.y, b.z), horiz = Math.hypot(b.x - a.x, b.z - a.z);
+    main.push(a, b);
+    helper.push(a, c, c, b);
+    mark(a); mark(b);
+    addLabel(a.clone().add(b).multiplyScalar(0.5), `<b>${fmt(a.distanceTo(b))}</b>↔ ${fmt(horiz)} · ↕ ${fmt(b.y - a.y)}`);
+  }
+  if (pending) mark(pending);
+  const geo = (v) => new THREE.BufferGeometry().setFromPoints(v);
+  for (const [Cls, v, m] of [[THREE.LineSegments, helper, helperMat], [THREE.LineSegments, main, lineMat], [THREE.Points, pts, markMat]]) {
+    const o = new Cls(geo(v), m);
+    o.frustumCulled = false;
+    overlay.add(o);
+  }
+  invalidate();
+}
+function clearMeasures() { measures.length = 0; pending = null; if (cloud) rebuild(); }
+function setMeasuring(on) {
+  measuring = on;
+  $("bMeasure").setAttribute("aria-pressed", on);
+  renderer.domElement.style.cursor = on ? "crosshair" : "";
+  if (on) toast("Click two points to measure · Esc clears");
+  else { pending = null; rebuild(); }
+}
+function onEscape() {
+  if (!$("help").hidden) $("help").hidden = true;
+  else if (pending) { pending = null; rebuild(); }
+  else if (measures.length) clearMeasures();
+  else if (measuring) setMeasuring(false);
+}
+
+let down = null;
+const el = renderer.domElement;
+el.addEventListener("pointerdown", (e) => { down = e.isPrimary ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null; });
+el.addEventListener("pointerup", (e) => {
+  if (!measuring || !cloud || !down || !e.isPrimary || (e.pointerType === "mouse" && e.button !== 0)) return;
+  if (Math.hypot(e.clientX - down.x, e.clientY - down.y) > 6 || e.timeStamp - down.t > 600) return;
+  const p = pick(e);
+  if (!p) return toast("No points there — click on the cloud");
+  if (pending) { measures.push([pending, p]); pending = null; } else pending = p;
+  rebuild();
+});
+
+// ---- Render loop and HUD
+const tmp = new THREE.Vector3();
+let scaleText = "";
+function render() {
+  if ($("edl").checked) {
+    renderer.setRenderTarget(rt);
+    renderer.clear();
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    renderer.render(postScene, postCam);
+  } else {
+    renderer.setRenderTarget(null);
+    renderer.clear();
+    renderer.render(scene, camera);
+  }
+  renderer.clearDepth();
+  renderer.render(overlay, camera);
+
+  for (const l of labels) {
+    tmp.copy(l.pos).project(camera);
+    l.el.style.display = tmp.z < 1 ? "" : "none";
+    l.el.style.transform = `translate(${(tmp.x * .5 + .5) * innerWidth}px, ${(.5 - tmp.y * .5) * innerHeight}px) translate(-50%, -50%)`;
+  }
+  $("needle").setAttribute("transform", `rotate(${controls.getAzimuthalAngle() * 180 / Math.PI})`);
+  const mpp = 2 * camera.position.distanceTo(controls.target) * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
+  const raw = mpp * 100, p10 = 10 ** Math.floor(Math.log10(raw)), nice = (raw / p10 >= 5 ? 5 : raw / p10 >= 2 ? 2 : 1) * p10;
+  const text = nice >= 1 ? `${nice} m` : `${Math.round(nice * 100)} cm`;
+  $("scale").firstElementChild.style.width = `${nice / mpp}px`;
+  if (text !== scaleText) $("scale").lastElementChild.textContent = scaleText = text;
+}
+renderer.setAnimationLoop(() => {
+  if (anim) stepAnim();
+  if (controls.update() || dirty) { dirty = false; render(); }
+});
+
+// ---- UI wiring
+let toastTimer;
+function toast(msg, ms = 3500) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, ms);
+}
+$("toggle").onclick = () => {
+  const c = $("panel").classList.toggle("collapsed");
+  $("toggle").setAttribute("aria-expanded", !c);
+};
+if (matchMedia("(max-width: 600px)").matches) $("toggle").click();
+$("bTop").onclick = viewTop;
+$("bHome").onclick = viewHome;
+$("bFit").onclick = viewFit;
+$("bMeasure").onclick = () => setMeasuring(!measuring);
+$("bClear").onclick = onEscape;
+$("bHelp").onclick = () => { $("help").hidden = !$("help").hidden; };
+$("help").onclick = () => { $("help").hidden = true; };
+addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey || /^(SELECT|TEXTAREA)$/.test(e.target.tagName)) return;
+  ({ t: viewTop, p: viewHome, f: viewFit, m: () => setMeasuring(!measuring), c: cycleColor, e: () => $("edl").click(),
+     "?": $("bHelp").onclick, escape: onEscape }[e.key.toLowerCase()])?.();
+});
+
+$("mesh").onchange = async (e) => {
+  if (e.target.checked && !meshObj) {
+    try {
+      toast("Loading mesh…");
+      const geom = loader.parse(await fetchBuffer("mesh.ply"));
+      geom.computeVertexNormals();
+      meshObj = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color: 0xbbbbbb, side: THREE.DoubleSide }));
+      scene.add(meshObj);
+    } catch { e.target.checked = false; toast("Could not load mesh.ply"); }
+  }
+  if (meshObj) meshObj.visible = e.target.checked;
+  invalidate();
+};
+
+const openFile = (file) => file && open(file.name, async () => file.arrayBuffer(), { local: true });
+$("file").onchange = (e) => openFile(e.target.files[0]);
+addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragging"); });
+addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+addEventListener("drop", (e) => {
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  openFile(e.dataTransfer.files[0]);
+});
+
+async function start() {
+  const index = await fetch("models/index.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  if (!Array.isArray(index) || !index.length) return open("points.ply", (p) => fetchBuffer("points.ply", 0, p), { mesh: true });
+  const box = $("models"), want = new URLSearchParams(location.search).get("model");
+  const select = (m) => {
+    for (const b of box.children) b.setAttribute("aria-pressed", b.dataset.name === m.name);
+    open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p));
+  };
+  for (const m of index) {
+    const b = Object.assign(document.createElement("button"), {
+      innerHTML: `<span></span><small>${m.points ? `${(m.points / 1e6).toFixed(1)}M points · ` : ""}${MB(m.bytes)} MB</small>` });
+    b.firstChild.textContent = m.title;
+    b.dataset.name = m.name;
+    b.onclick = () => { startView = null; history.replaceState(null, "", `?model=${m.name}`); select(m); };
+    box.append(b);
+  }
+  box.hidden = false;
+  select(index.find((m) => m.name === want) || index[0]);
+}
+start();
+</script>
+</body>
+</html>
