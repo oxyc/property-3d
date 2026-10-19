@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Walk Viewer</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #111; color: #ddd; font: 13px system-ui, sans-serif; overflow: hidden; }
+  #hud { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,.6); padding: 8px 10px; border-radius: 6px; }
+  #hud label { display: block; margin-top: 4px; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+} }
+</script>
+</head>
+<body>
+<div id="hud">
+  <div id="status">Loading points.ply…</div>
+  <label>Point size <input id="size" type="range" min="1" max="8" value="2"></label>
+  <label><input id="mesh" type="checkbox"> Show mesh</label>
+  <div>Drag: orbit · Right-drag: pan · Scroll: zoom</div>
+</div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PLYLoader } from "three/addons/loaders/PLYLoader.js";
+
+// World is ARKit's: X east, Y up, Z south — already Y-up, so no rotation needed.
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(devicePixelRatio);
+renderer.setSize(innerWidth, innerHeight);
+document.body.appendChild(renderer.domElement);
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x111111);
+scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.05, 2000);
+const controls = new OrbitControls(camera, renderer.domElement);
+
+const loader = new PLYLoader();
+const material = new THREE.PointsMaterial({ size: 2, sizeAttenuation: false, vertexColors: true });
+let meshObj = null;
+
+loader.load("points.ply", (geom) => {
+  const points = new THREE.Points(geom, material);
+  scene.add(points);
+  geom.computeBoundingBox();
+  const box = geom.boundingBox, c = box.getCenter(new THREE.Vector3()), s = box.getSize(new THREE.Vector3());
+  const r = Math.max(s.x, s.z);
+  controls.target.copy(c);
+  camera.position.set(c.x + r * 0.6, c.y + r * 0.8, c.z + r * 0.6);
+  scene.add(new THREE.AxesHelper(1)); // red = east, green = up, blue = south, at the walk start
+  document.getElementById("status").textContent =
+    `${geom.attributes.position.count.toLocaleString()} points · ${s.x.toFixed(1)} × ${s.z.toFixed(1)} m · ${s.y.toFixed(1)} m tall`;
+}, undefined, (e) => { document.getElementById("status").textContent = "Could not load points.ply: " + e; });
+
+document.getElementById("size").oninput = (e) => { material.size = +e.target.value; };
+document.getElementById("mesh").onchange = (e) => {
+  if (e.target.checked && !meshObj) {
+    loader.load("mesh.ply", (geom) => {
+      geom.computeVertexNormals();
+      meshObj = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color: 0xbbbbbb, side: THREE.DoubleSide }));
+      scene.add(meshObj);
+    });
+  } else if (meshObj) meshObj.visible = e.target.checked;
+};
+
+addEventListener("resize", () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+</script>
+</body>
+</html>
