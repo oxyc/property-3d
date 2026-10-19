@@ -9,6 +9,7 @@ Reads points.ply, mesh.ply and ground.npz from out_dir (fuse.py output) and writ
   terrain.dae + terrain.png  COLLADA terrain from the ground grid, textured with a top-down orthophoto
   scene.dae                  TSDF mesh decimated to --max-faces, one plain material
   terrain.kmz                terrain.dae + terrain.png in one file (texture survives single-file upload), geolocated
+  textured.kmz               texture.py's photo-textured scene (textured/model.dae + texture.jpg), if it exists
   terrain.stl, scene.stl     the same geometry without texture, for SketchUp plans that don't import DAE
   points.las                 LAS 1.4 with RGB, for Scan Essentials
 
@@ -353,6 +354,10 @@ def export(out, terrain_cell=None, max_faces=150_000):
     write_dae(dst / "terrain.dae", "terrain", verts, tris, uvs, "terrain.png")
     write_stl(dst / "terrain.stl", verts, tris)
     write_kmz(dst / "terrain.kmz", dst / "terrain.dae", dst / "terrain.png", out / "georef.json")
+    textured = out / "textured" / "model.dae"
+    if textured.exists():  # texture.py output: the whole scene with photos, one file for SketchUp
+        write_kmz(dst / "textured.kmz", textured, textured.parent / "texture.jpg", out / "georef.json")
+        print(f"textured: {(dst / 'textured.kmz').stat().st_size / 1e6:.1f} MB kmz")
     print(f"terrain: {len(tris)} faces, {len(verts)} vertices, {cell:.3f} m cells, {a.shape[1] * cell:.0f} x {a.shape[0] * cell:.0f} m")
 
     sv, st = scene_mesh(out / "mesh.ply", max_faces)
