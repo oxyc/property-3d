@@ -149,7 +149,7 @@ def triangulate(a, west, north, cell):
     return np.stack([x, y, a[rows, cols]], 1), np.stack([(x - xmin) / w, (y - ymin) / h], 1), tris
 
 
-def orthophoto(pts, cols, west, north, w, h, ground=None):
+def orthophoto(pts, cols, west, north, w, h, ground=None, fill=ORTHO_FILL):
     """Top-down image over [west, west+w] x [north-h, north]: the highest coloured point in each pixel.
     With ground=(grid, cell) only points within GROUND_BAND of the terrain count, so bushes and walls
     aren't painted onto it."""
@@ -174,7 +174,7 @@ def orthophoto(pts, cols, west, north, w, h, ground=None):
     img[r, k] = np.round(c[order[first]] * 255)
     empty[r, k] = False
     dist, (ir, ic) = ndimage.distance_transform_edt(empty, return_indices=True)
-    near = empty & (dist * px <= ORTHO_FILL)
+    near = empty & (dist * px <= fill)
     if ground is not None:  # only fill pixels that lie on terrain geometry
         yy, xx = np.mgrid[0:H, 0:W]
         on = ~np.isnan(a[np.clip((yy * px / cell).astype(int), 0, a.shape[0] - 1),
