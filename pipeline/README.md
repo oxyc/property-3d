@@ -56,4 +56,22 @@ uv run python test_export.py                     # synth -> fuse -> export, chec
 
 Paid plans: File > Import > COLLADA for the `.dae` files. SketchUp Free officially imports only `.skp`/`.jpg`/`.png`; try the `.stl` files via Insert as Component (choose metres) and lay `terrain.png` over the terrain. `points.las` is for Scan Essentials (Studio, Windows).
 
+## Site plan
+
+```
+uv run python siteplan.py ../out/<walk> [--interval 0.1]   # siteplan/: siteplan.svg (layers), .pdf (A3, real scale), .png, features.json
+uv run python test_siteplan.py                              # contour heights, trunk positions, a hand-made wall
+```
+
+Contours, tree canopies and wall outlines are estimated from the scan: use the plan for discussion, not as a survey.
+
+## Simplified model (experimental)
+
+```
+uv run python simplify.py ../out/<walk>   # simple/: simple.dae+terrain.png, simple.stl, simple.glb, elements.json
+uv run python test_simplify.py
+```
+
+The decimated terrain is good (e.g. ~40k grid faces -> ~1.5k within a few cm) and light enough for SketchUp. Walls are only recovered as small slabs on real scans, and anything tall and non-planar (including tanks or parts of houses) becomes a crown ellipsoid — check `elements.json` before relying on it.
+
 `georef_points.ply` stores coordinates minus `offset` from `georef.json`; add it back to get EPSG:5382.
