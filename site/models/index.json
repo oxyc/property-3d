@@ -3,6 +3,8 @@
   "name": "garden",
   "title": "Garden walk (8 min, iPhone 15 Pro LiDAR)",
   "points": 1452096,
-  "bytes": 21781621
+  "bytes": 21781621,
+  "mesh": true,
+  "mesh_bytes": 10550089
  }
 ]

@@ -37,7 +37,7 @@
   #compass { width: 56px; height: 56px; padding: 0; border-radius: 50%; background: rgba(20,22,26,.7); border-color: #555; }
   #compass svg { width: 100%; height: 100%; display: block; }
   #side .tb { display: grid; gap: 6px; padding: 6px; }
-  #side .tb button { width: 52px; padding: 8px 0; }
+  #side .tb button { width: 52px; padding: 6px 0; }
 
   #scale { position: absolute; left: 12px; bottom: 14px; color: #eee; font-size: 12px; text-shadow: 0 0 3px #000; pointer-events: none; }
   #scale i { display: block; height: 6px; border: 2px solid #eee; border-top: 0; margin-bottom: 2px; box-sizing: border-box; }
@@ -85,11 +85,11 @@
   <div class="body">
     <div id="status">Loading…</div>
     <div id="models" hidden></div>
+    <div class="row">Display <div class="seg" id="displays"></div></div>
     <div class="row">Colour <div class="seg" id="colors"></div></div>
     <label>Point size <input id="size" type="range" min="0.4" max="4" step="0.1" value="1"></label>
     <label><input id="edl" type="checkbox" checked> Depth shading (eye-dome)</label>
     <label><input id="trackpad" type="checkbox"> Trackpad gestures (off = mouse wheel zooms)</label>
-    <label id="meshRow" hidden><input id="mesh" type="checkbox"> Show mesh</label>
     <label class="btn" style="justify-content:center">Open .ply file…<input id="file" type="file" accept=".ply" hidden></label>
     <p class="hint">Drop a .ply file on the page to view it locally — nothing is uploaded.</p>
   </div>
@@ -102,6 +102,7 @@
   <div class="tb card">
     <button id="bTop" title="Top view, north up (T)">Top</button>
     <button id="bHome" title="Perspective view (P)">3D</button>
+    <button id="bPlan" title="Plan view: orthographic, north up (L)" aria-pressed="false">Plan</button>
     <button id="bFit" title="Fit to model (F)">Fit</button>
     <button id="bMeasure" title="Measure distances (M)" aria-pressed="false">Ruler</button>
     <button id="bClear" title="Clear measurements (Esc)">Clear</button>
@@ -120,7 +121,8 @@
 <div id="toast" hidden></div>
 <div id="drop">Drop .ply to view</div>
 <div id="help" hidden><div class="card"><h3>Mouse &amp; trackpad</h3><dl id="gestures"></dl><h3 style="margin-top:12px">Shortcuts</h3><dl>
-  <dt>T P F</dt><dd>Top (north up) · Perspective · Fit</dd>
+  <dt>T P L F</dt><dd>Top · Perspective · Plan (orthographic) · Fit</dd>
+  <dt>S</dt><dd>Cycle display: points / solid / surface</dd>
   <dt>M</dt><dd>Measure: click two points</dd><dt>Esc</dt><dd>Cancel / clear measurements</dd>
   <dt>Arrows</dt><dd>Orbit (Shift: pan)</dd><dt>+ −</dt><dd>Zoom</dd>
   <dt>C E</dt><dd>Colour mode · depth shading</dd><dt>?</dt><dd>This help</dd>
@@ -144,26 +146,44 @@ renderer.autoClear = false;
 document.body.prepend(renderer.domElement);
 const scene = new THREE.Scene();   // cloud (+ mesh), goes through the EDL pass
 const overlay = new THREE.Scene(); // measurements, drawn on top without depth test
-scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
-const camera = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
+// Surface lighting is gentle so photo colours survive (intensities are x PI: three's Lambert divides by PI).
+scene.add(new THREE.HemisphereLight(0xffffff, 0xaaaaaa, 0.8 * Math.PI));
+const headlight = new THREE.DirectionalLight(0xffffff, 0.3 * Math.PI);
+scene.add(headlight, headlight.target);
+const persp = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
+const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.5, 100);  // plan view
+let camera = persp, plan = false;
 let dirty = true, anim = null;
 const invalidate = () => { dirty = true; };
 // Camera state: the camera sits at target + off and looks at target (Y-up, so it can't roll).
-const nav = { target: new THREE.Vector3(), off: new THREE.Vector3(0, 0, 10), maxDist: 1000 };
+// In plan view off is straight up and nav.planH is the visible height in metres.
+const nav = { target: new THREE.Vector3(), off: new THREE.Vector3(0, 0, 10), maxDist: 1000, planH: 50 };
 
-const material = new THREE.PointsMaterial({ size: 0.03, sizeAttenuation: true, vertexColors: true });
-material.onBeforeCompile = (s) => {  // never thinner than ~1.5 css px, so distant points don't vanish
-  s.vertexShader = s.vertexShader.replace("#include <fog_vertex>",
-    `#include <fog_vertex>\n gl_PointSize = max(gl_PointSize, ${(1.5 * pr).toFixed(1)});`);
+// Round splats ("solid") are the same material with a circular discard and a bigger minimum size.
+const pointsMaterial = (solid) => {
+  const m = new THREE.PointsMaterial({ size: 0.03, sizeAttenuation: true, vertexColors: true });
+  m.customProgramCacheKey = () => (solid ? "solid" : "dots");
+  m.onBeforeCompile = (s) => {  // never thinner than a minimum pixel size, so distant points don't vanish
+    s.vertexShader = s.vertexShader.replace("#include <fog_vertex>",
+      `#include <fog_vertex>\n gl_PointSize = max(gl_PointSize, ${((solid ? 2.5 : 1.5) * pr).toFixed(1)});`);
+    if (solid) s.fragmentShader = s.fragmentShader.replace("#include <clipping_planes_fragment>",
+      "#include <clipping_planes_fragment>\n if (length(gl_PointCoord - .5) > .5) discard;");
+  };
+  return m;
 };
+const dots = pointsMaterial(false), solid = pointsMaterial(true);
 
 // ---- Eye-dome lighting: render to a colour+depth target, darken pixels that sit behind closer neighbours.
 let rt;
 const post = new THREE.ShaderMaterial({
-  uniforms: { tColor: {}, tDepth: {}, texel: { value: new THREE.Vector2() }, near: { value: 0.1 }, far: { value: 100 }, strength: { value: 60 } },
+  uniforms: { tColor: {}, tDepth: {}, texel: { value: new THREE.Vector2() }, near: { value: 0.1 }, far: { value: 100 }, strength: { value: 60 }, ortho: { value: 0 } },
   vertexShader: "varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0., 1.); }",
-  fragmentShader: `uniform sampler2D tColor, tDepth; uniform vec2 texel; uniform float near, far, strength; varying vec2 vUv;
-    float lin(vec2 uv) { float d = texture2D(tDepth, uv).x; return d >= 1. ? -1. : 2. * near * far / (far + near - (d * 2. - 1.) * (far - near)); }
+  fragmentShader: `uniform sampler2D tColor, tDepth; uniform vec2 texel; uniform float near, far, strength, ortho; varying vec2 vUv;
+    float lin(vec2 uv) {
+      float d = texture2D(tDepth, uv).x;
+      if (d >= 1.) return -1.;
+      return ortho > .5 ? near + d * (far - near) : 2. * near * far / (far + near - (d * 2. - 1.) * (far - near));
+    }
     float ob(vec2 o, float lz) { float n = lin(vUv + o * texel); return n < 0. ? 0. : max(0., lz - log2(n)); }
     void main() {
       vec4 c = texture2D(tColor, vUv); float z = lin(vUv);
@@ -180,8 +200,9 @@ const postCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
 
 function resize() {
   renderer.setSize(innerWidth, innerHeight);
-  camera.aspect = innerWidth / innerHeight;
-  camera.updateProjectionMatrix();
+  persp.aspect = innerWidth / innerHeight;
+  persp.updateProjectionMatrix();
+  updateOrtho();
   if (rt) { rt.dispose(); rt.depthTexture.dispose(); }
   const s = renderer.getDrawingBufferSize(new THREE.Vector2());
   rt = new THREE.WebGLRenderTarget(s.x, s.y, { minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter, depthTexture: new THREE.DepthTexture(s.x, s.y) });
@@ -195,7 +216,7 @@ resize();
 
 // ---- Loading
 const loader = new PLYLoader();
-let cloud = null, meshObj = null, token = 0, startView = parseHash();
+let cloud = null, surf = null, display = "solid", token = 0, startView = parseHash();
 const nextTick = () => new Promise((r) => setTimeout(r, 30));
 const MB = (n) => (n / 1e6).toFixed(1);
 
@@ -249,11 +270,21 @@ async function open(label, getBuffer, opts = {}) {
 
 function percentile(sorted, p) { return sorted[Math.floor(p * (sorted.length - 1))]; }
 
-function show(geom, label, { local, mesh }) {
+// A PLY with faces (a dropped mesh) gives a surface, and its vertices serve as the points.
+function show(parsed, label, { local, meshUrl, meshBytes }) {
+  let geom = parsed, meshGeom = null;
+  if (parsed.index) {
+    meshGeom = parsed;
+    geom = new THREE.BufferGeometry().setAttribute("position", parsed.attributes.position);
+    if (parsed.attributes.color) geom.setAttribute("color", parsed.attributes.color);
+  }
   const pos = geom.attributes.position, n = pos.count;
   if (!n) throw new Error("empty");
   if (cloud) { scene.remove(cloud.obj); cloud.geom.dispose(); }
-  if (meshObj) { scene.remove(meshObj); meshObj.geometry.dispose(); meshObj = null; $("mesh").checked = false; }
+  if (surf) { scene.remove(surf.obj); surf.geom.dispose(); surf = null; }
+  plan = false;
+  camera = persp;
+  $("bPlan").setAttribute("aria-pressed", false);
   clearMeasures();
   if (!geom.attributes.color) geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(n * 3).fill(0.7), 3));
   geom.computeBoundingBox();
@@ -267,28 +298,92 @@ function show(geom, label, { local, mesh }) {
   for (let i = 0; i < n; i += step)
     seen.add(((Math.floor(a[3 * i] / cell) + 4096) * 8192 + Math.floor(a[3 * i + 2] / cell) + 4096) * 8192 + Math.floor(a[3 * i + 1] / cell) + 4096);
   const spacing = Math.min(0.08, Math.max(0.004, Math.sqrt(1.5 * seen.size * cell * cell / n)));
-  cloud = { geom, obj: new THREE.Points(geom, material), size, center, local, attrs: { rgb: geom.attributes.color },
-    ground: percentile(ys, 0.01), top: percentile(ys, 0.995), baseSize: 1.8 * spacing };
+  cloud = { geom, obj: new THREE.Points(geom, solid), size, center, local, attrs: { rgb: geom.attributes.color },
+    ground: percentile(ys, 0.01), top: percentile(ys, 0.995), spacing, meshUrl, meshBytes };
   scene.add(cloud.obj);
+  if (meshGeom) surf = makeSurface(meshGeom);
   setColorMode(colorMode);
-  material.size = cloud.baseSize * +$("size").value;
-  $("meshRow").hidden = !mesh;
+  const hasSurface = !!(surf || meshUrl), sv = !local && startView;
+  $("displays").lastChild.hidden = !hasSurface;
   $("status").textContent = `${label} · ${(n / 1e6).toFixed(2)}M points · ${size.x.toFixed(1)} × ${size.z.toFixed(1)} m · ${size.y.toFixed(1)} m tall`;
 
   const r = 0.5 * size.length();
-  camera.near = Math.max(0.02, r / 1000);
-  camera.far = r * 40;
-  camera.updateProjectionMatrix();
-  post.uniforms.near.value = camera.near;
-  post.uniforms.far.value = camera.far;
+  persp.near = Math.max(0.02, r / 1000);
+  persp.far = r * 40;
+  persp.updateProjectionMatrix();
   nav.maxDist = r * 10;
-  if (startView && !local) {
-    nav.target.fromArray(startView, 3);
-    nav.off.fromArray(startView, 0).sub(nav.target);
+  if (sv && sv.cam) {
+    nav.target.fromArray(sv.cam, 3);
+    nav.off.fromArray(sv.cam, 0).sub(nav.target);
     applyNav();
+    if (sv.z) { setPlan(true); nav.target.fromArray(sv.cam, 3); nav.planH = sv.z; applyNav(); }
   } else flyTo(center, homeView(), 0);
+  const want = surf && !sv ? "surface" : sv && sv.d;
+  display = null;
+  setDisplay(want in DISPLAYS && (want !== "surface" || hasSurface) ? want : "solid");
   startView = null;
   invalidate();
+}
+
+// ---- Display modes: dots, solid round splats, or the (lazily loaded) coloured mesh
+const DISPLAYS = { points: "Points", solid: "Solid", surface: "Surface" };
+function makeSurface(geom) {
+  geom.computeVertexNormals();
+  if (!geom.attributes.color) geom.setAttribute("color", new THREE.BufferAttribute(new Float32Array(geom.attributes.position.count * 3).fill(0.7), 3));
+  const obj = new THREE.Mesh(geom, new THREE.MeshLambertMaterial({ vertexColors: true, side: THREE.DoubleSide }));
+  obj.visible = false;
+  scene.add(obj);
+  return { geom, obj, attrs: { rgb: geom.attributes.color } };
+}
+async function loadSurface() {
+  const c = cloud;
+  try {
+    c.surfLoad ||= fetchBuffer(c.meshUrl, c.meshBytes, (got, total) => setLoader("Loading surface", got, total));
+    const buf = await c.surfLoad;
+    if (c !== cloud) return false;
+    setLoader("Preparing surface");
+    await nextTick();
+    if (c !== cloud) return false;
+    surf ||= makeSurface(loader.parse(buf));
+    setColorMode(colorMode);
+    $("loader").hidden = true;
+    return true;
+  } catch (err) {
+    console.error(err);
+    c.surfLoad = null;
+    $("loader").hidden = true;
+    toast("Could not load the surface mesh");
+    return false;
+  }
+}
+async function setDisplay(d) {
+  if (!cloud || d === display) return;
+  if (d === "surface" && !surf && !(cloud.meshUrl && await loadSurface())) return;
+  display = d;
+  document.querySelectorAll("#displays button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === d));
+  cloud.obj.visible = d !== "surface";
+  cloud.obj.material = d === "points" ? dots : solid;
+  if (surf) surf.obj.visible = d === "surface";
+  scheduleHash();
+  invalidate();
+}
+for (const [m, text] of Object.entries(DISPLAYS)) {
+  const b = Object.assign(document.createElement("button"), { textContent: text });
+  b.dataset.m = m;
+  b.onclick = () => setDisplay(m);
+  $("displays").append(b);
+}
+const cycleDisplay = () => {
+  const k = Object.keys(DISPLAYS).filter((m) => m !== "surface" || surf || cloud?.meshUrl);
+  setDisplay(k[(k.indexOf(display) + 1) % k.length]);
+};
+// Point sizes are world-space diameters (about the point spacing): x1.73 for a perspective camera's `size`,
+// css px per metre for the orthographic plan view.
+function updatePointSize() {
+  if (!cloud) return;
+  const k = +$("size").value * cloud.spacing * (plan ? innerHeight / nav.planH : 1.73);
+  dots.size = 1.04 * k;
+  solid.size = 1.6 * k;
 }
 
 // ---- Colour modes
@@ -300,20 +395,22 @@ for (let i = 0; i < 256; i++) {
   const t = i / 255 * (RAMP.length - 1), j = Math.min(Math.floor(t), RAMP.length - 2);
   for (let k = 0; k < 3; k++) LUT[3 * i + k] = RAMP[j][k] + (RAMP[j + 1][k] - RAMP[j][k]) * (t - j);
 }
-function setColorMode(m) {
+function setColorMode(m) {  // applies to the points and, once loaded, the surface
   colorMode = m;
   document.querySelectorAll("#colors button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === m));
-  if (!cloud) return;
-  if (!cloud.attrs[m]) {
-    const p = cloud.geom.attributes.position.array, n = p.length / 3, c = new Float32Array(n * 3);
-    if (m === "grey") c.fill(0.75);
-    else for (let i = 0; i < n; i++) {
-      const t = Math.min(1, Math.max(0, (p[3 * i + 1] - cloud.ground) / (cloud.top - cloud.ground || 1)));
-      c.set(LUT.subarray(3 * Math.round(t * 255), 3 * Math.round(t * 255) + 3), 3 * i);
+  for (const item of cloud ? [cloud, surf] : []) {
+    if (!item) continue;
+    if (!item.attrs[m]) {
+      const p = item.geom.attributes.position.array, n = p.length / 3, c = new Float32Array(n * 3);
+      if (m === "grey") c.fill(0.75);
+      else for (let i = 0; i < n; i++) {
+        const t = Math.min(1, Math.max(0, (p[3 * i + 1] - cloud.ground) / (cloud.top - cloud.ground || 1)));
+        c.set(LUT.subarray(3 * Math.round(t * 255), 3 * Math.round(t * 255) + 3), 3 * i);
+      }
+      item.attrs[m] = new THREE.BufferAttribute(c, 3);
     }
-    cloud.attrs[m] = new THREE.BufferAttribute(c, 3);
+    item.geom.setAttribute("color", item.attrs[m]);
   }
-  cloud.geom.setAttribute("color", cloud.attrs[m]);
   invalidate();
 }
 for (const [m, text] of Object.entries(MODES)) {
@@ -323,12 +420,12 @@ for (const [m, text] of Object.entries(MODES)) {
   $("colors").append(b);
 }
 const cycleColor = () => { const k = Object.keys(MODES); setColorMode(k[(k.indexOf(colorMode) + 1) % k.length]); };
-$("size").oninput = (e) => { if (cloud) { material.size = cloud.baseSize * +e.target.value; invalidate(); } };
+$("size").oninput = invalidate;
 $("edl").onchange = invalidate;
 
 // ---- Camera: views, smooth transitions, share link
 function fitRadius(top) {
-  const t = Math.tan(camera.fov * Math.PI / 360), a = camera.aspect, s = cloud.size;
+  const t = Math.tan(persp.fov * Math.PI / 360), a = persp.aspect, s = cloud.size;
   if (top) return 1.05 * Math.max(s.z / 2 / t, s.x / 2 / (t * a)) + s.y / 2;
   return 0.45 * s.length() / Math.sin(Math.atan(t * Math.min(1, a)));
 }
@@ -348,35 +445,74 @@ function stepAnim() {
   applyNav();
   if (k === 1) anim = null;
 }
-const viewTop = () => cloud && flyTo(cloud.center, new THREE.Spherical(fitRadius(true), 0.0005, 0));
-const viewHome = () => cloud && flyTo(cloud.center, homeView());
+const viewTop = () => { if (cloud) { setPlan(false); flyTo(cloud.center, new THREE.Spherical(fitRadius(true), 0.0005, 0)); } };
+const viewHome = () => { if (cloud) { setPlan(false); flyTo(cloud.center, homeView()); } };
 const viewFit = () => {
   if (!cloud) return;
+  if (plan) return fitPlan();
   const s = currentSpherical();
   flyTo(cloud.center, new THREE.Spherical(fitRadius(s.phi < 0.2), s.phi, s.theta));
 };
-$("compass").onclick = () => { const s = currentSpherical(); flyTo(nav.target.clone(), new THREE.Spherical(s.radius, s.phi, 0)); };
+$("compass").onclick = () => { if (!plan) { const s = currentSpherical(); flyTo(nav.target.clone(), new THREE.Spherical(s.radius, s.phi, 0)); } };
+
+// Plan view: orthographic, straight down, north up. Leaving it (3D, Top, any orbit) goes back to a perspective top view.
+function updateOrtho() {
+  const h = nav.planH / 2, w = h * innerWidth / innerHeight;
+  Object.assign(ortho, { left: -w, right: w, top: h, bottom: -h });
+  ortho.updateProjectionMatrix();
+}
+function fitPlan() {
+  nav.target.copy(cloud.center);
+  nav.planH = 1.05 * Math.max(cloud.size.z, cloud.size.x * innerHeight / innerWidth);
+  applyNav();
+}
+function setPlan(on) {
+  if (!cloud || on === plan) return;
+  plan = on;
+  camera = on ? ortho : persp;
+  if (on) {
+    ortho.up.set(0, 0, -1);
+    nav.off.set(0, cloud.size.length(), 0);
+    ortho.near = 0.1;
+    ortho.far = 3 * nav.off.y;
+    fitPlan();
+  } else {
+    const r = nav.planH / (2 * Math.tan(persp.fov * Math.PI / 360));
+    nav.off.set(0, r, r * 0.0005);
+    applyNav();
+  }
+  $("bPlan").setAttribute("aria-pressed", on);
+  anim = null;
+}
 
 function parseHash() {
-  const m = /cam=([-\d.,e]+)/.exec(location.hash), v = m && m[1].split(",").map(Number);
-  return v && v.length === 6 && v.every(Number.isFinite) ? v : null;
+  const q = new URLSearchParams(location.hash.slice(1)), v = (q.get("cam") || "").split(",").map(Number);
+  return { cam: v.length === 6 && v.every(Number.isFinite) ? v : null, d: q.get("d"), z: +q.get("z") || 0 };
 }
 let hashTimer;
+function scheduleHash() {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    if (!cloud) return;
+    if (cloud.local) return history.replaceState(null, "", location.pathname + location.search);  // a local file can't be linked
+    const c = camera.position, t = nav.target;
+    const q = [`cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`, `d=${display}`];
+    if (plan) q.push(`z=${+nav.planH.toFixed(2)}`);
+    history.replaceState(null, "", `${location.pathname}${location.search}#${q.join("&")}`);
+  }, 400);
+}
 function applyNav() {
+  if (plan) updateOrtho();
   camera.position.copy(nav.target).add(nav.off);
   camera.lookAt(nav.target);
   invalidate();
-  clearTimeout(hashTimer);
-  hashTimer = setTimeout(() => {
-    if (!cloud || cloud.local) return;
-    const c = camera.position, t = nav.target;
-    history.replaceState(null, "", `${location.pathname}${location.search}#cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`);
-  }, 400);
+  scheduleHash();
 }
 
 // ---- Navigation primitives (SketchUp-style: orbit about a pivot, zoom toward a point, pan in screen plane)
 const UP = new THREE.Vector3(0, 1, 0), clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 function orbit(dTheta, dPhi, pivot = nav.target) {  // rotate camera+target about pivot; pitch is clamped at the poles
+  setPlan(false);
   pivot = pivot.clone();
   const phi = Math.acos(clamp(nav.off.y / nav.off.length(), -1, 1)), theta = Math.atan2(nav.off.x, nav.off.z);
   dPhi = clamp(phi + dPhi, 0.0005, Math.PI - 0.05) - phi;
@@ -388,13 +524,21 @@ function orbit(dTheta, dPhi, pivot = nav.target) {  // rotate camera+target abou
   applyNav();
 }
 function pan(dx, dy) {  // dx, dy: how far the scene is dragged, in screen px
-  const s = 2 * nav.off.length() * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
+  const s = plan ? nav.planH / innerHeight : 2 * nav.off.length() * Math.tan(persp.fov * Math.PI / 360) / innerHeight;
   nav.target.addScaledVector(new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion), -dx * s)
     .addScaledVector(new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion), dy * s);
   applyNav();
 }
 function zoomAt(f, P) {  // dolly along the ray to P; never closer than 15 cm to it
   if (!cloud) return;
+  if (plan) {  // orthographic: scale the view height, keeping P under the cursor
+    const h = clamp(nav.planH * f, 0.5, nav.maxDist);
+    f = h / nav.planH;
+    nav.planH = h;
+    nav.target.x = P.x + (nav.target.x - P.x) * f;
+    nav.target.z = P.z + (nav.target.z - P.z) * f;
+    return applyNav();
+  }
   const cam = nav.target.clone().add(nav.off), fwd = nav.off.clone().normalize().negate();
   if (f < 1) f = Math.max(f, Math.min(1, 0.15 / cam.distanceTo(P)));
   const cam2 = P.clone().add(cam.sub(P).multiplyScalar(f));
@@ -442,13 +586,15 @@ const markMat = new THREE.PointsMaterial({ color: 0xffd23f, size: 9, sizeAttenua
 function pick(x, y, radiusPx = 7) {
   const r = renderer.domElement.getBoundingClientRect(), ray = new THREE.Raycaster();
   ray.setFromCamera(new THREE.Vector2((x - r.left) / r.width * 2 - 1, -((y - r.top) / r.height * 2 - 1)), camera);
-  const o = ray.ray.origin, d = ray.ray.direction, p = cloud.geom.attributes.position.array;
-  const tanPx = radiusPx * 2 * Math.tan(camera.fov * Math.PI / 360) / r.height;
+  // In Surface mode this snaps to the nearest mesh vertex (a few cm apart) rather than ray-casting 500k triangles.
+  const o = ray.ray.origin, d = ray.ray.direction, p = (display === "surface" && surf ? surf : cloud).geom.attributes.position.array;
+  const tanPx = radiusPx * 2 * Math.tan(persp.fov * Math.PI / 360) / r.height, widthM = radiusPx * nav.planH / r.height;
   let best = -1, bestT = Infinity;
   for (let i = 0; i < p.length; i += 3) {
     const x = p[i] - o.x, y = p[i + 1] - o.y, z = p[i + 2] - o.z, t = x * d.x + y * d.y + z * d.z;
     if (t < camera.near || t >= bestT) continue;
-    if (x * x + y * y + z * z - t * t < t * t * tanPx * tanPx) { best = i; bestT = t; }
+    const lim = plan ? widthM : t * tanPx;  // cone radius: grows with distance in perspective, constant in plan
+    if (x * x + y * y + z * z - t * t < lim * lim) { best = i; bestT = t; }
   }
   return best < 0 ? null : new THREE.Vector3(p[best], p[best + 1], p[best + 2]);
 }
@@ -512,6 +658,12 @@ el.addEventListener("pointerup", (e) => {
 const tmp = new THREE.Vector3();
 let scaleText = "";
 function render() {
+  updatePointSize();
+  headlight.position.copy(camera.position);
+  headlight.target.position.copy(nav.target);
+  post.uniforms.near.value = camera.near;
+  post.uniforms.far.value = camera.far;
+  post.uniforms.ortho.value = +plan;
   if ($("edl").checked) {
     renderer.setRenderTarget(rt);
     renderer.clear();
@@ -532,7 +684,7 @@ function render() {
     l.el.style.transform = `translate(${(tmp.x * .5 + .5) * innerWidth}px, ${(.5 - tmp.y * .5) * innerHeight}px) translate(-50%, -50%)`;
   }
   $("needle").setAttribute("transform", `rotate(${Math.atan2(nav.off.x, nav.off.z) * 180 / Math.PI})`);
-  const mpp = 2 * nav.off.length() * Math.tan(camera.fov * Math.PI / 360) / innerHeight;
+  const mpp = plan ? nav.planH / innerHeight : 2 * nav.off.length() * Math.tan(persp.fov * Math.PI / 360) / innerHeight;
   const raw = mpp * 100, p10 = 10 ** Math.floor(Math.log10(raw)), nice = (raw / p10 >= 5 ? 5 : raw / p10 >= 2 ? 2 : 1) * p10;
   const text = nice >= 1 ? `${nice} m` : `${Math.round(nice * 100)} cm`;
   $("scale").firstElementChild.style.width = `${nice / mpp}px`;
@@ -559,6 +711,8 @@ $("toggle").onclick = () => {
 if (matchMedia("(max-width: 600px)").matches) $("toggle").click();
 $("bTop").onclick = viewTop;
 $("bHome").onclick = viewHome;
+const viewPlan = () => { if (!plan) setPlan(true); else fitPlan(); };
+$("bPlan").onclick = viewPlan;
 $("bFit").onclick = viewFit;
 $("bMeasure").onclick = () => setMeasuring(!measuring);
 $("bClear").onclick = onEscape;
@@ -684,23 +838,9 @@ addEventListener("keydown", (e) => {
   }
   const zoomKey = { "+": 0.85, "=": 0.85, "-": 1.18, _: 1.18 }[e.key];
   if (zoomKey) return zoomAt(zoomKey, nav.target);
-  ({ t: viewTop, p: viewHome, f: viewFit, m: () => setMeasuring(!measuring), c: cycleColor, e: () => $("edl").click(),
+  ({ t: viewTop, p: viewHome, l: viewPlan, s: cycleDisplay, f: viewFit, m: () => setMeasuring(!measuring), c: cycleColor, e: () => $("edl").click(),
      "?": $("bHelp").onclick, escape: onEscape }[e.key.toLowerCase()])?.();
 });
-
-$("mesh").onchange = async (e) => {
-  if (e.target.checked && !meshObj) {
-    try {
-      toast("Loading mesh…");
-      const geom = loader.parse(await fetchBuffer("mesh.ply"));
-      geom.computeVertexNormals();
-      meshObj = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({ color: 0xbbbbbb, side: THREE.DoubleSide }));
-      scene.add(meshObj);
-    } catch { e.target.checked = false; toast("Could not load mesh.ply"); }
-  }
-  if (meshObj) meshObj.visible = e.target.checked;
-  invalidate();
-};
 
 const openFile = (file) => file && open(file.name, async () => file.arrayBuffer(), { local: true });
 $("file").onchange = (e) => openFile(e.target.files[0]);
@@ -714,15 +854,19 @@ addEventListener("drop", (e) => {
 
 async function start() {
   const index = await fetch("models/index.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
-  if (!Array.isArray(index) || !index.length) return open("points.ply", (p) => fetchBuffer("points.ply", 0, p), { mesh: true });
+  if (!Array.isArray(index) || !index.length) {  // pipeline folder: points.ply, plus mesh.ply if present
+    const hasMesh = await fetch("mesh.ply", { method: "HEAD" }).then((r) => r.ok).catch(() => false);
+    return open("points.ply", (p) => fetchBuffer("points.ply", 0, p), { meshUrl: hasMesh ? "mesh.ply" : null });
+  }
   const box = $("models"), want = new URLSearchParams(location.search).get("model");
   const select = (m) => {
     for (const b of box.children) b.setAttribute("aria-pressed", b.dataset.name === m.name);
-    open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p));
+    open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p),
+      m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {});
   };
   for (const m of index) {
     const b = Object.assign(document.createElement("button"), {
-      innerHTML: `<span></span><small>${m.points ? `${(m.points / 1e6).toFixed(1)}M points · ` : ""}${MB(m.bytes)} MB</small>` });
+      innerHTML: `<span></span><small>${m.points ? `${(m.points / 1e6).toFixed(1)}M points · ` : ""}${MB(m.bytes)} MB${m.mesh ? " · surface" : ""}</small>` });
     b.firstChild.textContent = m.title;
     b.dataset.name = m.name;
     b.onclick = () => { startView = null; history.replaceState(null, "", `?model=${m.name}`); select(m); };
