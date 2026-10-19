@@ -1,6 +1,6 @@
 """Export a fused walk for SketchUp: textured terrain, decimated scene mesh and a point cloud.
 
-usage: export_sketchup.py <out_dir> [--terrain-cell 0.1] [--max-faces 150000]
+usage: export_sketchup.py <out_dir> [--terrain-cell 0.02..0.5] [--max-faces 150000]
 
 Decimating the scanned scene much below ~150k faces breaks it up (holes, blobs), so keep the
 default; SketchUp Free imports only the .stl files (choose metres), paid plans the .dae too.
@@ -321,7 +321,17 @@ def write_stl(path, verts, tris):
     o3d.io.write_triangle_mesh(str(path), mesh)
 
 
-def export(out, terrain_cell=0.1, max_faces=150_000):
+def ground_from_points(pts, cell):
+    """Lowest point per cell from SketchUp-frame points, in ground.npz layout (for cells finer than fuse's 10 cm)."""
+    west, north = np.floor(pts[:, 0].min() / cell) * cell, np.ceil(pts[:, 1].max() / cell) * cell
+    col, row = ((pts[:, 0] - west) / cell).astype(int), ((north - pts[:, 1]) / cell).astype(int)
+    h = np.full((row.max() + 1, col.max() + 1), np.inf)
+    np.minimum.at(h, (row, col), pts[:, 2])
+    return {"height": np.where(np.isinf(h), np.nan, h), "cell": cell, "west": west, "north": north}
+
+
+def export(out, terrain_cell=None, max_faces=150_000):
+    """terrain_cell None = 0.1 m, coarsened to fit TERRAIN_MAX_FACES; an explicit cell is used as is."""
     out = Path(out)
     dst = out / "sketchup"
     dst.mkdir(exist_ok=True)
@@ -330,7 +340,14 @@ def export(out, terrain_cell=0.1, max_faces=150_000):
     pcd = o3d.io.read_point_cloud(str(out / "points.ply"))
     pts, cols = to_su(np.asarray(pcd.points)), np.asarray(pcd.colors)
     g = np.load(out / "ground.npz")
-    a, west, north, cell = terrain_grid(g, terrain_cell)
+    if terrain_cell is None:
+        a, west, north, cell = terrain_grid(g, 0.1)
+    else:
+        if terrain_cell < float(g["cell"]):  # ground.npz is too coarse; rebuild from the points
+            g = ground_from_points(pts, terrain_cell)
+        a, west, north, cell = terrain_grid(g, terrain_cell, max_faces=float("inf"))
+        if len(a[~np.isnan(a)]) * 2 > 300_000:
+            print(f"terrain: warning, ~{len(a[~np.isnan(a)]) * 2:,} faces is heavy for SketchUp")
     verts, uvs, tris = triangulate(a, west, north, cell)
     Image.fromarray(orthophoto(pts, cols, west, north, a.shape[1] * cell, a.shape[0] * cell, (a, cell))).save(dst / "terrain.png")
     write_dae(dst / "terrain.dae", "terrain", verts, tris, uvs, "terrain.png")
@@ -352,7 +369,8 @@ def export(out, terrain_cell=0.1, max_faces=150_000):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
-    ap.add_argument("--terrain-cell", type=float, default=0.1)
+    ap.add_argument("--terrain-cell", type=float, default=None,
+                    help="terrain grid in m (default 0.1, coarsened to fit; an explicit value is kept, e.g. 0.02)")
     ap.add_argument("--max-faces", type=int, default=150_000)
     a = ap.parse_args()
     export(a.out_dir, a.terrain_cell, a.max_faces)
