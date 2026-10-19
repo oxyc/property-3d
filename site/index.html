@@ -74,9 +74,20 @@
   body.measuring #scale { bottom: 72px; }
   body.measuring #toast { bottom: 80px; }
   #vcb { position: absolute; right: 12px; bottom: 72px; background: rgba(20,22,26,.9); color: #ffd23f; padding: 6px 12px; border-radius: 6px; font: 600 15px ui-monospace, monospace; border: 1px solid #555; pointer-events: none; }
-  #mbar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; gap: 6px; padding: 6px; max-width: calc(100vw - 20px); }
+  #mbar { position: absolute; left: 50%; bottom: 12px; transform: translateX(-50%); display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; padding: 6px; max-width: calc(100vw - 20px); }
   #mbar button, #mbar select { min-height: 44px; padding: 0 12px; }
+  #mbar .seg { flex: none; }
   #mbar select { font: inherit; }
+  body.measuring #scale { bottom: 130px; }
+  @media (min-width: 700px) { body.measuring #scale { bottom: 72px; } }
+  .lbl[data-id] { pointer-events: auto; cursor: pointer; }
+  .lbl.sel { outline: 2px solid #ff8a00; background: rgba(90,45,0,.92); }
+  .lbl .x { pointer-events: auto; margin-left: 6px; border: 0; background: rgba(255,255,255,.18); color: #fff; border-radius: 50%; width: 20px; height: 20px; padding: 0; line-height: 1; cursor: pointer; }
+  #mItems { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+  #mItems li { display: flex; gap: 4px; }
+  #mItems li button:first-child { flex: 1; text-align: left; }
+  #mItems li.sel button:first-child { border-color: #ff8a00; }
+  #mItems .del { width: 36px; }
 
   #loader, #toast { position: absolute; left: 50%; transform: translateX(-50%); background: rgba(20,22,26,.9); color: #eee; border-radius: 10px; padding: 10px 14px; }
   #loader { top: 45%; width: min(340px, calc(100vw - 40px)); text-align: center; }
@@ -128,9 +139,8 @@
       <div class="row">Background <div class="seg" id="bgs"></div></div>
       <label><input id="grid" type="checkbox"> Ground grid</label>
       <label><input id="shadows" type="checkbox"> Sun shadows (surface)</label>
-      <p class="hint" id="sunHint" hidden><b>Sun</b> — it only lights the Surface display. <button id="toSurface" type="button">Switch to Surface</button></p>
       <fieldset id="sunBox">
-        <legend>Sun</legend>
+        <legend>Sun <small id="sunHint" hidden>(shown in Surface)</small></legend>
         <div class="row"><div class="seg" id="sunModes"></div></div>
         <div id="solar">
           <label>Date <input id="sunDate" type="date"></label>
@@ -144,6 +154,10 @@
           <label>Elevation <input id="sunEl" type="range" min="5" max="90" aria-label="Sun elevation"><output id="sunElOut"></output></label>
         </div>
       </fieldset>
+    </div></details>
+    <details id="mlist" hidden open><summary>Measurements</summary><div>
+      <ul id="mItems"></ul>
+      <button id="mClearAll" type="button">Clear all</button>
     </div></details>
     <details id="export" hidden><summary>Export</summary><div>
       <div class="exg"><b>Content</b><div class="seg" id="exContent"></div></div>
@@ -203,10 +217,11 @@
 <canvas id="loupe" width="120" height="120" hidden></canvas>
 <div id="vcb" hidden></div>
 <div id="mbar" class="card" hidden>
+  <div class="seg" id="mModes" role="group" aria-label="Measuring mode"></div>
   <button id="mUndo" type="button" aria-label="Undo last point">↶ Undo</button>
-  <button id="mDone" type="button" aria-label="Finish this measurement">Done</button>
-  <button id="mClose" type="button" aria-label="Close the shape and measure its area">Close</button>
+  <button id="mDone" type="button" aria-label="Finish this measurement (closes an area)">Done</button>
   <button id="mCopy" type="button" aria-label="Copy measurements">Copy</button>
+  <button id="mClear" type="button" aria-label="Remove all measurements">Clear all</button>
   <select id="mUnit" aria-label="Units"></select>
 </div>
 <div id="loader" hidden><div></div><div class="bar"><i></i></div></div>
@@ -683,11 +698,8 @@ function refreshSun() {
 }
 let sunTzNote = "your browser's time zone";
 function syncSunUI() {  // the sun only lights the Surface display
-  const on = display === "surface";
-  $("sunBox").disabled = !on;
-  $("shadows").disabled = !on;
-  $("sunHint").hidden = on;
-  $("toSurface").hidden = !(surf || cloud?.meshUrl);
+  $("sunHint").hidden = display === "surface";  // the sun controls work in any display; only Surface shows their effect
+  $("shadows").checked = look.shadows && display === "surface";  // "shadows visible": ticking it from another display switches to Surface
   document.querySelectorAll("#sunModes button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === look.mode));
   $("solar").hidden = look.mode !== "solar";
   $("manual").hidden = look.mode !== "manual";
@@ -698,7 +710,6 @@ function applyLook() {
   gridMat.uniforms.col.value.set(look.bg === "light" ? 0x222222 : 0xffffff);
   grid.visible = look.grid;
   $("grid").checked = look.grid;
-  $("shadows").checked = look.shadows;
   $("sunAz").value = look.az;
   $("sunEl").value = look.el;
   syncSunUI();
@@ -733,7 +744,6 @@ for (const id of ["lat", "lon", "sunDate", "utc"]) $(id).oninput = () => { if (i
 $("sunTime").oninput = refreshSun;
 $("sunAz").oninput = (e) => { look.az = +e.target.value; applyLook(); };
 $("sunEl").oninput = (e) => { look.el = +e.target.value; applyLook(); };
-$("toSurface").onclick = () => setDisplay("surface");
 let sunTimer = null;
 $("sunPlay").onclick = () => {  // animate the day: 10 minutes every 120 ms
   if (sunTimer) { clearInterval(sunTimer); sunTimer = null; $("sunPlay").textContent = "▶"; return; }
@@ -758,7 +768,14 @@ for (const [m, text] of Object.entries(BGS)) {
   $("bgs").append(b);
 }
 $("grid").onchange = (e) => { look.grid = e.target.checked; applyLook(); };
-$("shadows").onchange = (e) => { look.shadows = e.target.checked; applyLook(); };
+$("shadows").onchange = (e) => {  // ticking it switches to Surface (loading the mesh if needed); unticking only turns shadows off
+  look.shadows = e.target.checked;
+  applyLook();
+  if (look.shadows && display !== "surface") {
+    if (surf || cloud?.meshUrl) setDisplay("surface");
+    else toast("This model has no surface mesh, so there is nothing to cast shadows");
+  }
+};
 applyLook();
 
 // ---- Colour modes
@@ -974,8 +991,10 @@ function showPivot(p) {
 
 // ---- Measuring, SketchUp tape-measure style: snaps to endpoints, midpoints and the surface, infers the red / green /
 // blue axes, shows a live rubber band, takes a typed length, chains points into polylines and closes areas.
-const chains = [], labels = [], live = [];  // chains: {pts: [Vector3], closed, done}; live: labels that follow the cursor
-let measuring = false, hover = null, vcb = "", lockDir = null;
+// Modes: distance (2 points), path (any number, running total), area (a closed polygon: plan + surface area).
+const chains = [], labels = [], live = [];  // chains: {id, mode, pts: [Vector3], closed, done, surface}; live: labels that follow the cursor
+const MEASURE_MODES = { distance: "Distance", path: "Path", area: "Area" };
+let measuring = false, hover = null, vcb = "", lockDir = null, mode = "distance", selected = null, nextId = 1;
 let unit = "m";
 try { unit = localStorage.getItem("unit") || "m"; } catch {}
 const UNITS = { m: "m / cm", mm: "mm", ft: "ft / in" };
@@ -1022,7 +1041,7 @@ const toScreen = (p) => { tmp.copy(p).project(camera); return tmp.z < 1 ? [(tmp.
 // What the cursor is on, best first: an existing endpoint, a midpoint, then the surface / cloud point. When a first
 // point exists, a direction within ~3 degrees of an axis snaps onto that axis. Shift locks the current direction.
 function snapAt(x, y, shift) {
-  const P0 = lastPoint(), touch = lastPointerType === "touch", tolEnd = touch ? 22 : 13, tolMid = touch ? 18 : 11;
+  const P0 = lastPoint(), touch = lastPointerType === "touch", tolEnd = touch ? 28 : 14, tolMid = touch ? 24 : 12;
   let best = null;
   const consider = (p, kind, tol) => {
     const s = toScreen(p), d = s && Math.hypot(s[0] - x, s[1] - y);
@@ -1097,27 +1116,49 @@ function parseLength(s) {  // "1.5", "150" (in the current unit) or 5'3"
 }
 function addPoint(p) {
   let c = openChain();
-  if (!c) { c = { pts: [], closed: false, done: false }; chains.push(c); }
+  if (!c) { c = { id: nextId++, mode, pts: [], closed: false, done: false, surface: null }; chains.push(c); }
   const last = c.pts[c.pts.length - 1];
   if (last && last.distanceTo(p) < 0.002) return;  // the second click of a double-click
+  if (c.mode === "area" && c.pts.length >= 3 && p.distanceTo(c.pts[0]) < 0.002) return finishChain();  // clicked the first point: close
   c.pts.push(p.clone());
   vcb = ""; lockDir = null;
+  if (c.mode === "distance" && c.pts.length === 2) return finishChain();
   rebuild();
 }
-function finishChain(close) {
+function finishChain() {  // Done / Enter / double-click: a path ends, an area closes; too few points are dropped
   const c = openChain();
   if (!c) return;
-  if (c.pts.length < 2) chains.pop();
-  else { c.closed = close && c.pts.length >= 3; c.done = true; }
+  if (c.pts.length < (c.mode === "area" ? 3 : 2)) chains.splice(chains.indexOf(c), 1);
+  else {
+    c.done = true;
+    c.closed = c.mode === "area";
+    if (c.closed) computeSurface(c);
+  }
   hover = null; vcb = ""; lockDir = null;
   rebuild();
   updateRubber();
 }
+function discardOpen() {  // Esc: cancel only the measurement being drawn
+  const c = openChain();
+  if (c) chains.splice(chains.indexOf(c), 1);
+  hover = null; vcb = ""; lockDir = null;
+  rebuild();
+  updateRubber();
+}
+function removeMeasurement(id) {
+  const i = chains.findIndex((c) => c.id === id);
+  if (i >= 0) chains.splice(i, 1);
+  if (selected === id) selected = null;
+  rebuild();
+  updateRubber();
+}
+function selectMeasurement(id) { selected = selected === id ? null : id; rebuild(); }
 function undo() {
   const c = chains[chains.length - 1];
   if (!c) return;
   if (c.closed) c.closed = false; else c.pts.pop();
   c.done = false;
+  c.surface = null;
   if (!c.pts.length) chains.pop();
   rebuild();
   updateRubber();
@@ -1127,74 +1168,144 @@ const areaOf = (pts) => {  // horizontal (plan) area by the shoelace formula, m�
   for (let i = 0; i < pts.length; i++) { const a = pts[i], b = pts[(i + 1) % pts.length]; s += a.x * b.z - b.x * a.z; }
   return Math.abs(s) / 2;
 };
+const pathLength = (pts, closed = false) => pts.reduce((s, p, i) => s + (i || closed ? p.distanceTo(pts[(i + pts.length - 1) % pts.length]) : 0), 0);
+const fillMat = new THREE.MeshBasicMaterial({ color: 0x3fd87a, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthTest: false, depthWrite: false });
+const selMat = new THREE.LineBasicMaterial({ color: 0xff8a00, depthTest: false });
+const describe = (c) => (c.mode === "area"
+  ? `Area ${fmtArea(areaOf(c.pts))}${c.surface?.surface ? ` · surface ${fmtArea(c.surface.surface)}` : ""}`
+  : `${MEASURE_MODES[c.mode]} ${fmt(pathLength(c.pts))}${c.mode === "path" ? ` · ${c.pts.length} points` : ""}`) + (c.done ? "" : " …");
+function areaLabel(c) {  // plan area, true ground surface area inside the polygon, perimeter
+  let s = `<b>${fmtArea(areaOf(c.pts))}</b> plan`;
+  if (c.done) {
+    if (c.surface === "pending") s += "<br>ground surface …";
+    else if (c.surface?.surface) s += `<br><b>${fmtArea(c.surface.surface)}</b> ground surface${c.surface.coverage < 0.95 ? ` (${Math.round(c.surface.coverage * 100)}% of the area has terrain)` : ""}`;
+  }
+  return `${s}<br>perimeter ${fmt(pathLength(c.pts, c.pts.length > 2))}`;
+}
+function updateList() {
+  const ul = $("mItems");
+  ul.textContent = "";
+  $("mlist").hidden = !chains.length;
+  for (const c of chains) {
+    const li = document.createElement("li"), b = Object.assign(document.createElement("button"), { type: "button", textContent: describe(c) });
+    const d = Object.assign(document.createElement("button"), { type: "button", className: "del", textContent: "×", title: "Delete this measurement" });
+    li.className = c.id === selected ? "sel" : "";
+    b.onclick = () => selectMeasurement(c.id);
+    d.setAttribute("aria-label", "Delete this measurement");
+    d.onclick = () => removeMeasurement(c.id);
+    li.append(b, d);
+    ul.append(li);
+  }
+}
 function rebuild() {
   measureGroup.traverse((o) => o.geometry?.dispose());
   measureGroup.clear();
   labels.splice(0).forEach((l) => l.el.remove());
-  const add = (text, pos, cls = "") => { const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}`, innerHTML: text }); $("labels").append(el); labels.push({ el, pos }); };
-  const main = [], helper = [], pts = [];
+  // every label belongs to a measurement (click selects it); the "owner" label also carries the delete button
+  const add = (text, pos, cls = "", c = null, owner = false) => {
+    const el = Object.assign(document.createElement("div"), { className: `lbl ${cls}${c && c.id === selected ? " sel" : ""}`, innerHTML: text + (owner ? `<button class="x" type="button" aria-label="Delete this measurement" data-del="${c.id}">×</button>` : "") });
+    if (c) el.dataset.id = c.id;
+    $("labels").append(el);
+    labels.push({ el, pos });
+  };
+  const main = [], helper = [], pts = [], sel = [];
   for (const c of chains) {
-    const n = c.pts.length, segs = n - 1 + (c.closed ? 1 : 0);
+    const n = c.pts.length, segs = n - 1 + (c.closed ? 1 : 0), line = c.id === selected ? sel : main, area = c.mode === "area";
     let total = 0;
     for (let i = 0; i < segs; i++) {
-      const a = c.pts[i], b = c.pts[(i + 1) % n], corner = new THREE.Vector3(b.x, a.y, b.z);
-      total += a.distanceTo(b);
-      main.push(a, b);
+      const a = c.pts[i], b = c.pts[(i + 1) % n], corner = new THREE.Vector3(b.x, a.y, b.z), len = a.distanceTo(b);
+      total += len;
+      line.push(a, b);
       helper.push(a, corner, corner, b);
-      add(`<b>${fmt(a.distanceTo(b))}</b>↔ ${fmt(Math.hypot(b.x - a.x, b.z - a.z))} · ↕ ${fmt(b.y - a.y)}`, a.clone().add(b).multiplyScalar(0.5));
+      add(area ? fmt(len) : `<b>${fmt(len)}</b>↔ ${fmt(Math.hypot(b.x - a.x, b.z - a.z))} · ↕ ${fmt(b.y - a.y)}`, a.clone().add(b).multiplyScalar(0.5), area ? "pt" : "", c, !area && (c.mode === "distance" || segs === 1) && i === 0);
     }
     for (const p of c.pts) { pts.push(p); add(`↑ ${fmt(p.y - cloud.ground)}`, p, "pt"); }
-    if (segs > 1) add(`Σ ${fmt(total)}`, c.pts[c.pts.length - 1], "sum");
-    if (c.closed) add(`<b>${fmtArea(areaOf(c.pts))}</b>`, c.pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(n), "area");
+    if (c.mode === "path" && segs > 1) add(`Σ ${fmt(total)}`, c.pts[n - 1], "sum", c, true);
+    if (area && n >= 3) {
+      add(areaLabel(c), c.pts.reduce((s, p) => s.add(p), new THREE.Vector3()).divideScalar(n), "area", c, c.done);
+      const g = new THREE.BufferGeometry(), pos = [];
+      for (const t of THREE.ShapeUtils.triangulateShape(c.pts.map((p) => new THREE.Vector2(p.x, p.z)), [])) for (const k of t) pos.push(c.pts[k].x, c.pts[k].y, c.pts[k].z);
+      g.setAttribute("position", new THREE.Float32BufferAttribute(pos, 3));
+      measureGroup.add(Object.assign(new THREE.Mesh(g, fillMat), { frustumCulled: false, renderOrder: -1 }));
+    }
   }
-  for (const [Cls, v, m] of [[THREE.LineSegments, helper, helperMat], [THREE.LineSegments, main, lineMat], [THREE.Points, pts, markMat]]) {
+  for (const [Cls, v, m] of [[THREE.LineSegments, helper, helperMat], [THREE.LineSegments, main, lineMat], [THREE.LineSegments, sel, selMat], [THREE.Points, pts, markMat]]) {
     const o = new Cls(new THREE.BufferGeometry().setFromPoints(v), m);
     o.frustumCulled = false;
     measureGroup.add(o);
   }
+  updateList();
   scheduleHash();
   invalidate();
 }
-function clearMeasures() { chains.length = 0; hover = null; vcb = ""; if (cloud) { rebuild(); updateRubber(); } }
+// The true ground surface inside a polygon: the cleaned terrain grid's triangles whose centre is inside it (worker).
+async function computeSurface(c) {
+  if (!cloud) return;
+  c.surface = "pending";
+  try {
+    const src = pointSource(false), bb = cloud.geom.boundingBox;
+    const r = await kernel("surface", { p: src.p, c: src.c, f: src.f, bounds: { minx: bb.min.x - 0.1, maxx: bb.max.x + 0.1, minz: bb.min.z - 0.1, maxz: bb.max.z + 0.1 }, poly: c.pts.map((p) => [p.x, p.z]) });
+    const plan = areaOf(c.pts);
+    c.surface = r.covered > 0 ? { surface: r.surface * plan / r.covered, coverage: Math.min(1, r.covered / plan) } : null;
+  } catch (err) { console.warn(err); c.surface = null; }
+  rebuild();
+}
+function clearMeasures() {  // always removes everything, whatever state the tool is in
+  chains.length = 0;
+  selected = null; hover = null; vcb = ""; lockDir = null;
+  if (cloud) { rebuild(); updateRubber(); }
+}
 function setMeasuring(on) {
   measuring = on;
   $("bMeasure").setAttribute("aria-pressed", on);
   $("mbar").hidden = !on;
   document.body.classList.toggle("measuring", on);
   renderer.domElement.style.cursor = on ? "crosshair" : "";
-  if (on) toast("Click to place points · Enter or double-click to finish · type a length · Esc");
-  else { finishChain(false); hover = null; loupe = null; $("loupe").hidden = true; updateRubber(); }
+  if (on) toast(mode === "distance" ? "Click two points" : mode === "path" ? "Click points · double-click, Enter or Done to finish" : "Click the corners · click the first point, Enter or Done to close");
+  else { finishChain(); hover = null; loupe = null; $("loupe").hidden = true; updateRubber(); }
 }
-function onEscape() {
+function setMeasureMode(m) {
+  if (openChain()) finishChain();
+  mode = m;
+  document.querySelectorAll("#mModes button").forEach((b) => b.setAttribute("aria-pressed", b.dataset.m === m));
+  if (measuring) setMeasuring(true);
+}
+function onEscape() {  // cancels only what is in progress; Clear / Clear all remove measurements
   if (selecting) setSelecting(false);
   else if (!$("help").hidden) $("help").hidden = true;
   else if (vcb) { vcb = ""; showVcb(); }
-  else if (openChain()) finishChain(false);
-  else if (chains.length) clearMeasures();
+  else if (openChain()) discardOpen();
+  else if (selected !== null) { selected = null; rebuild(); }
   else if (measuring) setMeasuring(false);
 }
-function chainsToHash() {  // x,y,z;x,y,z[c] chains joined by ~ (a trailing c marks a closed shape)
-  return chains.map((c) => c.pts.map((p) => [p.x, p.y, p.z].map((v) => +v.toFixed(2)).join(",")).join(";") + (c.closed ? "c" : "")).join("~");
+const MODE_CHAR = { distance: "d", path: "p", area: "a" };
+function chainsToHash() {  // <d|p|a>x,y,z;x,y,z for each finished measurement, joined by ~
+  return chains.filter((c) => c.done).map((c) => MODE_CHAR[c.mode] + c.pts.map((p) => [p.x, p.y, p.z].map((v) => +v.toFixed(2)).join(",")).join(";")).join("~");
 }
 function loadChains(s) {
   chains.length = 0;
   for (const part of s.split("~")) {
-    const closed = part.endsWith("c"), pts = part.replace(/c$/, "").split(";").map((t) => new THREE.Vector3(...t.split(",").map(Number)));
-    if (pts.length > 1 && pts.every((p) => [p.x, p.y, p.z].every(Number.isFinite))) chains.push({ pts, closed, done: true });
+    const m = { d: "distance", p: "path", a: "area" }[part[0]], legacy = !m, closed = legacy && part.endsWith("c");  // older links: x,y,z;… with a trailing c for a closed shape
+    const pts = (legacy ? part.replace(/c$/, "") : part.slice(1)).split(";").map((t) => new THREE.Vector3(...t.split(",").map(Number)));
+    if (pts.length > 1 && pts.every((p) => [p.x, p.y, p.z].every(Number.isFinite))) {
+      const c = { id: nextId++, mode: m || (closed ? "area" : "path"), pts, closed: closed || m === "area", done: true, surface: null };
+      chains.push(c);
+      if (c.closed) computeSurface(c);
+    }
   }
   rebuild();
 }
 function measurementsText() {  // CSV in the SketchUp frame (east, north, up) relative to the walk start
-  const rows = ["chain,point,x_east,y_north,z_up,segment_m,running_m,area_m2"];
-  chains.forEach((c, ci) => {
+  const rows = ["id,mode,point,x_east,y_north,z_up,segment_m,running_m,plan_area_m2,surface_area_m2,perimeter_m"];
+  for (const c of chains) {
     let run = 0;
     c.pts.forEach((p, i) => {
       const seg = i ? p.distanceTo(c.pts[i - 1]) : 0;
       run += seg;
-      rows.push([ci + 1, i + 1, p.x.toFixed(3), (-p.z).toFixed(3), p.y.toFixed(3), seg.toFixed(3), run.toFixed(3), c.closed && i === c.pts.length - 1 ? areaOf(c.pts).toFixed(3) : ""].join(","));
+      rows.push([c.id, c.mode, i + 1, p.x.toFixed(3), (-p.z).toFixed(3), p.y.toFixed(3), seg.toFixed(3), run.toFixed(3), "", "", ""].join(","));
     });
-    if (c.closed) rows.push([ci + 1, "closing", "", "", "", c.pts[c.pts.length - 1].distanceTo(c.pts[0]).toFixed(3), (run + c.pts[c.pts.length - 1].distanceTo(c.pts[0])).toFixed(3), ""].join(","));
-  });
+    if (c.closed) rows.push([c.id, c.mode, "total", "", "", "", "", "", areaOf(c.pts).toFixed(3), c.surface?.surface ? c.surface.surface.toFixed(3) : "", pathLength(c.pts, true).toFixed(3)].join(","));
+  }
   return rows.join("\n");
 }
 
@@ -1219,6 +1330,7 @@ function showLoupe(x, y) {
 el.addEventListener("pointerdown", (e) => {
   lastPointerType = e.pointerType;
   down = e.isPrimary ? { x: e.clientX, y: e.clientY, t: e.timeStamp } : null;
+  if (!e.isPrimary && hold) { clearTimeout(hold.timer); hold = null; loupe = null; $("loupe").hidden = true; }  // a second finger (pinch) never places a point
   if (!measuring || e.pointerType !== "touch" || !e.isPrimary) return;
   hold = { x: e.clientX, y: e.clientY, precise: false };
   hold.timer = setTimeout(() => { if (hold) { hold.precise = true; showLoupe(hold.x, hold.y); updateHover(hold.x, hold.y, false); } }, 350);
@@ -1234,6 +1346,8 @@ for (const t of ["pointerup", "pointercancel"]) el.addEventListener(t, (e) => {
   if (t === "pointerup" && measuring && cloud && hold?.precise) placeAt(hold.x, hold.y, false);
   else if (t === "pointerup" && measuring && cloud && down && e.isPrimary && !(e.pointerType === "mouse" && e.button !== 0)
     && Math.hypot(e.clientX - down.x, e.clientY - down.y) <= 6 && e.timeStamp - down.t <= 600) placeAt(e.clientX, e.clientY, e.shiftKey);
+  else if (t === "pointerup" && !measuring && cloud && chains.length && down && e.isPrimary && !(e.pointerType === "mouse" && e.button !== 0)
+    && Math.hypot(e.clientX - down.x, e.clientY - down.y) <= 6 && e.timeStamp - down.t <= 600) selectNear(e.clientX, e.clientY);  // a tap on a line selects it
   if (hold) { clearTimeout(hold.timer); hold = null; }
   loupe = null;
   $("loupe").hidden = true;
@@ -1250,15 +1364,37 @@ function drawLoupe() {  // called right after a render, while the canvas still h
   ctx.moveTo(size / 2, size / 2 - 14); ctx.lineTo(size / 2, size / 2 + 14);
   ctx.stroke();
 }
-el.addEventListener("dblclick", (e) => {
-  if (!measuring || !cloud) return;
-  const c = openChain(), first = c?.pts[0], last = c?.pts[c.pts.length - 1];
-  if (c && c.pts.length >= 3 && last.distanceTo(first) < 0.02) { c.pts.pop(); finishChain(true); }  // double-click on the first point closes the shape
-  else finishChain(false);
-});
+function selectNear(x, y) {  // select the measurement whose line passes within 10 px of a tap, else deselect
+  let best = null;
+  for (const c of chains) {
+    for (let i = 0; i < c.pts.length - 1 + (c.closed ? 1 : 0); i++) {
+      const a = toScreen(c.pts[i]), b = toScreen(c.pts[(i + 1) % c.pts.length]);
+      if (!a || !b) continue;
+      const dx = b[0] - a[0], dy = b[1] - a[1], t = Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / (dx * dx + dy * dy || 1))), d = Math.hypot(a[0] + t * dx - x, a[1] + t * dy - y);
+      if (d <= 10 && (!best || d < best.d)) best = { id: c.id, d };
+    }
+  }
+  selected = best ? best.id : null;
+  rebuild();
+}
+el.addEventListener("dblclick", (e) => { if (measuring && cloud) finishChain(); });  // path ends, area closes
 $("mUndo").onclick = undo;
-$("mDone").onclick = () => finishChain(false);
-$("mClose").onclick = () => finishChain(true);
+$("mDone").onclick = () => finishChain();
+$("mClear").onclick = $("mClearAll").onclick = clearMeasures;
+$("bClear").onclick = clearMeasures;
+for (const [m, text] of Object.entries(MEASURE_MODES)) {
+  const b = Object.assign(document.createElement("button"), { type: "button", textContent: text, title: m === "distance" ? "Measure between two points" : m === "path" ? "Click several points; running total" : "Click the corners of an area: plan and ground surface area" });
+  b.dataset.m = m;
+  b.onclick = () => setMeasureMode(m);
+  $("mModes").append(b);
+}
+setMeasureMode(mode);
+$("labels").addEventListener("click", (e) => {  // labels: × deletes, anywhere else on a label selects its measurement
+  const del = e.target.closest("[data-del]");
+  if (del) return removeMeasurement(+del.dataset.del);
+  const l = e.target.closest(".lbl[data-id]");
+  if (l) selectMeasurement(+l.dataset.id);
+});
 $("mCopy").onclick = async () => {
   try { await navigator.clipboard.writeText(measurementsText()); toast("Measurements copied as CSV"); }
   catch { toast("Could not copy — your browser blocked the clipboard"); }
@@ -1333,7 +1469,6 @@ const viewPlan = () => { if (!plan) setPlan(true); else fitPlan(); };
 $("bPlan").onclick = viewPlan;
 $("bFit").onclick = viewFit;
 $("bMeasure").onclick = () => setMeasuring(!measuring);
-$("bClear").onclick = onEscape;
 $("bHelp").onclick = () => { $("help").hidden = !$("help").hidden; };
 $("help").onclick = () => { $("help").hidden = true; };
 $("bNav").onclick = () => { const h = $("pad").hidden = !$("pad").hidden; $("bNav").setAttribute("aria-pressed", !h); };
@@ -1451,6 +1586,7 @@ addEventListener("keyup", (e) => { if (e.key === "Shift") { lockDir = null; if (
 addEventListener("keydown", (e) => {
   if (/^(SELECT|TEXTAREA)$/.test(e.target.tagName) || (e.target.tagName === "INPUT" && !/^(range|checkbox)$/.test(e.target.type))) return;
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && chains.length) { e.preventDefault(); return undo(); }
+  if ((e.key === "Delete" || e.key === "Backspace") && selected !== null && !vcb) { e.preventDefault(); return removeMeasurement(selected); }  // delete the selected measurement
   if (measuring && !e.ctrlKey && !e.metaKey) {  // SketchUp-style: Shift locks the direction, digits + Enter set the length
     const P0 = lastPoint();
     if (e.key === "Shift" && !lockDir && hover && P0 && hover.p.distanceTo(P0) > 0.01) lockDir = hover.p.clone().sub(P0).normalize();
@@ -1922,8 +2058,32 @@ function classify(m) {
   return out;
 }
 
+function pointInPoly(x, z, poly) {  // even-odd rule, poly [[x, z], ...]
+  let inside = false;
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    if ((poly[i][1] > z) !== (poly[j][1] > z) && x < (poly[j][0] - poly[i][0]) * (z - poly[i][1]) / (poly[j][1] - poly[i][1]) + poly[i][0]) inside = !inside;
+  }
+  return inside;
+}
+// True ground surface inside a plan polygon: 3D area of the terrain grid's triangles whose centre lies in it, and the plan
+// area those triangles cover (so the caller can scale for terrain gaps).
+function surfaceInPolygon({ p, c, f, bounds, poly }) {
+  const xs = poly.map((q) => q[0]), zs = poly.map((q) => q[1]);
+  const region = { x0: Math.min(...xs), x1: Math.max(...xs), z0: Math.min(...zs), z1: Math.max(...zs) };
+  const t = buildTerrain({ p, c, f, bounds, region, cell: 0.1, auto: false, px: 0.03, photo: false }), v = t.verts;
+  let surface = 0, covered = 0;
+  for (let i = 0; i < t.tris.length; i += 3) {
+    const a = 3 * t.tris[i], b = 3 * t.tris[i + 1], d = 3 * t.tris[i + 2];
+    if (!pointInPoly((v[a] + v[b] + v[d]) / 3, -(v[a + 1] + v[b + 1] + v[d + 1]) / 3, poly)) continue;  // SketchUp y = -world z
+    const ux = v[b] - v[a], uy = v[b + 1] - v[a + 1], uz = v[b + 2] - v[a + 2], wx = v[d] - v[a], wy = v[d + 1] - v[a + 1], wz = v[d + 2] - v[a + 2];
+    surface += Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx) / 2;
+    covered += Math.abs(ux * wy - uy * wx) / 2;
+  }
+  return { surface, covered };
+}
+
 // -- Worker: the terrain kernel runs off the main thread so fine resolutions don't freeze the page
-const KERNEL = [nth, medianOf, lowestGrid, cleanGrid, cropGrid, maskRegion, upsampleGrid, triangulate, nearestSet, orthophoto, groundAt, countFaces, buildTerrain, classify];
+const KERNEL = [nth, medianOf, lowestGrid, cleanGrid, cropGrid, maskRegion, upsampleGrid, triangulate, nearestSet, orthophoto, groundAt, countFaces, buildTerrain, classify, pointInPoly, surfaceInPolygon];
 function kernelSource() {
   const consts = { TERRAIN_MAX_FACES, OUTLIER, BUMP, BUMP_WINDOW, MAX_SLOPE, MAX_HOLE, GROUND_BAND, ORTHO_MAX, ORTHO_FILL, STRUCTURE_ABOVE, D8, D4 };
   return `const ${Object.entries(consts).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(", ")};\n` +
@@ -1932,7 +2092,7 @@ const bufs = (o) => Object.values(o).flatMap((v) => ArrayBuffer.isView(v) ? [v.b
 onmessage = (e) => {
   const { id, op, ...m } = e.data;
   self.job = id;
-  try { const r = op === "terrain" ? buildTerrain(m) : classify(m); postMessage({ id, result: r }, [...new Set(bufs(r))]); }
+  try { const r = op === "terrain" ? buildTerrain(m) : op === "surface" ? surfaceInPolygon(m) : classify(m); postMessage({ id, result: r }, [...new Set(bufs(r))]); }
   catch (err) { postMessage({ id, error: err.message }); }
 };`;
 }
