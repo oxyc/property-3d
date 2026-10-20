@@ -18,6 +18,23 @@ struct Update: @unchecked Sendable {
     var duration: TimeInterval
     var frames: Int
     var issues: [String]
+    var holes: [HoleMark]
+    var gaps: Int
+    var target: SIMD3<Float>?
+    var targetDistance: Float
+    /// Target bearing relative to where the phone points, radians clockwise (0 = straight ahead).
+    var targetAngle: Float
+    var targetOnScreen: Bool
+    /// Open holes that were filled since the previous update.
+    var filled: Int
+}
+
+/// A blind spot for the minimap. Position is world X/Z in metres.
+struct HoleMark: Sendable {
+    var x: Float
+    var z: Float
+    var radius: Float
+    var blocked: Bool
 }
 
 /// UI-facing recorder. All disk and ARKit frame work lives in `Engine` on its own queue.
@@ -30,14 +47,24 @@ final class Recorder: ObservableObject {
     @Published private(set) var duration: TimeInterval = 0
     @Published private(set) var frames = 0
     @Published private(set) var warnings: [String] = []
+    @Published private(set) var holes: [HoleMark] = []
+    @Published private(set) var gaps = 0
+    @Published private(set) var target: SIMD3<Float>?
+    @Published private(set) var targetDistance: Float = 0
+    @Published private(set) var targetAngle: Float = 0
+    @Published private(set) var targetOnScreen = false
     @Published var errorMessage: String?
 
     let session = ARSession()
     private let engine = Engine()
     private let location = CLLocationManager()
     private let haptics = UINotificationFeedbackGenerator()
+    private let fillHaptic = UIImpactFeedbackGenerator(style: .light)
     private var shownWarnings = Set<String>()
     private var lastHaptic = Date.distantPast
+    private var lastFillHaptic = Date.distantPast
+
+    func setViewport(_ size: CGSize) { engine.setViewport(size) }
 
     var areaM2: Double { snapshot?.areaM2 ?? 0 }
 
@@ -93,6 +120,9 @@ final class Recorder: ObservableObject {
         frames = 0
         warnings = []
         shownWarnings = []
+        holes = []
+        gaps = 0
+        target = nil
         isRecording = true
     }
 
@@ -113,6 +143,12 @@ final class Recorder: ObservableObject {
         yaw = u.yaw
         duration = u.duration
         frames = u.frames
+        holes = u.holes
+        gaps = u.gaps
+        target = u.target
+        targetDistance = u.targetDistance
+        targetAngle = u.targetAngle
+        targetOnScreen = u.targetOnScreen
 
         var list = u.issues
         let thermal = ProcessInfo.processInfo.thermalState
@@ -129,6 +165,12 @@ final class Recorder: ObservableObject {
             lastHaptic = now
         }
         shownWarnings = current
+
+        // Light tap when a gap gets filled; never within 1.5 s of another tap.
+        if u.filled > 0, now.timeIntervalSince(lastFillHaptic) > 1.5, now.timeIntervalSince(lastHaptic) > 1.5 {
+            fillHaptic.impactOccurred()
+            lastFillHaptic = now
+        }
     }
 }
 
@@ -143,6 +185,23 @@ private struct FrameRecord: Encodable {
     let rgb: Bool
 }
 
+/// A hole cell that can be looked at; `y` is the estimated ground height.
+private struct LookCell {
+    var key: Int64
+    var x: Float
+    var y: Float
+    var z: Float
+    var blocked: Bool
+}
+
+private struct HoleComp {
+    var keys: [Int64]
+    var groundY: Float
+    var center: SIMD2<Float>
+    var radius: Float
+    var blocked = false
+}
+
 /// Handles ARKit frames and location updates on `q`: writes to disk, updates coverage, reports to the UI.
 /// Everything except `onUpdate` and `q` is confined to `q`.
 final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unchecked Sendable {
@@ -150,7 +209,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     var onUpdate: (@Sendable (Update) -> Void)?
 
     private var walk: Walk?
+    private var viewport = CGSize(width: 390, height: 844)
     private let ciContext = CIContext()
+    private let holeQueue = DispatchQueue(label: "walkscan.holes", qos: .utility)
 
     private static let iso: ISO8601DateFormatter = ISO8601DateFormatter()
 
@@ -171,6 +232,21 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         var lastDiskCheck = -Double.infinity
         var dirty = false
         var grid = CoverageGrid()
+
+        // Blind-spot guidance
+        var fine = FineGrid()
+        var fineDirty = false
+        var lastHoleJob = -Double.infinity
+        var holeJobRunning = false
+        var firstSeen: [Int64: Double] = [:]
+        var looks: [Int64: LookTracker] = [:]
+        var blockedKeys = Set<Int64>()
+        var comps: [HoleComp] = []
+        var lookCells: [LookCell] = []
+        var targetKey: Int64?
+        var target: SIMD3<Float>?
+        var targetOnScreen = false
+        var pendingFilled = 0
 
         var pos = SIMD3<Float>(0, 0, 0)
         var yaw: Float = 0
@@ -257,6 +333,10 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         }
     }
 
+    func setViewport(_ size: CGSize) {
+        q.async { self.viewport = size }
+    }
+
     // MARK: ARSessionDelegate (called on q)
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
@@ -269,7 +349,14 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let tr = cam.transform
         w.pos = SIMD3(tr.columns.3.x, tr.columns.3.y, tr.columns.3.z)
         let fwd = -tr.columns.2
-        w.yaw = atan2(fwd.x, -fwd.z)  // clockwise from north (north = -Z)
+        // Heading clockwise from north (north = -Z). Looking steeply up or down, the forward vector says
+        // nothing about heading, so use the phone's top edge (camera -X in portrait) instead.
+        var heading = SIMD2(fwd.x, -fwd.z)
+        if abs(fwd.y) > 0.85 {
+            let top = -tr.columns.0
+            heading = SIMD2(top.x, -top.z) * (fwd.y < 0 ? 1 : -1)
+        }
+        w.yaw = atan2(heading.x, heading.y)
         defer { publish(w) }
 
         let (trackingName, issue) = Self.describe(cam.trackingState)
@@ -288,6 +375,19 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         }
         w.lastPos = w.pos
         w.lastPosT = now
+
+        if let t = w.target {
+            let toTarget = SIMD3(t.x - w.pos.x, t.y - w.pos.y, t.z - w.pos.z)
+            var onScreen = false
+            if simd_dot(toTarget, SIMD3(fwd.x, fwd.y, fwd.z)) > 0 {
+                let p = cam.projectPoint(t, orientation: .portrait, viewportSize: viewport)
+                onScreen = p.x > viewport.width * 0.08 && p.x < viewport.width * 0.92
+                    && p.y > viewport.height * 0.15 && p.y < viewport.height * 0.85
+            }
+            w.targetOnScreen = onScreen
+        } else {
+            w.targetOnScreen = false
+        }
 
         let depthW = CVPixelBufferGetWidth(depth.depthMap)
         let depthH = CVPixelBufferGetHeight(depth.depthMap)
@@ -332,9 +432,11 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         w.count += 1
 
         markCoverage(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
+        registerLooks(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
     }
 
-    /// Unprojects every 4th depth pixel (confidence >= 1, depth <= 4 m) into world cells.
+    /// Unprojects every 4th depth pixel (confidence >= 1, depth <= 4 m) into the 25 cm coverage cells,
+    /// and every 2nd pixel (depth <= 3.5 m) into the 10 cm grid used for hole detection.
     private func markCoverage(_ w: Walk, frame: ARFrame, depth: Data, conf: Data, width: Int, height: Int) {
         let cam = frame.camera
         let tr = cam.transform
@@ -346,22 +448,109 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             conf.withUnsafeBytes { cRaw in
                 let d = dRaw.bindMemory(to: Float.self)
                 let c = cRaw.bindMemory(to: UInt8.self)
-                for v in stride(from: 0, to: height, by: 4) {
-                    for u in stride(from: 0, to: width, by: 4) {
-                        total += 1
+                for v in stride(from: 0, to: height, by: 2) {
+                    for u in stride(from: 0, to: width, by: 2) {
+                        let coarse = u % 4 == 0 && v % 4 == 0
+                        if coarse { total += 1 }
                         let i = v * width + u
                         let z = d[i]
                         guard c[i] >= 1, z > 0, z <= 4 else { continue }
-                        valid += 1
                         let p = SIMD4<Float>((Float(u) * scale - cx) / fx * z, -(Float(v) * scale - cy) / fy * z, -z, 1)
                         let wp = tr * p
-                        w.grid.mark(x: wp.x, y: wp.y, z: wp.z)
+                        if coarse {
+                            valid += 1
+                            w.grid.mark(x: wp.x, y: wp.y, z: wp.z)
+                        }
+                        if z <= HoleConfig.maxFineDistance { w.fine.mark(x: wp.x, y: wp.y, z: wp.z) }
                     }
                 }
             }
         }
         if valid * 20 >= total { w.lastValidDepth = frame.timestamp }
         w.dirty = true
+        w.fineDirty = true
+    }
+
+    /// For every settled hole cell near the camera: if it projects into the image and the depth there
+    /// is invalid or shorter than the cell (something in front), count a look from this viewpoint.
+    private func registerLooks(_ w: Walk, frame: ARFrame, depth: Data, conf: Data, width: Int, height: Int) {
+        guard !w.lookCells.isEmpty else { return }
+        let cam = frame.camera
+        let inv = cam.transform.inverse
+        let k = cam.intrinsics
+        let fx = k[0][0], fy = k[1][1], cx = k[2][0], cy = k[2][1]
+        let resW = Float(cam.imageResolution.width), resH = Float(cam.imageResolution.height)
+        let scale = resW / Float(width)
+        let view = SIMD2(w.pos.x, w.pos.z)
+        depth.withUnsafeBytes { dRaw in
+            conf.withUnsafeBytes { cRaw in
+                let d = dRaw.bindMemory(to: Float.self)
+                let c = cRaw.bindMemory(to: UInt8.self)
+                for i in w.lookCells.indices {
+                    let cell = w.lookCells[i]
+                    if cell.blocked { continue }
+                    let dx = cell.x - view.x, dz = cell.z - view.y
+                    if dx * dx + dz * dz > 20 { continue }
+                    let p = inv * SIMD4<Float>(cell.x, cell.y, cell.z, 1)
+                    let cellDepth = -p.z
+                    guard cellDepth > 0.3, cellDepth <= 4 else { continue }
+                    let u = fx * p.x / cellDepth + cx
+                    let v = cy - fy * p.y / cellDepth
+                    // Central 90% of the image only: the camera is really pointed there.
+                    guard u > 0.05 * resW, u < 0.95 * resW, v > 0.05 * resH, v < 0.95 * resH else { continue }
+                    let idx = Int(v / scale) * width + Int(u / scale)
+                    guard HoleLook.isLook(depth: d[idx], confidence: c[idx], cellDepth: cellDepth) else { continue }
+                    var tracker = w.looks[cell.key] ?? LookTracker(cell: SIMD2(cell.x, cell.z))
+                    tracker.add(viewpoint: view)
+                    w.looks[cell.key] = tracker
+                    if tracker.isBlocked() {
+                        w.lookCells[i].blocked = true
+                        w.blockedKeys.insert(cell.key)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Takes the result of a hole search: ages holes, drops stale look state, detects filled holes.
+    private func applyHoles(_ w: Walk, _ found: [FoundHole]) {
+        guard walk === w else { return }
+        w.holeJobRunning = false
+        let now = ProcessInfo.processInfo.systemUptime
+
+        var raw = Set<Int64>()
+        var seen: [Int64: Double] = [:]
+        var comps: [HoleComp] = []
+        for hole in found {
+            var settled = false
+            var sum = SIMD2<Float>(0, 0)
+            for key in hole.keys {
+                raw.insert(key)
+                let first = w.firstSeen[key] ?? now
+                seen[key] = first
+                if now - first >= HoleConfig.settleSeconds { settled = true }
+                sum += FineGrid.center(key)
+            }
+            if settled {
+                let n = Float(hole.keys.count)
+                let radius = max(HoleConfig.cellSize, (n / .pi).squareRoot() * HoleConfig.cellSize)
+                comps.append(HoleComp(keys: hole.keys, groundY: hole.groundY, center: sum / n, radius: radius))
+            }
+        }
+        w.firstSeen = seen
+
+        // A hole that was open and has no hole cells left was filled (blocked ones don't count).
+        for c in w.comps where !c.blocked && !c.keys.contains(where: raw.contains) { w.pendingFilled += 1 }
+
+        w.looks = w.looks.filter { raw.contains($0.key) }
+        w.blockedKeys.formIntersection(raw)
+        w.comps = comps
+        w.lookCells = comps.flatMap { comp in
+            comp.keys.map { key -> LookCell in
+                let c = FineGrid.center(key)
+                return LookCell(key: key, x: c.x, y: comp.groundY, z: c.y, blocked: w.blockedKeys.contains(key))
+            }
+        }
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -393,6 +582,18 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             w.lastSnapshot = now
             w.dirty = false
         }
+        // Hole search runs on its own queue on a copy of the fine grid, at most once a second.
+        if w.fineDirty, !w.holeJobRunning, now - w.lastHoleJob >= 1 {
+            w.fineDirty = false
+            w.holeJobRunning = true
+            w.lastHoleJob = now
+            let fine = w.fine
+            holeQueue.async {
+                let found = fine.holes()
+                self.q.async { self.applyHoles(w, found) }
+            }
+        }
+        let guidance = guide(w)
         if now - w.lastDiskCheck >= 5 {
             w.lastDiskCheck = now
             let values = try? w.dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
@@ -408,7 +609,48 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         if w.writeFailed { issues.append("Writing to disk failed") }
 
         onUpdate?(Update(snapshot: snapshot, x: w.pos.x, z: w.pos.z, yaw: w.yaw,
-                         duration: now - w.startUptime, frames: w.count, issues: issues))
+                         duration: now - w.startUptime, frames: w.count, issues: issues,
+                         holes: guidance.marks, gaps: guidance.open, target: w.target,
+                         targetDistance: guidance.distance, targetAngle: guidance.angle,
+                         targetOnScreen: w.targetOnScreen, filled: guidance.filled))
+    }
+
+    /// Marks blocked holes, counts open ones and picks the nearest open hole cell as the target.
+    private func guide(_ w: Walk) -> (marks: [HoleMark], open: Int, distance: Float, angle: Float, filled: Int) {
+        var marks: [HoleMark] = []
+        var open = 0
+        for i in w.comps.indices {
+            w.comps[i].blocked = w.comps[i].keys.allSatisfy(w.blockedKeys.contains)
+            let c = w.comps[i]
+            if !c.blocked { open += 1 }
+            marks.append(HoleMark(x: c.center.x, z: c.center.y, radius: c.radius, blocked: c.blocked))
+        }
+
+        // Nearest open cell, sticking with the current target unless another is clearly (1 m) closer.
+        func dist(_ c: LookCell) -> Float { hypot(c.x - w.pos.x, c.z - w.pos.z) }
+        var best: LookCell?
+        var current: LookCell?
+        for c in w.lookCells where !c.blocked {
+            if best == nil || dist(c) < dist(best!) { best = c }
+            if c.key == w.targetKey { current = c }
+        }
+        var chosen = best
+        if let current, let best, dist(current) <= dist(best) + 1 { chosen = current }
+
+        let filled = w.pendingFilled
+        w.pendingFilled = 0
+        guard let chosen else {
+            w.target = nil
+            w.targetKey = nil
+            return (marks, open, 0, 0, filled)
+        }
+        w.target = SIMD3(chosen.x, chosen.y, chosen.z)
+        w.targetKey = chosen.key
+        let bearing = atan2(chosen.x - w.pos.x, -(chosen.z - w.pos.z))
+        var rel = bearing - w.yaw
+        while rel > .pi { rel -= 2 * .pi }
+        while rel < -.pi { rel += 2 * .pi }
+        return (marks, open, dist(chosen), rel, filled)
     }
 
     // MARK: CLLocationManagerDelegate (called on main; hop to q)
