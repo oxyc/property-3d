@@ -1,9 +1,13 @@
 """Fuse a walk (FORMAT.md) into a point cloud, a TSDF mesh and a ground height grid.
 
-usage: fuse.py <walk_dir> <out_dir> [--voxel 0.02] [--poses poses.npz]
+usage: fuse.py <walk_dir> <out_dir> [--voxel 0.02] [--poses poses.npz] [--consensus]
 
 Outputs in out_dir (all in the ARKit world frame: X east, Y up, Z south, metres):
-  points.ply   voxel-downsampled, outlier-filtered, coloured from the closest unoccluded RGB keyframe
+  points.ply   voxel-downsampled, outlier-filtered, coloured from the closest unoccluded RGB keyframe.
+               Experimental --consensus drops points most frames saw straight through (people, flying pixels).
+               Off by default: on a real garden walk it also removed real structure next to walls and edges
+               (ARKit's smoothed depth makes silhouettes look see-through). The TSDF only updates a thin band
+               around surfaces, so it cannot hold these free-space votes, and mesh.ply is unaffected.
   mesh.ply     TSDF mesh (depth only, 3 cm voxels)
   ground.npz   lowest-point height grid (10 cm cells): height[row, col] in Y, NaN = empty.
                Row 0 is the northernmost row. west/north = local east and north (= -Z) of the
@@ -22,6 +26,11 @@ MIN_DEPTH, MAX_DEPTH = 0.2, 4.5
 CHUNK = 10  # frames merged between voxel-downsamples, bounds memory
 GROUND_CELL = 0.1
 TSDF_VOXEL = 0.03
+CONSENSUS_FRAMES = 1500  # frames per walk that vote (every k-th), bounds the time on long walks
+CONSENSUS_MIN_VOTES = 3  # a point needs this many "seen through" votes before it can be dropped
+CONSENSUS_FRACTION = 0.4  # ... and be this share of all votes (a shade under a majority: passes see a spot from unequal numbers of frames)
+CONSENSUS_MIN_SPAN = 30.0  # ... and the "seen through" votes must span this many seconds: independent passes, not one stretch
+CONSENSUS_MARGIN_VOXELS, CONSENSUS_MARGIN_RANGE = 2, 0.015  # depth margin: max(2 voxels, 1.5% of range)
 
 
 def read_walk(walk):
@@ -97,6 +106,62 @@ def colour_points(pcd, sources):
     return np.isfinite(best).mean()
 
 
+def frame_votes(pts, f, depth, conf, meta):
+    """Per point: (free, support) for one frame. Free = the frame saw through the point (a surface well behind
+    it), support = the frame saw a surface at it. Neither if the point is outside the view, occluded, or the
+    depth around it is missing. The 3x3 pixel neighbourhood keeps thin things alive: a pole counts as seen if
+    any neighbouring pixel hits it, and as seen through only if every neighbour is valid and farther away."""
+    fx, fy, cx, cy = f["intrinsics"]
+    T = f["T"]
+    cam = (pts - T[:3, 3]) @ T[:3, :3]  # world -> camera: R^T (p - t)
+    z = -cam[:, 2]
+    zs = np.maximum(z, 1e-6)
+    dw, dh = meta["depth_w"], meta["depth_h"]
+    u = np.round((fx * cam[:, 0] / zs + cx) * dw / meta["rgb_w"]).astype(int)
+    v = np.round((cy - fy * cam[:, 1] / zs) * dh / meta["rgb_h"]).astype(int)
+    inside = (z > MIN_DEPTH) & (u >= 1) & (u < dw - 1) & (v >= 1) & (v < dh - 1)
+    free, support = np.zeros(len(pts), bool), np.zeros(len(pts), bool)
+    u, v, z = u[inside], v[inside], z[inside]
+    D = np.where((conf >= 1) & (depth >= MIN_DEPTH), depth, np.nan)
+    nb = np.stack([D[v + dy, u + dx] for dy in (-1, 0, 1) for dx in (-1, 0, 1)])
+    margin = np.maximum(CONSENSUS_MARGIN_VOXELS * TSDF_VOXEL, CONSENSUS_MARGIN_RANGE * z)
+    free[inside] = ~np.isnan(nb).any(0) & (z < nb.min(0) - margin)
+    support[inside] = np.nan_to_num(np.abs(nb - z), nan=np.inf).min(0) <= margin
+    return free, support
+
+
+def consensus_filter(acc, sources):
+    """Drop points that a large share of the frames able to judge them saw straight through ("2 of 3 passes say it wasn't
+    there"): transient things (people, swaying leaves) and flying pixels. Two guards, because ARKit's smoothed depth
+    maps are unreliable at thin things and silhouettes: the "seen through" votes must come from at least
+    CONSENSUS_MIN_SPAN seconds apart (a revisit, not neighbouring frames of one pass), and points too rarely observed
+    to judge are kept: no evidence is not evidence of absence. sources: [(walk, meta, tracking-normal frames)]."""
+    pts = np.asarray(acc.points)
+    free, support = np.zeros(len(pts), np.int32), np.zeros(len(pts), np.int32)
+    first, last = np.full(len(pts), np.inf), np.full(len(pts), -np.inf)  # times of the first / last "seen through" vote
+    tree = o3d.geometry.KDTreeFlann(acc)
+    for k, (walk, meta, frames) in enumerate(sources):
+        for f in frames[::max(1, -(-len(frames) // CONSENSUS_FRAMES))]:
+            _, idx, _ = tree.search_radius_vector_3d(f["T"][:3, 3], MAX_DEPTH + 0.5)
+            idx = np.asarray(idx)
+            if len(idx) == 0:
+                continue
+            depth, conf = read_depth(walk, meta, f["i"])
+            fr, su = frame_votes(pts[idx], f, depth, conf, meta)
+            free[idx] += fr
+            support[idx] += su
+            seen_through, t = idx[fr], f["t"] + k * 1e6  # separate walks are always far apart in time
+            first[seen_through] = np.minimum(first[seen_through], t)
+            last[seen_through] = np.maximum(last[seen_through], t)
+    leaning = (free >= CONSENSUS_MIN_VOTES) & (free >= CONSENSUS_FRACTION * (free + support))
+    drop = leaning & (last - first >= CONSENSUS_MIN_SPAN)
+    stats = {"points": len(pts), "removed": int(drop.sum()), "removed_never_supported": int((drop & (support == 0)).sum()),
+             "removed_outvoted": int((drop & (support > 0)).sum()),
+             "kept_one_pass_only": int((leaning & ~drop).sum()),
+             "kept_unjudged": int(((free + support < CONSENSUS_MIN_VOTES) & ~drop).sum())}
+    return acc.select_by_index(np.nonzero(~drop)[0]), stats
+
+
 def to_cloud(pts):
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(pts)
@@ -129,20 +194,21 @@ def save_preview(height, path):
     Image.fromarray(img).resize((img.shape[1] * 4, img.shape[0] * 4), Image.NEAREST).save(path)
 
 
-def fuse(walk, out, voxel=0.02, poses=None):
+def fuse(walk, out, voxel=0.02, poses=None, consensus=False):
     """poses: optional poses.npz from optimize.py; its transforms replace the recorded ones."""
-    fuse_many([(walk, poses)], out, voxel)
+    return fuse_many([(walk, poses)], out, voxel, consensus)
 
 
-def fuse_many(walks, out, voxel=0.02):
+def fuse_many(walks, out, voxel=0.02, consensus=False):
     """walks: [(walk_dir, poses.npz or None)], all in one common world frame through their poses.
-    Frame indices only need to be unique within a walk."""
+    Frame indices only need to be unique within a walk. consensus: drop points the other frames saw through
+    (see consensus_filter). Returns the consensus stats ({} if off)."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
         TSDF_VOXEL, 4 * TSDF_VOXEL, o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
     acc = o3d.geometry.PointCloud()
-    sources = []
+    sources, voters = [], []
     for walk, poses in walks:
         walk = Path(walk)
         meta, frames = read_walk(walk)
@@ -152,6 +218,7 @@ def fuse_many(walks, out, voxel=0.02):
             for f in frames:
                 f["T"] = corrected[f["i"]]
         sources.append((walk, meta, [f for f in frames if f["rgb"]]))
+        voters.append((walk, meta, [f for f in frames if f["tracking"] == "normal"]))
 
         dw, dh = meta["depth_w"], meta["depth_h"]
         sx, sy = dw / meta["rgb_w"], dh / meta["rgb_h"]
@@ -176,6 +243,13 @@ def fuse_many(walks, out, voxel=0.02):
 
         if pend:  # tracking-skipped tail
             acc = (acc + to_cloud(np.vstack(pend))).voxel_down_sample(voxel)
+    stats = {}
+    if consensus:
+        acc, stats = consensus_filter(acc, voters)
+        print(f"consensus: {stats['removed']} of {stats['points']} points removed ({stats['removed'] / stats['points']:.1%}): "
+              f"{stats['removed_never_supported']} seen through and never seen there, {stats['removed_outvoted']} outvoted; "
+              f"{stats['kept_one_pass_only']} kept although leaning that way (seen through within one pass only), "
+              f"{stats['kept_unjudged']} kept unjudged (too few observations)")
     n_before = len(acc.points)
     acc, _ = acc.remove_statistical_outlier(nb_neighbors=20, std_ratio=2.0)
     coloured = colour_points(acc, sources)
@@ -190,6 +264,7 @@ def fuse_many(walks, out, voxel=0.02):
     save_preview(height, out / "ground.png")
     print(f"points: {n_before} -> {len(acc.points)} after outlier removal, {coloured:.0%} coloured; "
           f"mesh: {len(mesh.triangles)} triangles; ground grid {height.shape[1]}x{height.shape[0]} cells")
+    return stats
 
 
 if __name__ == "__main__":
@@ -198,5 +273,6 @@ if __name__ == "__main__":
     ap.add_argument("out_dir")
     ap.add_argument("--voxel", type=float, default=0.02)
     ap.add_argument("--poses", help="poses.npz from optimize.py")
+    ap.add_argument("--consensus", action="store_true", help="experimental: drop points other frames saw straight through")
     a = ap.parse_args()
-    fuse(a.walk_dir, a.out_dir, a.voxel, a.poses)
+    fuse(a.walk_dir, a.out_dir, a.voxel, a.poses, a.consensus)
