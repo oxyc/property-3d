@@ -19,6 +19,8 @@
   "mesh_full_faces": 2424130,
   "photo": true,
   "photo_bytes": 17851776,
-  "photo_mobile_bytes": 14364068
+  "photo_mobile_bytes": 14364068,
+  "splat": true,
+  "splat_bytes": 23019264
  }
 ]

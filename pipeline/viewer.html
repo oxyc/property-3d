@@ -130,6 +130,7 @@
     <div id="status">Loading…</div>
     <div id="models" hidden></div>
     <div class="row">Display <div class="seg" id="displays"></div></div>
+    <p class="hint" id="splatRow" hidden><a id="splatLink" target="_blank" rel="noopener">Open the Gaussian splat view ↗</a> (experimental: photo-like but soft up close)</p>
     <div class="row">Quality <div class="seg" id="quality"></div></div>
     <small id="qualityHint"></small>
     <div class="row">Colour <div class="seg" id="colors"></div></div>
@@ -2548,6 +2549,8 @@ async function start() {
   const box = $("models"), want = new URLSearchParams(location.search).get("model");
   const select = (m) => {
     for (const b of box.children) b.setAttribute("aria-pressed", b.dataset.name === m.name);
+    $("splatRow").hidden = !m.splat;  // splat.html is its own page: Spark needs a newer three than this viewer
+    if (m.splat) $("splatLink").href = `models/${m.name}/splat.html`;
     open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p),
       { ...(m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {}), sunLoc: m.sun_location,
         ...(m.photo ? { photoUrl: `models/${m.name}/photo.glb`, photoBytes: m.photo_bytes, ...(m.photo_mobile_bytes ? { photoMobileUrl: `models/${m.name}/photo_mobile.glb`, photoMobileBytes: m.photo_mobile_bytes } : {}) } : {}),
