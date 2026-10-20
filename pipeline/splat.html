@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Splat Viewer</title>
+<style>
+  :root { color-scheme: light dark; --bg: #fff; --fg: #1d2127; --muted: #667085; --line: #d8dce2; --btn: #eef0f3; --accent: #1769e0; }
+  @media (prefers-color-scheme: dark) { :root { --bg: #1c1f24; --fg: #e6e8eb; --muted: #9aa3ad; --line: #343a42; --btn: #2a2f36; --accent: #5aa2ff; } }
+  html, body { margin: 0; height: 100%; background: #111; color: var(--fg); font: 13px/1.4 system-ui, sans-serif; overflow: hidden; }
+  canvas { position: absolute; inset: 0; display: block; touch-action: none; }
+  button, .btn { font: inherit; color: var(--fg); background: var(--btn); border: 1px solid var(--line); border-radius: 6px; padding: 5px 9px; cursor: pointer; }
+  button:hover, .btn:hover { border-color: var(--accent); }
+  button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #fff; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .card { background: var(--bg); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
+
+  #panel { position: absolute; top: 10px; left: 10px; width: min(300px, calc(100vw - 88px)); }
+  #toggle { display: flex; justify-content: space-between; width: 100%; border: 0; background: none; font-weight: 600; padding: 9px 12px; }
+  #panel.collapsed .body { display: none; }
+  #panel.collapsed .chev { transform: rotate(-90deg); }
+  .body { padding: 0 12px 12px; display: grid; gap: 9px; max-height: calc(100vh - 80px); overflow: auto; }
+  #status { color: var(--muted); }
+  label { display: flex; align-items: center; gap: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin: 0; }
+
+  #side { position: absolute; top: 10px; right: 10px; display: grid; gap: 6px; padding: 6px; }
+  #side button { width: 52px; padding: 8px 0; }
+
+  #loader { position: absolute; left: 50%; top: 45%; transform: translateX(-50%); width: min(340px, calc(100vw - 40px)); text-align: center; background: rgba(20,22,26,.9); color: #eee; border-radius: 10px; padding: 10px 14px; }
+  #loader .bar { height: 6px; background: #444; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  #loader .bar i { display: block; height: 100%; width: 0; background: #5aa2ff; }
+  #loader.err { background: #5a1f1f; }
+  [hidden] { display: none !important; }
+  #drop { position: absolute; inset: 0; display: none; align-items: center; justify-content: center; font-size: 20px; color: #fff; background: rgba(40,90,160,.45); pointer-events: none; }
+  body.dragging #drop { display: flex; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/",
+  "@sparkjsdev/spark": "https://cdn.jsdelivr.net/npm/@sparkjsdev/spark@2.2.0/dist/spark.module.js"
+} }
+</script>
+</head>
+<body>
+<div id="panel" class="card">
+  <button id="toggle" aria-expanded="true"><span>Splat viewer</span><span class="chev">▾</span></button>
+  <div class="body">
+    <div id="status">Loading…</div>
+    <label><input id="rotate" type="checkbox"> Slowly rotate</label>
+    <label class="btn" style="justify-content:center">Open splat file…<input id="file" type="file" accept=".splat,.ply,.spz,.ksplat" hidden></label>
+    <p class="hint">Drag to orbit, right-drag or Shift-drag to pan, wheel or pinch to zoom, double-click to pivot. Drop a .splat / .ply file on the page to view it locally — nothing is uploaded.</p>
+  </div>
+</div>
+<div id="side" class="card">
+  <button id="bHome" title="Perspective view (P)">3D</button>
+  <button id="bTop" title="Top view, north up (T)">Top</button>
+  <button id="bFit" title="Fit to splat (F)">Fit</button>
+</div>
+<div id="loader" hidden><div></div><div class="bar"><i></i></div></div>
+<div id="drop">Drop .splat to view</div>
+
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+
+// ?src=<url> (default scene.splat next to this page). World is ARKit's: X east, Y up, Z south (north = -Z), metres,
+// so the splat is shown as trained, with no re-orientation.
+const $ = (id) => document.getElementById(id);
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x111111);
+document.body.prepend(renderer.domElement);
+const scene = new THREE.Scene();
+scene.add(new SparkRenderer({ renderer }));
+const camera = new THREE.PerspectiveCamera(+new URLSearchParams(location.search).get("fov") || 60, 1, 0.05, 1000);  // ?fov= vertical degrees
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.screenSpacePanning = true;
+controls.zoomToCursor = true;
+controls.autoRotateSpeed = 0.6;
+
+function resize() {
+  renderer.setSize(innerWidth, innerHeight);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+}
+addEventListener("resize", resize);
+resize();
+
+const MB = (n) => (n / 1e6).toFixed(1);
+async function fetchBuffer(url, onProgress) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: HTTP ${r.status}`);
+  let total = +r.headers.get("content-length") || 0;
+  if (!r.body) return r.arrayBuffer();
+  const reader = r.body.getReader(), chunks = [];
+  for (let got = 0; ;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    got += value.length;
+    if (got > total) total = 0;  // content-encoding made the size unreliable
+    onProgress?.(got, total);
+  }
+  return new Blob(chunks).arrayBuffer();
+}
+
+function setLoader(text, got, total, err) {
+  const el = $("loader");
+  el.hidden = false;
+  el.classList.toggle("err", !!err);
+  el.firstElementChild.textContent = text + (got ? ` — ${MB(got)}${total ? ` / ${MB(total)}` : ""} MB` : "");
+  el.lastElementChild.hidden = !!err;
+  el.lastElementChild.firstElementChild.style.width = total ? `${(100 * got / total).toFixed(0)}%` : "0";
+  if (err) el.onclick = () => { el.hidden = true; };
+}
+
+// ---- Loading
+let mesh = null, token = 0, box = null, startView = parseHash();
+
+async function open(label, getBuffer, fileName) {
+  const my = ++token;
+  try {
+    setLoader(`Loading ${label}`);
+    const buf = await getBuffer((got, total) => my === token && setLoader(`Loading ${label}`, got, total));
+    if (my !== token) return;
+    setLoader(`Preparing ${label}`);
+    const next = new SplatMesh({ fileBytes: new Uint8Array(buf), fileName });
+    await next.initialized;
+    if (my !== token) return next.dispose();
+    if (mesh) { scene.remove(mesh); mesh.dispose(); }
+    mesh = next;
+    scene.add(mesh);
+    show(label, buf, fileName);
+    $("loader").hidden = true;
+  } catch (err) {
+    if (my !== token) return;
+    console.error(err);
+    const net = err instanceof TypeError || /HTTP/.test(err.message);
+    setLoader(net
+      ? `Could not load ${label}. If you opened this page as a file, serve the folder (python3 -m http.server) or drop the file onto the page. Click to dismiss.`
+      : `${label} could not be read as a splat file. Click to dismiss.`, 0, 0, true);
+  }
+}
+
+// Robust extent: 2nd..98th percentile of the splat centres per axis (floaters ignored). Only for .splat, whose
+// 32-byte records start with float32 xyz; other formats fall back to Spark's bounding box.
+function robustBox(buf, name) {
+  const n = Math.floor(buf.byteLength / 32), b = new THREE.Box3();
+  if (!/\.splat$/i.test(name) || !n) return mesh.getBoundingBox(true);
+  const f = new Float32Array(buf, 0, n * 8), step = Math.max(1, Math.floor(n / 100000));
+  const axes = [0, 1, 2].map((k) => {
+    const v = []; for (let i = 0; i < n; i += step) v.push(f[8 * i + k]);
+    v.sort((a, c) => a - c);
+    return [v[Math.floor(0.02 * (v.length - 1))], v[Math.floor(0.98 * (v.length - 1))]];
+  });
+  return b.set(new THREE.Vector3(axes[0][0], axes[1][0], axes[2][0]), new THREE.Vector3(axes[0][1], axes[1][1], axes[2][1]));
+}
+
+function show(label, buf, name) {
+  box = robustBox(buf, name);
+  const size = box.getSize(new THREE.Vector3());
+  $("status").textContent = `${label} · ${(mesh.numSplats / 1e6).toFixed(2)}M splats · ${MB(buf.byteLength)} MB · ${size.x.toFixed(1)} × ${size.z.toFixed(1)} m · ${size.y.toFixed(1)} m tall`;
+  const r = 0.5 * size.length();
+  camera.near = Math.max(0.02, r / 1000);
+  camera.far = r * 40;
+  camera.updateProjectionMatrix();
+  controls.maxDistance = r * 10;
+  if (startView) {
+    camera.position.fromArray(startView, 0);
+    controls.target.fromArray(startView, 3);
+    controls.update();
+  } else flyTo("home", 0);
+  startView = null;
+}
+
+// ---- Camera: views, smooth transitions, share link
+const fitRadius = (top) => {
+  const s = box.getSize(new THREE.Vector3()), t = Math.tan(camera.fov * Math.PI / 360), a = camera.aspect;
+  return top ? 1.05 * Math.max(s.z / 2 / t, s.x / 2 / (t * a)) + s.y / 2 : 0.45 * s.length() / Math.sin(Math.atan(t * Math.min(1, a)));
+};
+let anim = null;
+function flyTo(view, ms = 700) {
+  if (!box) return;
+  const c = box.getCenter(new THREE.Vector3());
+  const off = view === "top" ? new THREE.Vector3(0, fitRadius(true), 0.001)
+    : view === "home" ? new THREE.Vector3(0, 0.55, 0.8).normalize().multiplyScalar(fitRadius(false))
+    : camera.position.clone().sub(controls.target).setLength(fitRadius(false));
+  anim = { t0: performance.now(), ms, p0: camera.position.clone(), c0: controls.target.clone(), p1: c.clone().add(off), c1: c };
+  if (!ms) step();
+}
+function step() {
+  const { t0, ms, p0, c0, p1, c1 } = anim, k = ms ? Math.min(1, (performance.now() - t0) / ms) : 1;
+  const e = k < .5 ? 2 * k * k : 1 - 2 * (1 - k) ** 2;
+  camera.position.lerpVectors(p0, p1, e);
+  controls.target.lerpVectors(c0, c1, e);
+  controls.update();
+  if (k === 1) anim = null;
+}
+renderer.domElement.addEventListener("pointerdown", () => { anim = null; });
+renderer.domElement.addEventListener("wheel", () => { anim = null; }, { passive: true });
+$("bHome").onclick = () => flyTo("home");
+$("bTop").onclick = () => flyTo("top");
+$("bFit").onclick = () => flyTo("fit");
+
+function parseHash() {
+  const m = /cam=([-\d.,e]+)/.exec(location.hash), v = m && m[1].split(",").map(Number);
+  return v && v.length === 6 && v.every(Number.isFinite) ? v : null;
+}
+let hashTimer;
+controls.addEventListener("change", () => {
+  clearTimeout(hashTimer);
+  hashTimer = setTimeout(() => {
+    if (!box || localFile) return;
+    const c = camera.position, t = controls.target;
+    history.replaceState(null, "", `${location.pathname}${location.search}#cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`);
+  }, 400);
+});
+
+// Double-click: pivot about the splat under the cursor (Spark raycasts splats above a minimum opacity).
+const ray = new THREE.Raycaster();
+renderer.domElement.addEventListener("dblclick", (e) => {
+  if (!mesh) return;
+  ray.setFromCamera(new THREE.Vector2(e.clientX / innerWidth * 2 - 1, -(e.clientY / innerHeight * 2 - 1)), camera);
+  const hit = ray.intersectObject(mesh)[0];
+  if (hit) { controls.target.copy(hit.point); controls.update(); }
+});
+
+renderer.setAnimationLoop(() => {
+  if (anim) step(); else controls.update();
+  controls.autoRotate = $("rotate").checked;
+  renderer.render(scene, camera);
+});
+
+// ---- UI wiring
+$("toggle").onclick = () => {
+  const c = $("panel").classList.toggle("collapsed");
+  $("toggle").setAttribute("aria-expanded", !c);
+};
+if (matchMedia("(max-width: 600px)").matches) $("toggle").click();
+addEventListener("keydown", (e) => {
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  ({ t: () => flyTo("top"), p: () => flyTo("home"), f: () => flyTo("fit") }[e.key.toLowerCase()])?.();
+});
+
+let localFile = false;
+const openFile = (file) => {
+  if (!file) return;
+  localFile = true;
+  open(file.name, async () => file.arrayBuffer(), file.name);
+};
+$("file").onchange = (e) => openFile(e.target.files[0]);
+addEventListener("dragover", (e) => { e.preventDefault(); document.body.classList.add("dragging"); });
+addEventListener("dragleave", () => document.body.classList.remove("dragging"));
+addEventListener("drop", (e) => {
+  e.preventDefault();
+  document.body.classList.remove("dragging");
+  openFile(e.dataTransfer.files[0]);
+});
+
+const src = new URLSearchParams(location.search).get("src") || "scene.splat";
+open(src.split("/").pop(), (p) => fetchBuffer(src, p), src);
+</script>
+</body>
+</html>

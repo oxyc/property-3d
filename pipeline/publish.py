@@ -173,6 +173,16 @@ for src_name, dst_name, key in (("model.glb", "photo.glb", "photo_bytes"), ("mod
     entry |= {"photo": True, key: src.stat().st_size}
     print(f"{dst_name}: {src.stat().st_size / 1e6:.1f} MB")
 
+# Gaussian splat from splat.py: its own page (Spark needs a newer three than viewer.html), next to scene.splat.
+for f in ("scene.splat", "splat.html"):
+    (dest / f).unlink(missing_ok=True)
+splat = Path(a.out_dir) / "splat" / "scene.splat"
+if splat.exists() and splat.stat().st_size <= FULL_LIMIT:
+    shutil.copy(splat, dest / "scene.splat")
+    shutil.copy(HERE / "splat.html", dest / "splat.html")
+    entry |= {"splat": True, "splat_bytes": splat.stat().st_size}
+    print(f"scene.splat: {splat.stat().st_size / 1e6:.1f} MB")
+
 index_path = site / "models" / "index.json"
 index = json.loads(index_path.read_text()) if index_path.exists() else []
 index = [m for m in index if m["name"] != a.name] + [entry]
