@@ -226,7 +226,71 @@ def test_merge():
             assert np.allclose(w["translation_m"], w["gps_translation_m"]) and w["yaw_deg"] == 0.0
 
 
+GHOST = (0.2, -2.6, (0.3, 0.3, 0.3), 0.3)  # a box (a bag, a dog): cx, cz, half extents, yaw; only there during the first pass
+# (low, so that the ground behind it is within the 5 m sensor range from where it is seen: free space can only be
+# confirmed where the camera sees something farther away)
+POLE = (-1.2, -2.2, 0.015, 2.0)  # cx, cz, radius, height: a 3 cm pole, there all the time
+
+
+def ghost_sdf(p):
+    return synth._box_sdf(p, *GHOST)
+
+
+def test_consensus():
+    """Three passes over the same scene. In the first only, a box (a bag left and removed) stands in the scene, and in every
+    frame extra flying pixels appear. The consensus filter must remove most of that, keep the real scene (including a
+    3 cm pole seen from many sides) and not make the reconstruction worse. Three passes because with two, one saying
+    "there" and one saying "not there" is a tie nothing can settle."""
+    orig = (synth.simulate_depth, synth.scene_sdf, list(synth.CYLINDERS), list(synth.ALBEDO))
+    try:
+        synth.CYLINDERS.append(POLE)
+        synth.ALBEDO.append((200, 200, 200))
+        with_pole = synth.scene_sdf
+        calls = [0]
+
+        def simulate_depth(rng, R, pos):
+            first_pass = calls[0] < 220  # a loop is 217 frames
+            calls[0] += 1
+            synth.scene_sdf = (lambda p: np.minimum(with_pole(p), ghost_sdf(p))) if first_pass else with_pole
+            return orig[0](rng, R, pos)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            walk = tmp / "walk"
+            synth.simulate_depth = simulate_depth
+            synth.generate(walk, 660)
+            synth.simulate_depth, synth.scene_sdf = orig[0], with_pole
+
+            rng = np.random.default_rng(5)  # extra flying pixels, confidence 1, in every frame
+            for i in range(660):
+                depth, conf = fuse.read_depth(walk, json.loads((walk / "meta.json").read_text()), i)
+                fly = rng.random(depth.shape) < 0.003
+                depth[fly], conf[fly] = rng.uniform(0.5, 4.0, fly.sum()), 1
+                depth.astype("<f2").tofile(walk / "depth" / f"{i:06d}.bin")
+                conf.tofile(walk / "conf" / f"{i:06d}.bin")
+
+            res = {}
+            for name, on in (("off", False), ("on", True)):
+                fuse.fuse(walk, tmp / name, consensus=on)
+                p = np.asarray(o3d.io.read_point_cloud(str(tmp / name / "points.ply")).points)
+                scene, ghost = np.abs(synth.scene_sdf(p)), ghost_sdf(p)
+                res[name] = {"all": scene, "true": (scene < 0.03).sum(), "ghost": ((ghost < 0.04) & (scene > 0.08)).sum(),
+                             "pole": (np.abs(synth._cyl_sdf(p, *POLE)) < 0.02).sum(), "floaters": ((scene > 0.1) & (ghost > 0.1)).sum()}
+            off, on = res["off"], res["on"]
+            print(f"consensus: ghost box points {off['ghost']} -> {on['ghost']}, floating points {off['floaters']} -> {on['floaters']}, "
+                  f"true-surface points {off['true']} -> {on['true']} ({on['true'] / off['true']:.1%} kept), pole points {off['pole']} -> {on['pole']}")
+            print(f"consensus: |dist to scene| median/p90 {pct(off['all'], 50) * 100:.2f}/{pct(off['all'], 90) * 100:.2f} cm -> "
+                  f"{pct(on['all'], 50) * 100:.2f}/{pct(on['all'], 90) * 100:.2f} cm")
+            assert off["ghost"] > 500 and off["pole"] > 100 and off["floaters"] > 1000  # the test is meaningful
+            assert on["ghost"] <= 0.1 * off["ghost"] and on["floaters"] <= 0.15 * off["floaters"]  # floaters: some only have judges within one pass
+            assert on["true"] >= 0.98 * off["true"] and on["pole"] >= 0.9 * off["pole"]
+            assert pct(on["all"], 50) <= pct(off["all"], 50) and pct(on["all"], 90) <= pct(off["all"], 90)
+    finally:
+        synth.simulate_depth, synth.scene_sdf = orig[0], orig[1]
+        synth.CYLINDERS[:], synth.ALBEDO[:] = orig[2], orig[3]
+
+
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_consensus"]:  # optionally just some of them
         globals()[test]()
     print("OK")
