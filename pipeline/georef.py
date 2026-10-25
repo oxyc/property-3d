@@ -21,6 +21,7 @@ Writes to out_dir:
 """
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -29,17 +30,23 @@ import rasterio
 from pyproj import Transformer
 from rasterio.transform import from_origin
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I drops the script dir from sys.path
+import fuse  # noqa: E402
+
 CRS = "EPSG:5382"
 
 
 def gps_offsets(walk, poses=None):
     """Per GPS fix: (E - X, N + Z, alt - Y, h_acc, v_acc) with the ARKit position X, Y, Z interpolated to the fix."""
     walk = Path(walk)
-    frames = [json.loads(l) for l in (walk / "frames.jsonl").read_text().splitlines() if l]
+    _, frames = fuse.read_walk(walk)  # same frame list (and order) as optimize.py's poses
     ft = np.array([f["t"] for f in frames])
     xyz = np.array([f["transform"][12:15] for f in frames])  # column-major: last column = translation
-    if poses is not None:  # optimize.py output, same frame order: the fused points use these positions
-        xyz = np.load(poses)["T"][:, :3, 3]
+    if poses is not None:  # optimize.py output: the fused points use these positions, for the frames it lists
+        z = np.load(poses)
+        at = dict(zip(z["i"].tolist(), z["T"][:, :3, 3]))
+        keep = [k for k, f in enumerate(frames) if f["i"] in at]
+        ft, xyz = ft[keep], np.array([at[frames[k]["i"]] for k in keep])
     gps = [json.loads(l) for l in (walk / "gps.jsonl").read_text().splitlines() if l]
     gps = [g for g in gps if ft[0] <= g["t"] <= ft[-1]]
 

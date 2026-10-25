@@ -226,6 +226,107 @@ def test_merge():
             assert np.allclose(w["translation_m"], w["gps_translation_m"]) and w["yaw_deg"] == 0.0
 
 
+def slide_walk(drift_walk, dst, start=200, length=100):
+    """The drifted walk with a bad-tracking stretch injected into the recorded poses (depth is untouched): for `length`
+    frames from `start` the pose slides away with steps growing from 0.3 to 0.9 m per frame (3-9 m/s, ~60 m in all) while
+    turning up to 32 degrees, then relocalises, i.e. snaps back to where the recorded walk was."""
+    dst.mkdir()
+    for sub in ("depth", "conf", "rgb"):
+        (dst / sub).symlink_to(drift_walk / sub)
+    for name in ("meta.json", "gps.jsonl", "truth.json"):
+        (dst / name).write_text((drift_walk / name).read_text())
+    frames = [json.loads(l) for l in (drift_walk / "frames.jsonl").read_text().splitlines()]
+    away = np.array([0.8, 0.0, 0.6])
+    for k in range(length):
+        d = sum(0.3 + 0.6 * j / length for j in range(k + 1))
+        a = np.radians(32.0) * k / length
+        M = np.array(frames[start + k]["transform"]).reshape(4, 4, order="F")
+        M[:3, :3], M[:3, 3] = optimize.rot_y(a) @ M[:3, :3], optimize.rot_y(a) @ M[:3, 3] + d * away
+        frames[start + k]["transform"] = M.flatten(order="F").tolist()
+    (dst / "frames.jsonl").write_text("".join(json.dumps(f) + "\n" for f in frames))
+    return dst
+
+
+def test_slide():
+    """A drifted two-loop walk with a ~10 s slide in the middle (see slide_walk). The bad stretch must be found and cut
+    out, the two clean segments registered to each other, and the result be far better than the uncorrected drift (and
+    free of the slide): camera positions and the surface they reconstruct."""
+    quiet = lambda *_: None  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        walk = tmp / "drift"
+        synth.generate(walk, 440, drift=True)
+        slid = slide_walk(walk, tmp / "slid")
+        recorded = np.array([json.loads(l)["transform"][12:15] for l in (slid / "frames.jsonl").read_text().splitlines()])
+        raw_step = float(np.linalg.norm(np.diff(recorded, axis=0), axis=1).max())
+
+        stats = merge.merge(tmp / "m", [slid], 40, log=quiet)
+        plan = stats["input_walks"][0]
+        (cut,) = plan["removed_intervals"]
+        segs = stats["walks"]
+        true = np.array(json.loads((walk / "truth.json").read_text())["true_transforms"])[:, 12:15]
+        ids, got = [], []
+        for k in range(len(segs)):
+            z = np.load(tmp / "m" / f"walk{k}" / "poses_merged.npz")
+            ids += z["i"].tolist()
+            got.append(z["T"][:, :3, 3])
+            assert max(np.linalg.norm(np.diff(z["T"][:, :3, 3], axis=0), axis=1)) < 0.3  # no slide, no jump left
+        ids, got = np.array(ids), np.vstack(got)
+        err = np.linalg.norm(got - true[ids], axis=1)
+        pts = np.asarray(o3d.io.read_point_cloud(str(tmp / "m" / "points.ply")).points)
+        d = np.abs(synth.scene_sdf(pts))
+        print(f"slide:  recorded max step {raw_step:.1f} m; removed t={cut['t0']:.1f}-{cut['t1']:.1f} s ({cut['seconds']:.1f} s: "
+              f"{', '.join(cut['reasons'])}); injected at t=20.0-30.0 s")
+        print(f"slide:  segments kept {[(round(s['t0']), round(s['t1'])) for s in plan['segments_kept']]} s, "
+              f"{[w['method'] for w in segs]}, {len(ids)} of 440 frames used")
+        print(f"slide:  camera position error mean/max {err.mean() * 100:.1f}/{err.max() * 100:.1f} cm, |dist to scene| "
+              f"median/p90 {pct(d, 50) * 100:.2f}/{pct(d, 90) * 100:.2f} cm")
+        print("slide:  for reference, the same walk without the slide: raw drift 36/74 cm and 14.2/26.3 cm, optimised 6/9 cm and 2.70/5.53 cm. "
+              "Cutting out 12 s costs the loop closure with the start (the walk's only absolute anchor), so what is left of the drift is "
+              "corrected relative to the segments, not to the truth: better than uncorrected, not as good as the whole walk")
+        assert raw_step > 0.5 and len(plan["removed_intervals"]) == 1
+        assert 17 < cut["t0"] < 21 and 30 < cut["t1"] < 33 and "sustained speed" in cut["reasons"]
+        assert len(plan["segments_kept"]) == 2 and all(w["method"] in ("reference", "registered") for w in segs)
+        assert not stats["warnings"] and not stats["excluded"]
+        assert not (set(ids) & set(range(205, 296)))  # nothing from inside the slide is fused
+        assert err.mean() < 0.3 and err.max() < 0.5  # uncorrected: 0.36 / 0.74 m, and tens of metres with the slide in
+        assert pct(d, 50) < 0.10 and pct(d, 90) < 0.16  # uncorrected: 14.2 / 26.3 cm
+
+
+def test_jobs():
+    """--jobs only changes how long things take: fusing with worker threads and a mesh process, and merging with the
+    walks optimised in parallel worker processes, must give exactly the serial result."""
+    quiet = lambda *_: None  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = tmp / "a", tmp / "b"
+        synth.generate(a, 240, seed=0)
+        synth.generate(b, 240, seed=1, phase=2.0, yaw_deg=4.0)
+
+        for jobs in (1, 3):
+            fuse.fuse(a, tmp / f"f{jobs}", jobs=jobs)
+            merge.merge(tmp / f"m{jobs}", [a, b], 40, log=quiet, jobs=jobs)
+        # fuse: exactly the same. merge: Open3D's multi-threaded ICP sums in a different order with a different thread
+        # count (and from run to run), so the poses agree to a fraction of a millimetre rather than bit for bit
+        for name in ("f", "m"):
+            p1, p3 = (o3d.io.read_point_cloud(str(tmp / f"{name}{j}" / "points.ply")) for j in (1, 3))
+            m1, m3 = (o3d.io.read_triangle_mesh(str(tmp / f"{name}{j}" / "mesh.ply")) for j in (1, 3))
+            n1, n3 = len(p1.points), len(p3.points)
+            if n1 == n3:
+                dp = float(np.abs(np.asarray(p1.points) - np.asarray(p3.points)).max())
+                dc = float((np.abs(np.asarray(p1.colors) - np.asarray(p3.colors)).max(1) > 1e-3).mean())  # a near-tie flips a keyframe
+            else:
+                dp = dc = float("inf")
+            print(f"jobs:   {'fuse' if name == 'f' else 'merge'} jobs=1 vs jobs=3: {n1} / {n3} points, {len(m1.triangles)} / {len(m3.triangles)} triangles, "
+                  f"largest point difference {dp:.2e} m, share of points with another colour {dc:.4%}")
+            assert n1 == n3 and len(m1.triangles) == len(m3.triangles) and dp <= (0 if name == "f" else 1e-3) and dc <= (0 if name == "f" else 1e-3)
+        for k in (0, 1):
+            t1, t3 = (np.load(tmp / f"m{j}" / f"walk{k}" / "poses_merged.npz")["T"] for j in (1, 3))
+            d = float(np.abs(t1 - t3).max())
+            print(f"jobs:   walk {k} merged poses differ by at most {d:.2e}")
+            assert d < 1e-3
+
+
 GHOST = (0.2, -2.6, (0.3, 0.3, 0.3), 0.3)  # a box (a bag, a dog): cx, cz, half extents, yaw; only there during the first pass
 # (low, so that the ground behind it is within the 5 m sensor range from where it is seen: free space can only be
 # confirmed where the camera sees something farther away)
@@ -291,6 +392,6 @@ def test_consensus():
 
 
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_consensus"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_jobs", "test_consensus"]:  # optionally just some of them
         globals()[test]()
     print("OK")

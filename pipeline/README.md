@@ -3,12 +3,19 @@
 ## Normal use
 
 ```
-# 1. Pull a walk off the phone (cable or Wi-Fi; no AirDrop needed). Find <device-id> with
+# 1a. Pull a walk off the phone over Wi-Fi (fast, resumable, no zip, no extra space on the phone):
+#     in the app open Walks > (...) > Send to Mac, then run the command it shows, e.g.
+python3 pull.py http://192.168.1.23:51234            # -> ../walks/<walk_name>, verified; add --tar for one streamed tar
+#     The app then offers "Delete from phone". Re-run the same command to resume after a dropped connection.
+
+# 1b. Or by cable with devicectl (slow over Wi-Fi with 50k small files). Find <device-id> with
 #    `xcrun devicectl list devices`, then list walks:
 xcrun devicectl device info files --device <device-id> --domain-type appDataContainer --domain-identifier fi.genero.walkscan --subdirectory Documents
 xcrun devicectl device copy from --device <device-id> --domain-type appDataContainer --domain-identifier fi.genero.walkscan --source Documents/<walk_name> --destination ../walks/<walk_name>
 
 # 2. Walk folder (or an AirDropped .zip) -> point cloud, mesh, ground grid, georef, previews, viewer
+#    (process.py, merge.py, optimize.py and fuse.py take --jobs N, default 3: caps Open3D's threads and runs the
+#    mesh, colouring and per-walk work in parallel; the results are identical for any N. See cores.py.)
 uv run python process.py ../walks/<walk_name>
 
 # 3. Look at it in 3D

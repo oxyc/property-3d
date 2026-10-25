@@ -1,9 +1,19 @@
 """Merge several walks into one model in the first walk's frame.
 
-usage: merge.py <out_dir> <walk_dir> <walk_dir> [...]
+usage: merge.py <out_dir> <walk_dir> [<walk_dir> ...] [--jobs 3]
 
-Every walk is optimised on its own first (optimize.py: snaps, drift loops). Then, in order, each walk is
-registered to the union of the walks before it:
+Bad tracking is cut out first (optimize.find_failures: ARKit sliding for seconds then relocalising, jumps too
+big to ramp, long tracking loss; each padded by a second). A walk with such stretches is split into its clean
+segments (pieces under 10 s or 5 m dropped), and every segment is handled below as a walk of its own, so one
+walk merged with itself is just this: split, register the pieces to each other, joint graph. A segment that
+cannot be registered (typically: it walked a different part of the plot, so there is nothing to match) is placed in
+the frame of its neighbouring segment if ARKit's pose is continuous across the cut (the world survives a tracking
+failure: 2.8 m and 5.9 m in 7 and 16 s on the first real walks), and is flagged as unverified; if it is not
+continuous either it is excluded from the model, since a GPS placement alone (+-3 m) would double what it overlaps.
+Both are reported in merge.json. A whole walk that fails keeps its GPS placement as before.
+
+Every walk (or segment) is optimised on its own (optimize.py: snaps, drift loops). Then, in order, each is
+registered to the union of the ones before it (a failed one is retried once others have been added):
   1. initial guess from GPS (translation only, yaw 0: each walk's frame is gravity and compass aligned);
   2. coarse search for yaw (+-20 deg) and translation (+-12 m) by FFT cross-correlation of top-down "structure"
      rasters (vertical extent per 25 cm cell, so bare slopes do not vote), then the best candidates are ranked by a
@@ -27,11 +37,16 @@ import sys
 import time
 from pathlib import Path
 
-import numpy as np
-import open3d as o3d
-
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # python -I drops the script dir from sys.path
+
+import cores  # noqa: E402
+
+if __name__ == "__main__":
+    cores.setup()  # caps the threads Open3D uses; must happen before it is imported
+
+import numpy as np  # noqa: E402
+import open3d as o3d  # noqa: E402
 
 import fuse  # noqa: E402
 import georef  # noqa: E402
@@ -49,6 +64,7 @@ MIN_WALK_RATIO = 0.3  # inliers / points with a neighbour within NEAR_DIST (whol
 MAX_WALK_RMSE = 0.07  # of the inliers (< 10 cm); looser than for fragments: a whole walk carries residual drift
 MAX_GPS_ERR = 15.0  # the registered placement may not be further than this from the GPS one (m)
 OVERLAP_DIST = 0.3
+CONTINUITY_SPEED, CONTINUITY_MARGIN = 2.0, 3.0 # m/s and m: how far the camera may be across a cut and still count as continuous
 
 
 def make_G(yaw, t):
@@ -194,6 +210,7 @@ def fragment_data(walk, poses, frag_frames):
     meta, frames = fuse.read_walk(walk)
     z = np.load(poses)
     corrected = dict(zip(z["i"].tolist(), z["T"]))
+    frames = [f for f in frames if f["i"] in corrected]  # a segment's poses list only its own frames
     for f in frames:
         f["T"] = corrected[f["i"]]
     groups = optimize.fragment_groups(frames, frag_frames)
@@ -203,6 +220,23 @@ def fragment_data(walk, poses, frag_frames):
     walked = np.concatenate([[0], np.cumsum([np.linalg.norm(mid[k + 1] - mid[k]) for k in range(len(mid) - 1)])])
     return {"frames": frames, "groups": groups, "clouds": clouds, "cams": cams, "walked": walked,
             "cen": [np.asarray(c.points).mean(0) for c in clouds]}
+
+
+def cloud_of(points, normals):
+    pcd = o3d.geometry.PointCloud()
+    pcd.points, pcd.normals = o3d.utility.Vector3dVector(points), o3d.utility.Vector3dVector(normals)
+    return pcd
+
+
+def unit_job(args):
+    """Worker: optimise one unit on its own, then build its fragments from the result. Returns (log lines, fragment
+    data with each cloud as a (points, normals) pair: Open3D clouds cannot be pickled)."""
+    walk, out, frag_frames, ids = args
+    lines = []
+    optimize.optimize(walk, out, frag_frames, log=lines.append, frame_ids=ids)
+    d = fragment_data(walk, Path(out) / "poses.npz", frag_frames)
+    d["clouds"] = [(np.asarray(c.points), np.asarray(c.normals)) for c in d["clouds"]]
+    return lines, d
 
 
 def consistency(data, transforms, k, earlier):
@@ -216,46 +250,137 @@ def consistency(data, transforms, k, earlier):
             "within_10cm_of_overlap": float((d[near] < INLIER_DIST).mean()) if near.any() else None}
 
 
-def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print):
-    t0 = time.time()
-    out, walks = Path(out), [Path(w) for w in walks]
-    out.mkdir(parents=True, exist_ok=True)
-    n = len(walks)
-    warnings = []
+def continuity(k, anchored, units, data):
+    """(sibling, distance, gap) if unit k, a segment of a split walk, can be placed in the frame of an adjacent placed
+    segment of the same walk: the camera pose just before / after the cut is within what walking covers in the gap
+    (ARKit relocalises into the same world, so the frame survives a tracking failure). None otherwise."""
+    for s in (k - 1, k + 1):
+        if s in anchored and 0 <= s < len(units) and units[s]["split"] and units[s]["walk"] == units[k]["walk"]:
+            a, b = (data[s]["frames"], data[k]["frames"]) if s < k else (data[k]["frames"], data[s]["frames"])
+            gap = b[0]["t"] - a[-1]["t"]
+            dist = float(np.linalg.norm(b[0]["T"][:3, 3] - a[-1]["T"][:3, 3]))
+            if dist <= CONTINUITY_SPEED * gap + CONTINUITY_MARGIN:
+                return s, dist, float(gap)
+    return None
 
-    for k, w in enumerate(walks):
-        log(f"walk {k}: optimising on its own")
-        optimize.optimize(w, out / f"walk{k}", frag_frames, log=lambda s, k=k: log(f"  [{k}] {s}"))
+
+def split_inputs(walks, log):
+    """What gets merged: each walk whole, or, if it has bad-tracking stretches (optimize.find_failures), its clean
+    segments, each handled as a walk of its own. Returns (units, plans): units [{walk, ids (None = whole walk),
+    split, segment, label, info}], plans = per input walk report."""
+    units, plans = [], []
+    for w in walks:
+        _, frames = fuse.read_walk(w)
+        segments, removed, dropped = optimize.split_walk(frames)
+        strip = lambda d: {k: v for k, v in d.items() if k != "ids"}  # noqa: E731
+        plan = {"walk": w.name, "frames": len(frames), "removed_intervals": removed,
+                "removed_seconds": float(sum(r["seconds"] for r in removed)),
+                "segments_kept": [strip(s) for s in segments], "segments_dropped": [strip(s) for s in dropped]}
+        for r in removed:
+            log(f"{w.name}: bad tracking removed t={r['t0']:.1f}-{r['t1']:.1f} s ({r['seconds']:.1f} s; {', '.join(r['reasons'])}; "
+                f"largest step {r['max_step_m']:.2f} m)")
+        for s in dropped:
+            log(f"{w.name}: dropped piece t={s['t0']:.1f}-{s['t1']:.1f} s: {s['why']}")
+        for s, seg in enumerate(segments):
+            split = bool(removed)
+            label = f"{w.name} segment {s} (t={seg['t0']:.0f}-{seg['t1']:.0f} s)" if split else w.name
+            units.append({"walk": w, "ids": seg["ids"] if split else None, "split": split, "segment": s, "label": label})
+        if not segments:
+            log(f"WARNING: {w.name} has no clean stretch left, left out")
+        plans.append(plan)
+    return units, plans
+
+
+def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
+    t0 = time.time()
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    warnings = []
+    units, plans = split_inputs([Path(w) for w in walks], log)
+    walks = [u["walk"] for u in units]  # one entry per unit: the same walk appears once per clean segment
+    n = len(units)
+    if not n:
+        raise SystemExit("no walk has a clean stretch of tracking left to merge")
+
+    # every unit is optimised on its own and its fragments built: independent, so one worker process each
+    done = cores.pmap(unit_job, [(u["walk"], out / f"walk{k}", frag_frames, u["ids"]) for k, u in enumerate(units)], jobs)
+    for k, (u, (lines, _)) in enumerate(zip(units, done)):
+        log(f"walk {k}: optimising on its own" if not u["split"] else f"walk {k}: optimising {u['label']} on its own")
+        for line in lines:
+            log(f"  [{k}] {line}")
     own = [out / f"walk{k}" / "poses.npz" for k in range(n)]
 
     fits = [georef.fit_translation(w, p) for w, p in zip(walks, own)]  # (E0, N0, dz, ...) per walk
     gps_t = [np.array([f[0] - fits[0][0], f[2] - fits[0][2], -(f[1] - fits[0][1])]) for f in fits]  # walk k -> walk 0
-    data = [fragment_data(w, p, frag_frames) for w, p in zip(walks, own)]
+    data = []
+    for _, d in done:
+        d["clouds"] = [cloud_of(p, nrm) for p, nrm in d["clouds"]]
+        data.append(d)
     log(f"fragments: {[len(d['clouds']) for d in data]} ({time.time() - t0:.0f} s)")
 
     # ---- walk-level registration
     G = [np.eye(4)] + [make_G(0, t) for t in gps_t[1:]]
     G_gps = [g.copy() for g in G]
     reports = [{"method": "reference"}] + [{} for _ in range(n - 1)]
-    registered = [0]
+    registered, excluded, anchored = [0], set(), {0}  # anchored: registered or placed some other way (GPS, continuity)
     ref = join(data[0]["clouds"])
-    for k in range(1, n):
-        log(f"walk {k}: registering to walk(s) {registered}")
-        src = join(data[k]["clouds"])
-        T, rep = register_walk(src, ref, gps_t[k], log)
-        if T is None:
-            msg = f"walk {k} could not be registered ({rep.get('why') or rep['attempt']['why']}): kept its GPS placement (~1-5 m, yaw 0), left out of the joint graph"
-            warnings.append(msg)
-            reports[k] = {"method": "gps_fallback", **rep, "warnings": [msg]}
-            log("WARNING: " + msg)
-            continue
-        G[k] = T
-        reports[k] = {"method": "registered", **rep}
-        registered.append(k)
-        ref = join([ref, place(src, T)])
-        q = rep["registration"]
-        log(f"  registered: yaw {q['yaw_deg']:+.2f} deg, {q['gps_error_m']:.2f} m from GPS, ratio {q['ratio']:.2f}, "
-            f"rmse {q['rmse'] * 100:.1f} cm, overlap {q['overlap']:.2f} ({time.time() - t0:.0f} s)")
+    pending, attempts = list(range(1, n)), {}
+    while pending:  # a unit that fails is retried once something else got registered (the reference has grown)
+        progressed, still = False, []
+        for k in pending:
+            log(f"walk {k}: registering to walk(s) {registered}")
+            src = join(data[k]["clouds"])
+            guesses = [("GPS", gps_t[k])]
+            siblings = [s for s in registered if units[k]["split"] and units[s]["walk"] == units[k]["walk"]]
+            if siblings:  # same walk, same ARKit world after relocalising: its frame is the better first guess than GPS
+                guesses.insert(0, ("sibling segment's placement", G[siblings[-1]][:3, 3].copy()))
+            attempts[k] = []
+            for name, tg in guesses:
+                T, rep = register_walk(src, ref, tg, log)
+                attempts[k].append({"initial_guess": name, **rep})
+                if T is not None:
+                    break
+            if T is None:
+                still.append(k)
+                continue
+            G[k] = T
+            reports[k] = {"method": "registered", "initial_guess": name, **rep}
+            registered.append(k)
+            anchored.add(k)
+            progressed = True
+            ref = join([ref, place(src, T)])
+            q = rep["registration"]
+            log(f"  registered ({name}): yaw {q['yaw_deg']:+.2f} deg, {q['gps_error_m']:.2f} m from GPS, ratio {q['ratio']:.2f}, "
+                f"rmse {q['rmse'] * 100:.1f} cm, overlap {q['overlap']:.2f} ({time.time() - t0:.0f} s)")
+        pending = still if progressed else []
+        if not progressed:
+            for k in still:
+                last = attempts[k][-1]
+                why = last.get("why") or last["attempt"]["why"]
+                cont = continuity(k, anchored, units, data) if units[k]["split"] else None
+                if cont:  # no overlap to register on, but the walk's own frame survived the cut: place it there, unverified
+                    s, dist, gap = cont
+                    G[k] = G[s].copy()
+                    anchored.add(k)
+                    if s in registered:  # a GPS-placed sibling keeps its pieces out of the joint graph with it
+                        registered.append(k)
+                    msg = (f"{units[k]['label']} could not be registered ({why}); placed in the frame of {units[s]['label']} "
+                           f"instead: ARKit's pose is continuous across the cut ({dist:.1f} m in {gap:.1f} s), not verified geometrically"
+                           + ("" if s in registered else " (that segment itself keeps its GPS placement)"))
+                    reports[k] = {"method": "continuity_placement", "sibling": s, "continuity_distance_m": dist, "gap_s": gap,
+                                  "attempts": attempts[k], "warnings": [msg]}
+                elif units[k]["split"] and any(units[s]["walk"] == units[k]["walk"] for s in anchored):
+                    # another piece of this walk is placed but this one is not continuous with it: GPS alone could double what it overlaps
+                    msg = f"{units[k]['label']} could not be registered ({why}) and is not continuous with its neighbours: excluded from the model"
+                    excluded.add(k)
+                    reports[k] = {"method": "excluded", "attempts": attempts[k], "warnings": [msg]}
+                else:  # a whole walk, or the first piece of a split one to be placed: its GPS placement, as ever
+                    anchored.add(k)
+                    msg = (f"{units[k]['label'] if units[k]['split'] else f'walk {k}'} could not be registered ({why}): "
+                           f"kept its GPS placement (~1-5 m, yaw 0), left out of the joint graph")
+                    reports[k] = {"method": "gps_fallback", **last, "warnings": [msg]}
+                warnings.append(msg)
+                log("WARNING: " + msg)
 
     # ---- joint pose graph over the registered walks' fragments
     nodes = [(k, f) for k in registered for f in range(len(data[k]["clouds"]))]
@@ -361,7 +486,8 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print):
             "joint_graph": consistency(data, C, k, [w for w in registered if w < k])}
     for k in range(n):
         reports[k].update({
-            "walk": walks[k].name,
+            "walk": walks[k].name, "unit": units[k]["label"], "segment": units[k]["segment"] if units[k]["split"] else None,
+            "frames": len(data[k]["frames"]), "seconds": data[k]["frames"][-1]["t"] - data[k]["frames"][0]["t"],
             "yaw_deg": float(np.degrees(yaw_of(G[k][:3, :3]))), "translation_m": G[k][:3, 3].tolist(),
             "gps_translation_m": gps_t[k].tolist(),
             "joint_graph_deviation_from_rigid": {
@@ -369,13 +495,15 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print):
                 "max_yaw_deg": float(max(abs(np.degrees(yaw_of((np.linalg.inv(G[k]) @ c)[:3, :3]))) for c in C[k]))}})
 
     stats = {"frame": "walk 0's ARKit frame; transforms map each walk's own frame into it (yaw about +Y, then translation)",
-             "walks": reports, "inter_walk_loops": loops, "rejected_loops": rejected, "candidates": len(candidates),
+             "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
+             "inter_walk_loops": loops, "rejected_loops": rejected, "candidates": len(candidates),
              "kept_loops": sum(lp["kept"] for lp in loops), "pruned_loops": sum(not lp["kept"] for lp in loops),
              "warnings": warnings}
     log(f"{stats['kept_loops']}/{len(loops)} inter-walk loops kept after pruning ({time.time() - t0:.0f} s)")
 
-    fuse.fuse_many(list(zip(walks, merged)), out)
-    georef.georef(out, walks, merged)
+    used = [k for k in range(n) if k not in excluded]
+    fuse.fuse_many([(walks[k], merged[k]) for k in used], out, jobs=jobs)
+    georef.georef(out, [walks[k] for k in used], [merged[k] for k in used])
     subprocess.run([sys.executable, "-I", str(HERE / "preview.py"), str(out)], check=True)
     shutil.copy(HERE / "viewer.html", out / "viewer.html")
     stats["seconds"] = round(time.time() - t0, 1)
@@ -387,10 +515,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("out_dir")
     ap.add_argument("walk_dirs", nargs="+")
+    ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores to use (default %(default)s)")
     a = ap.parse_args()
-    if len(a.walk_dirs) < 2:
-        ap.error("need at least two walks")
-    s = merge(a.out_dir, a.walk_dirs)
+    s = merge(a.out_dir, a.walk_dirs, jobs=a.jobs)
     print(f"\nDone: {a.out_dir}")
     for w in s["warnings"]:
         print("WARNING:", w, file=sys.stderr)

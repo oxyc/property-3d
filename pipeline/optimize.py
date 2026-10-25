@@ -1,6 +1,6 @@
 """Correct ARKit drift with a fragment pose graph.
 
-usage: optimize.py <walk_dir> <out_dir>
+usage: optimize.py <walk_dir> <out_dir> [--jobs 3]
 
 Stage 1 removes ARKit relocalisation snaps (single-frame pose jumps faster than 3 m/s): the
 poses after a snap are the trustworthy ones, so the jump is ramped in linearly over the frames
@@ -16,19 +16,26 @@ tilt), both for loop edges and for the final per-fragment result.
 
 Writes to out_dir:
   poses.npz      i[N], T[N,4,4]: corrected camera-to-world for every frame in frames.jsonl order
-                 (the fragment corrections interpolated between fragment centres)
+                 (the fragment corrections interpolated between fragment centres). Frames not listed in i
+                 (dropped bad-tracking stretches, see merge.py) are not used downstream.
   optimize.json  stats
 """
 import argparse
 import json
 import sys
 import time
+import warnings
 from pathlib import Path
 
-import numpy as np
-import open3d as o3d
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # python -I drops the script dir from sys.path
+import cores  # noqa: E402
+
+if __name__ == "__main__":
+    cores.setup()  # caps the threads Open3D uses; must happen before it is imported
+
+import numpy as np  # noqa: E402
+import open3d as o3d  # noqa: E402
+
 import fuse  # noqa: E402
 
 reg = o3d.pipelines.registration
@@ -52,6 +59,14 @@ SNAP_SPEED = 3.0  # m/s between consecutive frames; walking is ~1 m/s, relocalis
 GUARD_SHIFT, GUARD_YAW = 0.5, 3.0  # a loop correcting more than this needs another loop to agree with it
 GUARD_AGREE_SHIFT, GUARD_AGREE_YAW = 0.3, 3.0  # m, degrees: two loops agree if their corrections differ by less
 GUARD_PATH = 100.0  # m of walking: a loop only counts as corroborating if both its ends are this close
+FAIL_SPEED, FAIL_WINDOW = 2.0, 11  # m/s: median step speed over this many frames; a person walks at ~1 m/s
+FAIL_JUMP = 3.0  # m: a snap this big cannot be ramped away (the ramp assumes the drift grew steadily)
+FAIL_JUMP_YAW, FAIL_JUMP_YAW_SHIFT = 15.0, 1.0  # degrees, with at least this much shift (m): also too big to ramp
+RUNAWAY_MIN_STEP, RUNAWAY_GAP = 0.15, 5.0  # m, s: a spike is a step this big (and 3x the steps around it); a run has spikes this close
+RUNAWAY_MIN_SPIKES, RUNAWAY_GROWTH = 6, 3.0  # a run of at least this many spikes, never shrinking by more than 10%, whose last is this many times its first
+FAIL_TRACKING = 1.0 # seconds of tracking != normal that count as a failure (shorter gaps keep the weak identity edge)
+FAIL_PAD = 1.0  # seconds dropped either side of a failure: tracking degrades before and recovers after it
+MIN_SEGMENT_SECONDS, MIN_SEGMENT_PATH = 10.0, 5.0  # a clean piece shorter than this is dropped (too little to register)
 
 
 def rot_y(a):
@@ -131,6 +146,116 @@ def remove_snaps(frames, snaps):
             T[:3, :3], T[:3, 3] = rot_y(f * d_yaw) @ Ta[:3, :3], Ta[:3, 3] + f * (Tb[:3, 3] - Ta[:3, 3])
             frames[n]["T"] = T
         start = s["n"]
+
+
+def find_failures(frames):
+    """Bad-tracking intervals, padded by FAIL_PAD: ARKit sliding (tracking drifts for seconds, then relocalises),
+    which no snap ramp can fix. Found by (a) a sustained implausible speed (median step speed over FAIL_WINDOW
+    frames above FAIL_SPEED: single glitches do not move a median), (b) a snap too big to ramp away, (c) a run of
+    jumps that keep growing (the poses between them look normal, but each jump corrects more drift than the last),
+    (d) a stretch of tracking != normal of at least FAIL_TRACKING seconds. [{first, last, t0, t1, seconds, reasons}]
+    with first/last positions in `frames`, inclusive."""
+    n = len(frames)
+    t = np.array([f["t"] for f in frames])
+    P = np.array([f["T"][:3, 3] for f in frames])
+    normal = np.array([f["tracking"] == "normal" for f in frames])
+    step = np.full(n, np.nan)  # speed of the step into frame k
+    ok = normal[1:] & normal[:-1]
+    step[1:][ok] = (np.linalg.norm(np.diff(P, axis=0), axis=1) / np.maximum(np.diff(t), 1e-3))[ok]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)  # windows without a single valid step
+        windows = np.lib.stride_tricks.sliding_window_view(np.pad(step, FAIL_WINDOW // 2, constant_values=np.nan), FAIL_WINDOW)
+        median = np.nanmedian(windows, axis=1)
+    flags = {"sustained speed": np.zeros(n, bool), "jump too big to ramp": np.zeros(n, bool),
+             "growing jumps (runaway)": np.zeros(n, bool), "tracking not normal": np.zeros(n, bool)}
+    fast = median > FAIL_SPEED
+    flags["sustained speed"] = fast | np.r_[fast[1:], False]  # the step into k touches k-1 as well
+    snaps = detect_snaps(frames)
+    for s in snaps:
+        yaw, shift = snap_offset(frames, s, snaps)
+        at = frames[s["first"] - 1]["T"][:3, 3]
+        size = float(np.linalg.norm(rot_y(yaw) @ at + shift - at))  # how far the offset moves the camera (it turns about the origin)
+        if size > FAIL_JUMP or (abs(np.degrees(yaw)) > FAIL_JUMP_YAW and size > FAIL_JUMP_YAW_SHIFT):
+            flags["jump too big to ramp"][s["first"] - 1:s["n"] + 1] = True
+    # runaway: pose jumps that keep growing (ARKit is losing track and every correction is bigger than the last).
+    # A spike is a step at least RUNAWAY_MIN_STEP and 3x the walking steps around it.
+    spikes = []
+    for k in range(1, n):
+        if normal[k] and normal[k - 1]:
+            d = np.linalg.norm(P[k] - P[k - 1])
+            near = np.linalg.norm(np.diff(P[max(k - 10, 0):k + 11], axis=0), axis=1)
+            if d >= RUNAWAY_MIN_STEP and d >= 3 * np.median(near):
+                spikes.append((k, d))
+    run = []
+    for k, d in spikes + [(None, None)]:
+        if run and k is not None and t[k] - t[run[-1][0]] <= RUNAWAY_GAP and d >= 0.9 * run[-1][1]:
+            run.append((k, d))
+            continue
+        if len(run) >= RUNAWAY_MIN_SPIKES and run[-1][1] >= RUNAWAY_GROWTH * run[0][1]:
+            flags["growing jumps (runaway)"][run[0][0] - 1:run[-1][0] + 1] = True
+        run = [(k, d)] if k is not None else []
+    k = 0
+    while k < n:
+        if not normal[k]:
+            j = k
+            while j + 1 < n and not normal[j + 1]:
+                j += 1
+            if t[j] - t[k] >= FAIL_TRACKING:
+                flags["tracking not normal"][k:j + 1] = True
+            k = j + 1
+        else:
+            k += 1
+    bad = np.any(list(flags.values()), axis=0)
+    out = []
+    for a in np.flatnonzero(bad & ~np.r_[False, bad[:-1]]):  # starts of runs
+        b = a
+        while b + 1 < n and bad[b + 1]:
+            b += 1
+        lo = int(np.searchsorted(t, t[a] - FAIL_PAD, "left"))
+        hi = int(np.searchsorted(t, t[b] + FAIL_PAD, "right")) - 1
+        reasons = [name for name, fl in flags.items() if fl[a:b + 1].any()]
+        if out and lo <= out[-1]["last"] + 1:  # padded intervals that touch become one
+            out[-1].update(last=hi, t1=float(t[hi]), reasons=sorted(set(out[-1]["reasons"]) | set(reasons)))
+        else:
+            out.append({"first": lo, "last": hi, "t0": float(t[lo]), "t1": float(t[hi]), "reasons": reasons})
+    for r in out:
+        r["seconds"] = r["t1"] - r["t0"]
+        r["max_step_m"] = float(np.nanmax(step[r["first"]:r["last"] + 1])) if np.isfinite(step[r["first"]:r["last"] + 1]).any() else 0.0
+    return out
+
+
+def split_walk(frames):
+    """(segments, removed, dropped): the failures from find_failures, and the clean pieces between them. A piece
+    shorter than MIN_SEGMENT_SECONDS or with less than MIN_SEGMENT_PATH of path is dropped. A walk without
+    failures comes back whole as one segment, however short."""
+    removed = find_failures(frames)
+    if not removed:
+        return [_segment(frames, 0, len(frames) - 1)], [], []
+    keep = np.ones(len(frames), bool)
+    for r in removed:
+        keep[r["first"]:r["last"] + 1] = False
+    segments, dropped = [], []
+    k = 0
+    while k < len(frames):
+        if keep[k]:
+            j = k
+            while j + 1 < len(frames) and keep[j + 1]:
+                j += 1
+            s = _segment(frames, k, j)
+            if s["seconds"] < MIN_SEGMENT_SECONDS or s["path_m"] < MIN_SEGMENT_PATH:
+                dropped.append({**s, "why": f"too short ({s['seconds']:.0f} s, {s['path_m']:.0f} m of path)"})
+            else:
+                segments.append(s)
+            k = j + 1
+        else:
+            k += 1
+    return segments, removed, dropped
+
+
+def _segment(frames, a, b):
+    P = np.array([f["T"][:3, 3] for f in frames[a:b + 1]])
+    return {"first": a, "last": b, "t0": frames[a]["t"], "t1": frames[b]["t"], "seconds": frames[b]["t"] - frames[a]["t"],
+            "path_m": float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()), "ids": [f["i"] for f in frames[a:b + 1]]}
 
 
 def fragment_groups(frames, frag_frames, cuts=()):
@@ -221,11 +346,15 @@ def frame_poses(frames, centres, theta, trans):
     return out
 
 
-def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print):
+def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None):
+    """frame_ids: optimise only these frames (a clean segment from split_walk); poses.npz then lists only them."""
     t0 = time.time()
     walk, out = Path(walk), Path(out)
     out.mkdir(parents=True, exist_ok=True)
     meta, frames = fuse.read_walk(walk)
+    if frame_ids is not None:
+        keep = set(frame_ids)
+        frames = [f for f in frames if f["i"] in keep]
     recorded = np.array([f["T"] for f in frames])
     snaps = detect_snaps(frames)
     for s in snaps:
@@ -347,5 +476,6 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("walk_dir")
     ap.add_argument("out_dir")
+    ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores for Open3D (default %(default)s); merge.py also runs walks in parallel")
     a = ap.parse_args()
     optimize(a.walk_dir, a.out_dir)
