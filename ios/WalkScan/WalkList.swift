@@ -57,6 +57,8 @@ struct WalkListView: View {
     @State private var pendingDelete: WalkInfo?
     @State private var zipping = false
     @State private var shareItem: ShareItem?
+    @State private var sendWalk: WalkInfo?
+    @State private var zipWarning: WalkInfo?
 
     var body: some View {
         NavigationStack {
@@ -67,8 +69,14 @@ struct WalkListView: View {
                         Text(details(walk)).font(.subheadline).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button { share(walk) } label: { Image(systemName: "square.and.arrow.up") }
-                        .buttonStyle(.borderless)
+                    Menu {
+                        Button("Send to Mac (Wi-Fi)", systemImage: "wifi") { sendWalk = walk }
+                        Button("Zip and share (AirDrop)", systemImage: "square.and.arrow.up") { share(walk) }
+                        Button("Delete", systemImage: "trash", role: .destructive) { pendingDelete = walk }
+                    } label: {
+                        Image(systemName: "ellipsis.circle").font(.title3)
+                    }
+                    .buttonStyle(.borderless)
                 }
                 .swipeActions {
                     Button("Delete", role: .destructive) { pendingDelete = walk }
@@ -100,6 +108,16 @@ struct WalkListView: View {
                 Text("This cannot be undone.")
             }
             .sheet(item: $shareItem) { item in ActivityView(url: item.url) }
+            .sheet(item: $sendWalk) { walk in
+                SendView(walk: walk) { walks.removeAll { $0.id == walk.id } }
+            }
+            .confirmationDialog("Not enough space to zip", isPresented: Binding(get: { zipWarning != nil }, set: { if !$0 { zipWarning = nil } }),
+                                titleVisibility: .visible, presenting: zipWarning) { walk in
+                Button("Zip anyway") { startZip(walk) }
+            } message: { walk in
+                let free = Storage.freeBytes().map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "unknown"
+                Text("Zipping needs about as much free space as the walk (\(ByteCountFormatter.string(fromByteCount: walk.bytes, countStyle: .file))); \(free) is free. Use Send to Mac instead, which needs no extra space.")
+            }
         }
     }
 
@@ -110,6 +128,14 @@ struct WalkListView: View {
     }
 
     private func share(_ walk: WalkInfo) {
+        if let free = Storage.freeBytes(), free < walk.bytes {
+            zipWarning = walk
+        } else {
+            startZip(walk)
+        }
+    }
+
+    private func startZip(_ walk: WalkInfo) {
         zipping = true
         Task {
             let url = await Task.detached { zipWalk(walk.url) }.value

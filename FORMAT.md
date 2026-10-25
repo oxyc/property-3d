@@ -11,6 +11,7 @@ walk_YYYYMMDD_HHMMSS/
   meta.json
   frames.jsonl
   gps.jsonl
+  events.jsonl       optional: intervals where tracking was wrong (absent in older walks = none recorded)
   depth/000000.bin   Float16 little-endian (v1: Float32), metres, row-major, depth_w × depth_h
   conf/000000.bin    UInt8 ARConfidenceLevel (0 low, 1 medium, 2 high), same layout
   rgb/000000.jpg     only on some frames (~2 Hz), JPEG quality 0.8, full camera res
@@ -36,17 +37,37 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 ```json
 {
   "format_version": 2,
-  "app_version": "0.2",
+  "app_version": "0.3",
   "depth_dtype": "f16",
   "device": "iPhone16,1",
   "started_at": "2026-10-19T15:00:00Z",   // ISO 8601 UTC
-  "ended_at": "2026-10-19T15:45:00Z",      // null if the app crashed mid-walk
+  "ended_at": "2026-10-19T15:45:00Z",      // null if the app crashed or was killed mid-walk
+  "end_reason": "user",                    // optional: "user" | "low_space" | "write_failed"
   "world_alignment": "gravityAndHeading",
   "depth_w": 256, "depth_h": 192,
   "rgb_w": 1920, "rgb_h": 1440,
-  "frame_count": 12345
+  "frame_count": 12345,
+  "site_anchor": {                         // optional: walk was started on a loaded coverage.json
+    "coverage_id": "garden-v3",            // the file's "id", or null
+    "east": 12.5, "north": 40.0,           // where the walk origin (ARKit 0,0) sits in the coverage frame, metres
+    "heading_deg": 271.5,                  // phone compass heading at start, clockwise from north, or null
+    "heading_is_true": true,               // true north (else magnetic)
+    "method": "tap"
+  }
 }
 ```
+
+`end_reason` is written when the app closes the walk itself: `low_space` (free space fell below
+500 MB) and `write_failed` (a file write failed) end the walk cleanly, with `ended_at` and an exact
+`frame_count`; every frame listed in `frames.jsonl` then has its files. Walks from older app versions
+have no `end_reason`; `ended_at: null` still means the app died mid-walk, and the last few frames may
+list files that were never written.
+
+`site_anchor` is the initial guess for merging with the earlier model: the coverage frame is east/north
+metres, ARKit's world is already north-aligned (`gravityAndHeading`, +X east, −Z north), so a walk point
+`(x, z)` is at `(east + x, north − z)`. Only a translation is stored, not a rotation: the compass heading
+is recorded for the pipeline to refine yaw, but is not applied because ARKit and the compass share the
+same magnetometer error.
 
 ## frames.jsonl
 
@@ -62,6 +83,8 @@ One JSON object per recorded depth frame (~10 Hz), appended as recorded:
   "rgb": true                        // whether rgb/<i>.jpg exists
 }
 ```
+
+Frames are recorded only while ARKit reports `tracking: "normal"`; limited stretches leave a gap in `t`.
 
 Camera frame is ARKit's: +X right, +Y up, −Z forward (looking direction).
 Depth pixel (u, v) maps to RGB pixel (u · rgb_w/depth_w, v · rgb_h/depth_h).
@@ -81,3 +104,59 @@ One object per CLLocation update, carrying the latest heading:
 
 Whether ARKit's `gravityAndHeading` −Z is true or magnetic north (≈10° apart in
 Uruguay) is unverified; the pipeline should fit yaw once a real walk is long enough.
+
+## events.jsonl (optional)
+
+One object per interval where ARKit tracking was clearly wrong, as opposed to the user walking fast.
+Times are seconds since walk start, the same clock as `frames.jsonl`:
+
+```json
+{"t_start": 226.8, "t_end": 239.7, "reason": "implausible_speed"}
+```
+
+The pipeline should drop (or re-register) frames with `t_start <= t <= t_end`. `reason`:
+
+- `implausible_speed`: poses implied more than 2.5 m/s over about 1 s while the accelerometer showed no
+  running-level motion (ARKit sliding, then usually snapping back).
+- `jump`: two consecutive poses (0.1 s apart) more than 1.5 m apart.
+- `tracking_limited` / `relocalizing`: ARKit tracking state was limited or relocalizing for over 1 s
+  (shorter dips are only a warning). Frames are not recorded while it lasts, so there is a gap.
+
+`t_start` is 10 s before detection for the first two reasons (the pose drifts for a while before it
+is detectable; on the recorded failures it lands about at the real onset) and the moment tracking
+degraded for the last two. `t_end` is 1 s after the last anomaly, and the interval stays open until
+3 s of clean frames. The app also keeps these frames out of its live coverage map. An interval still
+open when the app dies is not written.
+
+## coverage.json (Mac → phone, "continue a site")
+
+Written by the pipeline for a merged model and loaded in the app (Files picker, AirDrop / "Open in
+WalkScan", or fetched from a URL). The app shows it as already-covered ground, so its red frontier and
+gap arrows point only at what is still missing, and lets the user tap where they stand to place the new
+walk (`site_anchor` above). Everything is in a local east/north frame in metres (any origin; no CRS
+needed):
+
+```json
+{
+  "format_version": 1,
+  "id": "garden-v3",
+  "cell_size": 0.25,
+  "origin": {"east": 120.0, "north": 340.0},
+  "width": 240, "height": 200,
+  "rows": ["....####....", "...#####x...", "..."],
+  "outline": [[[120, 340], [180, 340], [180, 290], [120, 290]]],
+  "ref": {"lat": -34.906, "lon": -56.191}
+}
+```
+
+- `origin` is the **north-west corner** of the grid; column 0 is the westernmost, row 0 the **northernmost**.
+  Cell `(col, row)` covers east `[origin.east + col·cell_size, +cell_size)` and north
+  `(origin.north − (row+1)·cell_size, origin.north − row·cell_size]`.
+- `rows` has `height` strings of exactly `width` ASCII characters: `#` covered (enough points to model
+  it), `.` unseen, `x` blocked (looked at from several sides but cannot be seen: water, glass, dense
+  thicket; the app treats it as done). Writing the grid as text keeps it readable and small.
+- `id` (optional string) is copied into `site_anchor.coverage_id`.
+- `outline` (optional) is a list of rings of `[east, north]` points, drawn on the map (e.g. the plot boundary).
+- `ref` (optional) is the lat/lon of east 0 / north 0; with it the map shows the phone's GPS position
+  to help the user tap the right spot.
+- Limits: `cell_size` 0.05 to 5 m, at most 4 000 000 cells. 0.25 m matches the app's own grid.

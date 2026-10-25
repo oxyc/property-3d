@@ -46,16 +46,22 @@ struct CoverageGrid {
     }
 
     /// Paints covered cells by hit count and uncovered cells touching a covered cell ("frontier") red.
-    func render(maxSide: Int = 1024) -> CoverageSnapshot? {
+    /// `prior` are cells from a previous walk (same keys, 25 cm): teal if covered, grey if unseeable. They count
+    /// as covered for the frontier but not for the area.
+    func render(prior: [Int64: UInt8] = [:], maxSide: Int = 1024) -> CoverageSnapshot? {
         var minX = Int32.max, maxX = Int32.min, minZ = Int32.max, maxZ = Int32.min
         var covered = 0
-        for (k, c) in cells where c.hits >= Self.minHits {
+        func extend(_ k: Int64) {
             let ix = Int32(truncatingIfNeeded: k >> 32), iz = Int32(truncatingIfNeeded: k)
             minX = min(minX, ix); maxX = max(maxX, ix)
             minZ = min(minZ, iz); maxZ = max(maxZ, iz)
+        }
+        for (k, c) in cells where c.hits >= Self.minHits {
+            extend(k)
             covered += 1
         }
-        guard covered > 0 else { return nil }
+        for k in prior.keys { extend(k) }
+        guard covered > 0 || !prior.isEmpty else { return nil }
 
         // One cell of padding so the frontier outside the covered extent is visible.
         let w = min(Int(maxX) - Int(minX) + 3, maxSide)
@@ -63,11 +69,18 @@ struct CoverageGrid {
         let ox = Int(minX) - 1, oz = Int(minZ) - 1
 
         var hits = [UInt16](repeating: 0, count: w * h)
+        var old = [UInt8](repeating: 0, count: w * h)
+        for (k, state) in prior {
+            let col = Int(Int32(truncatingIfNeeded: k >> 32)) - ox
+            let row = Int(Int32(truncatingIfNeeded: k)) - oz
+            if col >= 0, col < w, row >= 0, row < h { old[row * w + col] = state }
+        }
         for (k, c) in cells where c.hits >= Self.minHits {
             let col = Int(Int32(truncatingIfNeeded: k >> 32)) - ox
             let row = Int(Int32(truncatingIfNeeded: k)) - oz
             if col >= 0, col < w, row >= 0, row < h { hits[row * w + col] = c.hits }
         }
+        func seen(_ i: Int) -> Bool { hits[i] > 0 || old[i] > 0 }
 
         var pixels = [UInt8](repeating: 255, count: w * h * 4)
         for row in 0..<h {
@@ -77,8 +90,12 @@ struct CoverageGrid {
                 if hits[i] > 0 {
                     let t = min(Float(hits[i]) / 50, 1)
                     rgb = (UInt8(30 + 90 * t), UInt8(90 + 140 * t), UInt8(50 + 70 * t))
-                } else if (col > 0 && hits[i - 1] > 0) || (col < w - 1 && hits[i + 1] > 0)
-                            || (row > 0 && hits[i - w] > 0) || (row < h - 1 && hits[i + w] > 0) {
+                } else if old[i] == Site.covered {
+                    rgb = (60, 140, 170)
+                } else if old[i] == Site.blocked {
+                    rgb = (90, 90, 95)
+                } else if (col > 0 && seen(i - 1)) || (col < w - 1 && seen(i + 1))
+                            || (row > 0 && seen(i - w)) || (row < h - 1 && seen(i + w)) {
                     rgb = (230, 50, 50)
                 } else {
                     rgb = (20, 20, 24)

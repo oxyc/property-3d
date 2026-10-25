@@ -1,5 +1,6 @@
 import ARKit
 import CoreLocation
+import CoreMotion
 import SwiftUI
 import UIKit
 
@@ -7,6 +8,25 @@ enum Storage {
     static var documents: URL {
         FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
+
+    /// Recording stops cleanly below this much free space; it warns below `lowSpaceWarn`.
+    static let lowSpaceStop: Int64 = 500_000_000
+    static let lowSpaceWarn: Int64 = 2_000_000_000
+
+    /// Truly free bytes (not counting purgeable space, which a full disk cannot rely on).
+    static func freeBytes() -> Int64? {
+        (try? documents.resourceValues(forKeys: [.volumeAvailableCapacityKey]))?.volumeAvailableCapacity.map(Int64.init)
+    }
+
+    private static let rateKey = "bytesPerSecond"
+
+    /// Bytes written per second of recording: measured on the last walk, else about 8 GB/hour.
+    static var estimatedRate: Double {
+        let measured = UserDefaults.standard.double(forKey: rateKey)
+        return measured > 0 ? measured : 8e9 / 3600
+    }
+
+    static func saveRate(_ bytesPerSecond: Double) { UserDefaults.standard.set(bytesPerSecond, forKey: rateKey) }
 }
 
 /// Snapshot of recording state sent from the recording queue to the UI.
@@ -27,6 +47,9 @@ struct Update: @unchecked Sendable {
     var targetOnScreen: Bool
     /// Open holes that were filled since the previous update.
     var filled: Int
+    var trackingLost: Bool
+    var freeBytes: Int64
+    var bytesPerSecond: Double
 }
 
 /// A blind spot for the minimap. Position is world X/Z in metres.
@@ -53,6 +76,13 @@ final class Recorder: ObservableObject {
     @Published private(set) var targetDistance: Float = 0
     @Published private(set) var targetAngle: Float = 0
     @Published private(set) var targetOnScreen = false
+    @Published private(set) var trackingLost = false
+    @Published private(set) var freeBytes: Int64?
+    @Published private(set) var bytesPerSecond: Double = 0
+    /// Live compass heading in degrees (true north if available, else magnetic) and GPS position.
+    @Published private(set) var heading: Double?
+    @Published private(set) var headingIsTrue = false
+    @Published private(set) var coordinate: CLLocationCoordinate2D?
     @Published var errorMessage: String?
 
     let session = ARSession()
@@ -60,13 +90,22 @@ final class Recorder: ObservableObject {
     private let location = CLLocationManager()
     private let haptics = UINotificationFeedbackGenerator()
     private let fillHaptic = UIImpactFeedbackGenerator(style: .light)
+    private let lostHaptic = UIImpactFeedbackGenerator(style: .heavy)
     private var shownWarnings = Set<String>()
     private var lastHaptic = Date.distantPast
     private var lastFillHaptic = Date.distantPast
+    private var lastLostHaptic = Date.distantPast
 
     func setViewport(_ size: CGSize) { engine.setViewport(size) }
 
     var areaM2: Double { snapshot?.areaM2 ?? 0 }
+
+    /// Minutes of recording left before the safe stop, from the measured (or estimated) write rate.
+    var minutesLeft: Int? {
+        guard let free = freeBytes else { return nil }
+        let rate = bytesPerSecond > 0 ? bytesPerSecond : Storage.estimatedRate
+        return max(0, Int(Double(free - Storage.lowSpaceStop) / rate / 60))
+    }
 
     init() {
         session.delegate = engine
@@ -75,6 +114,18 @@ final class Recorder: ObservableObject {
         location.desiredAccuracy = kCLLocationAccuracyBest
         engine.onUpdate = { [weak self] update in
             Task { @MainActor in self?.apply(update) }
+        }
+        engine.onStopped = { [weak self] reason in
+            Task { @MainActor in self?.handleStopped(reason) }
+        }
+        engine.onHeading = { [weak self] degrees, isTrue in
+            Task { @MainActor in
+                self?.heading = degrees
+                self?.headingIsTrue = isTrue
+            }
+        }
+        engine.onLocation = { [weak self] coordinate in
+            Task { @MainActor in self?.coordinate = coordinate }
         }
     }
 
@@ -88,30 +139,46 @@ final class Recorder: ObservableObject {
         return config
     }
 
-    /// Runs the session so the camera and mesh preview show before a walk starts.
+    /// Runs the session so the camera and mesh preview show before a walk starts, and keeps
+    /// location and compass running (the compass and GPS are used to place the start on a loaded site).
     func startPreview() {
         location.requestWhenInUseAuthorization()
+        location.startUpdatingLocation()
+        location.startUpdatingHeading()
         session.run(Self.makeConfig())
+        refreshFreeSpace()
     }
 
-    func start() {
+    func refreshFreeSpace() {
+        if let free = Storage.freeBytes() { freeBytes = free }
+    }
+
+    /// Starts a walk. With a loaded `site` and the tapped `anchor`, the old coverage counts as already covered.
+    func start(site: Site?, anchor: SiteAnchor?) {
         guard !isRecording else { return }
+        refreshFreeSpace()
+        if let free = freeBytes, free < Storage.lowSpaceStop + 200_000_000 {
+            errorMessage = "Only \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free: not enough to record. Send walks to your Mac and delete them from the phone, then try again."
+            return
+        }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.dateFormat = "yyyyMMdd_HHmmss"
         let started = Date()
         let dir = Storage.documents.appendingPathComponent("walk_" + formatter.string(from: started))
         let startUptime = ProcessInfo.processInfo.systemUptime
+        var anchor = anchor
+        anchor?.headingDeg = heading
+        anchor?.headingIsTrue = headingIsTrue
+        anchor?.coverageId = site?.id
         do {
-            try engine.begin(dir: dir, startUptime: startUptime, startDate: started)
+            try engine.begin(dir: dir, startUptime: startUptime, startDate: started, site: site, anchor: anchor)
         } catch {
             errorMessage = "Could not create walk folder: \(error.localizedDescription)"
             return
         }
         // Reset so the world origin (and gravityAndHeading axes) are where the walk starts.
         session.run(Self.makeConfig(), options: [.resetTracking, .removeExistingAnchors])
-        location.startUpdatingLocation()
-        location.startUpdatingHeading()
         UIDevice.current.isBatteryMonitoringEnabled = true
         UIApplication.shared.isIdleTimerDisabled = true
         snapshot = nil
@@ -123,17 +190,35 @@ final class Recorder: ObservableObject {
         holes = []
         gaps = 0
         target = nil
+        trackingLost = false
+        bytesPerSecond = 0
         isRecording = true
     }
 
     func stop() {
         guard isRecording else { return }
         isRecording = false
-        location.stopUpdatingLocation()
-        location.stopUpdatingHeading()
         UIApplication.shared.isIdleTimerDisabled = false
         engine.end()
         warnings = []
+        trackingLost = false
+        refreshFreeSpace()
+    }
+
+    /// The engine ended the walk itself (disk nearly full, or writes failing). The walk is saved and closed.
+    private func handleStopped(_ reason: String) {
+        guard isRecording else { return }
+        isRecording = false
+        UIApplication.shared.isIdleTimerDisabled = false
+        warnings = []
+        trackingLost = false
+        refreshFreeSpace()
+        haptics.notificationOccurred(.error)
+        let free = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "little"
+        errorMessage = (reason == "low_space"
+            ? "Recording stopped: the phone is almost out of space (\(free) free). "
+            : "Recording stopped: writing to disk failed, most likely because the phone is full (\(free) free). ")
+            + "The walk so far was saved and closed cleanly. Send it to your Mac and delete it from the phone before starting another."
     }
 
     private func apply(_ u: Update) {
@@ -149,6 +234,9 @@ final class Recorder: ObservableObject {
         targetDistance = u.targetDistance
         targetAngle = u.targetAngle
         targetOnScreen = u.targetOnScreen
+        trackingLost = u.trackingLost
+        bytesPerSecond = u.bytesPerSecond
+        if u.freeBytes != .max { freeBytes = u.freeBytes }
 
         var list = u.issues
         let thermal = ProcessInfo.processInfo.thermalState
@@ -157,9 +245,19 @@ final class Recorder: ObservableObject {
         if battery >= 0, battery < 0.2 { list.append("Battery low (\(Int(battery * 100))%)") }
         warnings = list
 
-        // Haptic on any new warning, then repeat every few seconds while one persists.
-        let current = Set(list)
+        // Tracking lost gets its own, heavier double tap every 4 s until it clears.
         let now = Date()
+        if u.trackingLost, now.timeIntervalSince(lastLostHaptic) > 4 {
+            lastLostHaptic = now
+            lostHaptic.impactOccurred()
+            Task {
+                try? await Task.sleep(for: .milliseconds(180))
+                lostHaptic.impactOccurred()
+            }
+        }
+
+        // Haptic on any other new warning, then repeat every few seconds while one persists.
+        let current = Set(list).subtracting([Engine.lostMessage])
         if !current.isEmpty, !current.isSubset(of: shownWarnings) || now.timeIntervalSince(lastHaptic) > 4 {
             haptics.notificationOccurred(.warning)
             lastHaptic = now
@@ -167,7 +265,8 @@ final class Recorder: ObservableObject {
         shownWarnings = current
 
         // Light tap when a gap gets filled; never within 1.5 s of another tap.
-        if u.filled > 0, now.timeIntervalSince(lastFillHaptic) > 1.5, now.timeIntervalSince(lastHaptic) > 1.5 {
+        if u.filled > 0, now.timeIntervalSince(lastFillHaptic) > 1.5, now.timeIntervalSince(lastHaptic) > 1.5,
+           now.timeIntervalSince(lastLostHaptic) > 1.5 {
             fillHaptic.impactOccurred()
             lastFillHaptic = now
         }
@@ -202,16 +301,34 @@ private struct HoleComp {
     var blocked = false
 }
 
+/// World points of one recorded frame, held back before they count towards coverage so that a tracking
+/// failure detected a moment later can still discard them.
+private struct PointBatch {
+    var t: Double
+    var coarse: [SIMD3<Float>]
+    var fine: [SIMD3<Float>]
+}
+
 /// Handles ARKit frames and location updates on `q`: writes to disk, updates coverage, reports to the UI.
-/// Everything except `onUpdate` and `q` is confined to `q`.
+/// Everything except the callbacks and `q` is confined to `q`.
 final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unchecked Sendable {
+    static let lostMessage = "Tracking lost: stop, then point the phone at something you already scanned"
+    /// Coverage is applied this long after capture (see `PointBatch`).
+    private static let coverageDelay = 2.5
+
     let q = DispatchQueue(label: "walkscan.record", qos: .userInitiated)
     var onUpdate: (@Sendable (Update) -> Void)?
+    /// The engine ended the walk itself; the reason is "low_space" or "write_failed".
+    var onStopped: (@Sendable (String) -> Void)?
+    var onHeading: (@Sendable (Double, Bool) -> Void)?
+    var onLocation: (@Sendable (CLLocationCoordinate2D) -> Void)?
 
     private var walk: Walk?
     private var viewport = CGSize(width: 390, height: 844)
     private let ciContext = CIContext()
     private let holeQueue = DispatchQueue(label: "walkscan.holes", qos: .utility)
+    private let motionManager = CMMotionManager()
+    private let motionQueue = OperationQueue()
 
     private static let iso: ISO8601DateFormatter = ISO8601DateFormatter()
 
@@ -221,10 +338,12 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let startDate: Date
         let framesFile: FileHandle
         let gpsFile: FileHandle
+        let eventsFile: FileHandle
         let encoder = JSONEncoder()
         var meta: [String: Any]
 
         var count = 0
+        var bytesWritten: Int64 = 0
         var lastDepthT = -Double.infinity
         var lastRGBT = -Double.infinity
         var lastPublish = 0.0
@@ -232,6 +351,16 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         var lastDiskCheck = -Double.infinity
         var dirty = false
         var grid = CoverageGrid()
+        var pending: [PointBatch] = []
+
+        // Previous coverage of a loaded site, resampled to this walk's world cells.
+        var prior25: [Int64: UInt8] = [:]
+        var priorFine = Set<Int64>()
+
+        // Tracking failure detection
+        var monitor = TrackingMonitor()
+        var motion = MotionWindow()
+        var lost = false
 
         // Blind-spot guidance
         var fine = FineGrid()
@@ -261,7 +390,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         var writeFailed = false
         var lastLocation: CLLocation?
 
-        init(dir: URL, startUptime: TimeInterval, startDate: Date) throws {
+        init(dir: URL, startUptime: TimeInterval, startDate: Date, site: Site?, anchor: SiteAnchor?) throws {
             self.dir = dir
             self.startUptime = startUptime
             self.startDate = startDate
@@ -270,16 +399,17 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             for sub in ["depth", "conf", "rgb"] {
                 try fm.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
             }
-            for name in ["frames.jsonl", "gps.jsonl"] {
+            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl"] {
                 guard fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: nil) else {
                     throw CocoaError(.fileWriteUnknown)
                 }
             }
             framesFile = try FileHandle(forWritingTo: dir.appendingPathComponent("frames.jsonl"))
             gpsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("gps.jsonl"))
+            eventsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("events.jsonl"))
             meta = [
                 "format_version": 2,
-                "app_version": "0.2",
+                "app_version": "0.3",
                 "depth_dtype": "f16",
                 "device": Engine.deviceModel,
                 "started_at": Engine.iso.string(from: startDate),
@@ -289,7 +419,14 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                 "rgb_w": 1920, "rgb_h": 1440,
                 "frame_count": 0,
             ]
+            if let site, let anchor {
+                prior25 = site.worldCells(cellSize: CoverageGrid.cellSize, anchor: anchor)
+                priorFine = Set(site.worldCells(cellSize: HoleConfig.cellSize, anchor: anchor).keys)
+                meta["site_anchor"] = anchor.metaJSON
+                dirty = true  // draw the old coverage right away
+            }
             writeMeta()
+            if writeFailed { throw CocoaError(.fileWriteOutOfSpace) }
         }
 
         func writeMeta() {
@@ -297,12 +434,36 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             do { try data.write(to: dir.appendingPathComponent("meta.json"), options: .atomic) } catch { writeFailed = true }
         }
 
-        func write(_ data: Data, to file: FileHandle) {
-            do { try file.write(contentsOf: data) } catch { writeFailed = true }
+        @discardableResult
+        func write(_ data: Data, to file: FileHandle) -> Bool {
+            do {
+                try file.write(contentsOf: data)
+                bytesWritten += Int64(data.count)
+                return true
+            } catch {
+                writeFailed = true
+                return false
+            }
         }
 
-        func write(_ data: Data, path: String) {
-            do { try data.write(to: dir.appendingPathComponent(path)) } catch { writeFailed = true }
+        @discardableResult
+        func write(_ data: Data, path: String) -> Bool {
+            do {
+                try data.write(to: dir.appendingPathComponent(path))
+                bytesWritten += Int64(data.count)
+                return true
+            } catch {
+                writeFailed = true
+                return false
+            }
+        }
+
+        func log(_ event: TrackingEvent) {
+            let entry: [String: Any] = ["t_start": (event.tStart * 1000).rounded() / 1000,
+                                        "t_end": (event.tEnd * 1000).rounded() / 1000, "reason": event.reason]
+            guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+            line.append(10)
+            write(line, to: eventsFile)
         }
     }
 
@@ -317,20 +478,42 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
     // MARK: Start / stop
 
-    func begin(dir: URL, startUptime: TimeInterval, startDate: Date) throws {
-        try q.sync { walk = try Walk(dir: dir, startUptime: startUptime, startDate: startDate) }
+    func begin(dir: URL, startUptime: TimeInterval, startDate: Date, site: Site?, anchor: SiteAnchor?) throws {
+        try q.sync { walk = try Walk(dir: dir, startUptime: startUptime, startDate: startDate, site: site, anchor: anchor) }
+        // The accelerometer tells genuine fast motion from ARKit sliding while the phone is still.
+        if motionManager.isDeviceMotionAvailable {
+            motionManager.deviceMotionUpdateInterval = 1.0 / 30
+            motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
+                guard let self, let motion else { return }
+                let a = motion.userAcceleration
+                let magnitude = Float((a.x * a.x + a.y * a.y + a.z * a.z).squareRoot())
+                self.q.async { self.walk?.motion.add(t: motion.timestamp, magnitudeG: magnitude) }
+            }
+        }
     }
 
     func end() {
         q.async {
-            guard let w = self.walk else { return }
-            self.walk = nil
-            w.meta["ended_at"] = Self.iso.string(from: Date())
-            w.meta["frame_count"] = w.count
-            w.writeMeta()
-            try? w.framesFile.close()
-            try? w.gpsFile.close()
+            if let w = self.walk { self.finish(w, reason: "user") }
         }
+    }
+
+    /// Closes the walk cleanly: events, meta.json with ended_at and the reason, files closed. Runs on `q`.
+    private func finish(_ w: Walk, reason: String) {
+        guard walk === w else { return }
+        walk = nil
+        motionManager.stopDeviceMotionUpdates()
+        let duration = ProcessInfo.processInfo.systemUptime - w.startUptime
+        if let event = w.monitor.finish(t: duration) { w.log(event) }
+        w.meta["ended_at"] = Self.iso.string(from: Date())
+        w.meta["end_reason"] = reason
+        w.meta["frame_count"] = w.count
+        w.writeMeta()
+        try? w.framesFile.close()
+        try? w.gpsFile.close()
+        try? w.eventsFile.close()
+        if duration > 30 { Storage.saveRate(Double(w.bytesWritten) / duration) }
+        if reason != "user" { onStopped?(reason) }
     }
 
     func setViewport(_ size: CGSize) {
@@ -361,6 +544,15 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         let (trackingName, issue) = Self.describe(cam.trackingState)
         w.trackingIssue = issue
+
+        // Is tracking clearly wrong (as opposed to the user walking fast)? Everything inside such an
+        // interval is logged to events.jsonl for the pipeline and kept out of the coverage.
+        let verdict = w.monitor.update(t: now - w.startUptime, x: w.pos.x, z: w.pos.z, normal: trackingName == "normal",
+                                       state: trackingName, motionRMS: w.motion.rms(at: now))
+        if verdict.opened { w.pending.removeAll() }
+        if let event = verdict.closed { w.log(event) }
+        w.lost = w.monitor.lost
+
         guard trackingName == "normal" else {
             w.lastPos = nil
             return
@@ -371,7 +563,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         if let last = w.lastPos, now > w.lastPosT {
             let v = hypot(w.pos.x - last.x, w.pos.z - last.z) / Float(now - w.lastPosT)
-            w.speed = 0.8 * w.speed + 0.2 * v
+            // Steps faster than 5 m/s are tracking glitches (the monitor handles them), not walking.
+            if v < 5 { w.speed = 0.8 * w.speed + 0.2 * v }
         }
         w.lastPos = w.pos
         w.lastPosT = now
@@ -395,6 +588,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let depthData = Self.packed(depth.depthMap, bytesPerPixel: 4)
         let confData = Self.packed(conf, bytesPerPixel: 1)
 
+        // A frame is only logged if every file it refers to was written. Any failed write ends the walk
+        // cleanly instead of logging frames whose files are missing.
         let stem = String(format: "%06d", w.count)
         w.write(Self.float16(depthData), path: "depth/\(stem).bin")
         w.write(confData, path: "conf/\(stem).bin")
@@ -404,11 +599,11 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             let image = CIImage(cvPixelBuffer: frame.capturedImage)
             let options = [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.8]
             if let jpeg = ciContext.jpegRepresentation(of: image, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, options: options) {
-                w.write(jpeg, path: "rgb/\(stem).jpg")
-                hasRGB = true
+                hasRGB = w.write(jpeg, path: "rgb/\(stem).jpg")
                 w.lastRGBT = now
             }
         }
+        guard !w.writeFailed else { return finish(w, reason: "write_failed") }
 
         if w.count == 0 {
             w.meta["depth_w"] = depthW
@@ -429,21 +624,24 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             line.append(10)
             w.write(line, to: w.framesFile)
         }
+        guard !w.writeFailed else { return finish(w, reason: "write_failed") }
         w.count += 1
 
-        markCoverage(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
-        registerLooks(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
+        collectCoverage(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
+        if !w.lost { registerLooks(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH) }
     }
 
-    /// Unprojects every 4th depth pixel (confidence >= 1, depth <= 4 m) into the 25 cm coverage cells,
-    /// and every 2nd pixel (depth <= 3.5 m) into the 10 cm grid used for hole detection.
-    private func markCoverage(_ w: Walk, frame: ARFrame, depth: Data, conf: Data, width: Int, height: Int) {
+    /// Unprojects every 4th depth pixel (confidence >= 1, depth <= 4 m) for the 25 cm coverage cells,
+    /// and every 2nd pixel (depth <= 3.5 m) for the 10 cm grid used for hole detection. The points wait
+    /// `coverageDelay` seconds in `pending` before they are counted, and are dropped if tracking fails.
+    private func collectCoverage(_ w: Walk, frame: ARFrame, depth: Data, conf: Data, width: Int, height: Int) {
         let cam = frame.camera
         let tr = cam.transform
         let k = cam.intrinsics
         let fx = k[0][0], fy = k[1][1], cx = k[2][0], cy = k[2][1]
         let scale = Float(cam.imageResolution.width) / Float(width)
         var total = 0, valid = 0
+        var batch = PointBatch(t: frame.timestamp, coarse: [], fine: [])
         depth.withUnsafeBytes { dRaw in
             conf.withUnsafeBytes { cRaw in
                 let d = dRaw.bindMemory(to: Float.self)
@@ -459,16 +657,24 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                         let wp = tr * p
                         if coarse {
                             valid += 1
-                            w.grid.mark(x: wp.x, y: wp.y, z: wp.z)
+                            batch.coarse.append(SIMD3(wp.x, wp.y, wp.z))
                         }
-                        if z <= HoleConfig.maxFineDistance { w.fine.mark(x: wp.x, y: wp.y, z: wp.z) }
+                        if z <= HoleConfig.maxFineDistance { batch.fine.append(SIMD3(wp.x, wp.y, wp.z)) }
                     }
                 }
             }
         }
         if valid * 20 >= total { w.lastValidDepth = frame.timestamp }
-        w.dirty = true
-        w.fineDirty = true
+        if !w.lost { w.pending.append(batch) }
+
+        // Count everything that has waited long enough.
+        while let first = w.pending.first, first.t <= frame.timestamp - Self.coverageDelay {
+            for p in first.coarse { w.grid.mark(x: p.x, y: p.y, z: p.z) }
+            for p in first.fine { w.fine.mark(x: p.x, y: p.y, z: p.z) }
+            w.pending.removeFirst()
+            w.dirty = true
+            w.fineDirty = true
+        }
     }
 
     /// For every settled hole cell near the camera: if it projects into the image and the depth there
@@ -534,7 +740,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             if settled {
                 let n = Float(hole.keys.count)
                 let radius = max(HoleConfig.cellSize, (n / .pi).squareRoot() * HoleConfig.cellSize)
-                comps.append(HoleComp(keys: hole.keys, groundY: hole.groundY, center: sum / n, radius: radius))
+                // Holes bordered only by old coverage have no ground height of their own: assume the phone is held ~1.4 m up.
+                let ground = hole.groundY.isNaN ? w.pos.y - 1.4 : hole.groundY
+                comps.append(HoleComp(keys: hole.keys, groundY: ground, center: sum / n, radius: radius))
             }
         }
         w.firstSeen = seen
@@ -573,12 +781,19 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
     private func publish(_ w: Walk, force: Bool = false) {
         let now = ProcessInfo.processInfo.systemUptime
-        guard force || now - w.lastPublish >= 0.2 else { return }
+        guard walk === w, force || now - w.lastPublish >= 0.2 else { return }
         w.lastPublish = now
+
+        // Free space: warn early, and stop cleanly well before the disk is really full.
+        if now - w.lastDiskCheck >= 2 {
+            w.lastDiskCheck = now
+            w.diskFree = Storage.freeBytes() ?? .max
+            if w.diskFree < Storage.lowSpaceStop { return finish(w, reason: "low_space") }
+        }
 
         var snapshot: CoverageSnapshot?
         if w.dirty, now - w.lastSnapshot >= 1 {
-            snapshot = w.grid.render()
+            snapshot = w.grid.render(prior: w.prior25)
             w.lastSnapshot = now
             w.dirty = false
         }
@@ -588,31 +803,37 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             w.holeJobRunning = true
             w.lastHoleJob = now
             let fine = w.fine
+            let prior = w.priorFine
             holeQueue.async {
-                let found = fine.holes()
+                let found = fine.holes(prior: prior)
                 self.q.async { self.applyHoles(w, found) }
             }
         }
         let guidance = guide(w)
-        if now - w.lastDiskCheck >= 5 {
-            w.lastDiskCheck = now
-            let values = try? w.dir.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
-            w.diskFree = values?.volumeAvailableCapacityForImportantUsage ?? .max
-        }
 
         var issues: [String] = []
-        if let t = w.trackingIssue { issues.append(t) }
+        if w.lost {
+            issues.append(Self.lostMessage)
+        } else {
+            if let t = w.trackingIssue { issues.append(t) }
+            if w.speed > 1 { issues.append(String(format: "Walking too fast (%.1f m/s), slow down", w.speed)) }
+            if w.trackingIssue == nil, now - w.lastValidDepth > 2 { issues.append("No valid depth (sky or too far), aim at the ground") }
+        }
         if let s = w.sessionIssue { issues.append(s) }
-        if w.speed > 1 { issues.append(String(format: "Walking too fast (%.1f m/s), slow down", w.speed)) }
-        if w.trackingIssue == nil, now - w.lastValidDepth > 2 { issues.append("No valid depth (sky or too far), aim at the ground") }
-        if w.diskFree < 2_000_000_000 { issues.append(String(format: "Low disk space (%.1f GB free)", Double(w.diskFree) / 1e9)) }
+        if w.diskFree < Storage.lowSpaceWarn {
+            issues.append(String(format: "Low disk space (%.1f GB free), recording stops at %.1f GB",
+                                 Double(w.diskFree) / 1e9, Double(Storage.lowSpaceStop) / 1e9))
+        }
         if w.writeFailed { issues.append("Writing to disk failed") }
 
+        let duration = now - w.startUptime
         onUpdate?(Update(snapshot: snapshot, x: w.pos.x, z: w.pos.z, yaw: w.yaw,
-                         duration: now - w.startUptime, frames: w.count, issues: issues,
+                         duration: duration, frames: w.count, issues: issues,
                          holes: guidance.marks, gaps: guidance.open, target: w.target,
                          targetDistance: guidance.distance, targetAngle: guidance.angle,
-                         targetOnScreen: w.targetOnScreen, filled: guidance.filled))
+                         targetOnScreen: w.targetOnScreen, filled: guidance.filled,
+                         trackingLost: w.lost, freeBytes: w.diskFree,
+                         bytesPerSecond: duration > 15 ? Double(w.bytesWritten) / duration : 0))
     }
 
     /// Marks blocked holes, counts open ones and picks the nearest open hole cell as the target.
@@ -658,6 +879,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     private var lastHeading: CLHeading?
 
     func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        if let last = locations.last { onLocation?(last.coordinate) }
         q.async {
             guard let w = self.walk else { return }
             for l in locations {
@@ -668,11 +890,10 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     }
 
     func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
-        q.async {
-            // Heading is only recorded alongside the next location fix, not on every compass tick.
-            guard self.walk != nil else { return }
-            self.lastHeading = newHeading
-        }
+        let isTrue = newHeading.trueHeading >= 0
+        onHeading?(isTrue ? newHeading.trueHeading : newHeading.magneticHeading, isTrue)
+        // Heading is only recorded alongside the next location fix, not on every compass tick.
+        q.async { self.lastHeading = newHeading }
     }
 
     private func logGPS(_ w: Walk, at time: Date) {

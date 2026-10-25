@@ -57,11 +57,18 @@ struct FineGrid {
         cells[k] = c
     }
 
-    /// Unseen regions fully enclosed by seen cells. Ground height is the mean lowest-Y of the seen cells around each hole.
-    func holes(minCells: Int = HoleConfig.minHoleCells, maxSide: Int = 2048) -> [FoundHole] {
+    /// Unseen regions fully enclosed by seen cells. Ground height is the mean lowest-Y of the seen cells around each hole
+    /// (NaN when only `prior` cells surround it, so the caller picks a fallback).
+    /// `prior` are cells already covered by a previous walk (fine-grid keys): they count as seen.
+    func holes(minCells: Int = HoleConfig.minHoleCells, maxSide: Int = 2048, prior: Set<Int64> = []) -> [FoundHole] {
         guard !cells.isEmpty else { return [] }
         var minX = Int32.max, maxX = Int32.min, minZ = Int32.max, maxZ = Int32.min
         for k in cells.keys {
+            let (ix, iz) = Self.decode(k)
+            minX = min(minX, ix); maxX = max(maxX, ix)
+            minZ = min(minZ, iz); maxZ = max(maxZ, iz)
+        }
+        for k in prior {
             let (ix, iz) = Self.decode(k)
             minX = min(minX, ix); maxX = max(maxX, ix)
             minZ = min(minZ, iz); maxZ = max(maxZ, iz)
@@ -71,6 +78,11 @@ struct FineGrid {
         let ox = Int(minX) - 1, oz = Int(minZ) - 1
         var covered = [Bool](repeating: false, count: w * h)
         var minY = [Float](repeating: .infinity, count: w * h)
+        for k in prior {
+            let (ix, iz) = Self.decode(k)
+            let col = Int(ix) - ox, row = Int(iz) - oz
+            if col >= 0, col < w, row >= 0, row < h { covered[row * w + col] = true }
+        }
         for (k, c) in cells {
             let (ix, iz) = Self.decode(k)
             let col = Int(ix) - ox, row = Int(iz) - oz
@@ -86,11 +98,11 @@ struct FineGrid {
             for i in comp {
                 let col = i % w, row = i / w
                 keys.append(Self.key(Int32(col + ox), Int32(row + oz)))
-                for j in [i - 1, i + 1, i - w, i + w] where covered[j] {
+                for j in [i - 1, i + 1, i - w, i + w] where covered[j] && minY[j].isFinite {
                     sum += minY[j]; n += 1
                 }
             }
-            return FoundHole(keys: keys, groundY: n > 0 ? sum / n : 0)
+            return FoundHole(keys: keys, groundY: n > 0 ? sum / n : .nan)
         }
     }
 }

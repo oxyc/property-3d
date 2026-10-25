@@ -11,8 +11,13 @@ func clock(_ t: TimeInterval) -> String {
 
 struct ContentView: View {
     @StateObject private var rec = Recorder()
+    @StateObject private var site = SiteStore()
     @State private var showWalks = false
     @State private var confirmStop = false
+    @State private var showAnchor = false
+    @State private var showImporter = false
+    @State private var showFetch = false
+    @State private var fetchText = ""
 
     var body: some View {
         ZStack {
@@ -25,21 +30,35 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 if rec.isRecording {
                     ForEach(rec.warnings, id: \.self) { w in
+                        let lost = w == Engine.lostMessage
                         Text(w)
-                            .font(.subheadline.bold())
+                            .font(lost ? .headline : .subheadline.bold())
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity)
-                            .padding(10)
-                            .background(.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 10))
+                            .padding(lost ? 16 : 10)
+                            .background((lost ? Color.orange : Color.red).opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
                     }
                 }
 
                 HStack(alignment: .top) {
                     if !rec.isRecording {
-                        Button { showWalks = true } label: {
-                            Label("Walks", systemImage: "folder")
-                                .padding(10)
-                                .background(.regularMaterial, in: Capsule())
+                        VStack(alignment: .leading, spacing: 8) {
+                            Button { showWalks = true } label: {
+                                Label("Walks", systemImage: "folder")
+                                    .padding(10)
+                                    .background(.regularMaterial, in: Capsule())
+                            }
+                            Menu {
+                                Button("Load coverage from Files\u{2026}", systemImage: "folder.badge.plus") { showImporter = true }
+                                Button("Fetch coverage from URL\u{2026}", systemImage: "link") { showFetch = true }
+                                if site.site != nil {
+                                    Button("Forget this site", systemImage: "trash", role: .destructive) { site.clear() }
+                                }
+                            } label: {
+                                Label(site.summary.map { "Site: \($0)" } ?? "Continue a site", systemImage: "map")
+                                    .padding(10)
+                                    .background(.regularMaterial, in: Capsule())
+                            }
                         }
                     }
                     Spacer()
@@ -57,9 +76,16 @@ struct ContentView: View {
                         .padding(.horizontal, 14).padding(.vertical, 6)
                         .background(.regularMaterial, in: Capsule())
                 }
+                spacePill
 
                 Button {
-                    if rec.isRecording { confirmStop = true } else { rec.start() }
+                    if rec.isRecording {
+                        confirmStop = true
+                    } else if site.site != nil {
+                        showAnchor = true
+                    } else {
+                        rec.start(site: nil, anchor: nil)
+                    }
                 } label: {
                     Text(rec.isRecording ? "Stop" : "Start walk")
                         .font(.title.bold())
@@ -73,14 +99,56 @@ struct ContentView: View {
         }
         .onGeometryChange(for: CGSize.self, of: \.size) { rec.setViewport($0) }
         .onAppear { rec.startPreview() }
-        .sheet(isPresented: $showWalks) { WalkListView() }
+        .task {
+            // Free space can change while idle (e.g. after deleting walks).
+            while !Task.isCancelled {
+                if !rec.isRecording { rec.refreshFreeSpace() }
+                try? await Task.sleep(for: .seconds(10))
+            }
+        }
+        .onOpenURL { site.load($0) }
+        .fileImporter(isPresented: $showImporter, allowedContentTypes: [.json]) { result in
+            if case .success(let url) = result { site.load(url) }
+        }
+        .sheet(isPresented: $showWalks, onDismiss: { rec.refreshFreeSpace() }) { WalkListView() }
+        .sheet(isPresented: $showAnchor) {
+            if let loaded = site.site {
+                AnchorSheet(rec: rec, site: loaded,
+                            onStart: { rec.start(site: loaded, anchor: $0) },
+                            onSkip: { rec.start(site: nil, anchor: nil) })
+            }
+        }
         .confirmationDialog("Stop recording?", isPresented: $confirmStop, titleVisibility: .visible) {
             Button("Stop and save", role: .destructive) { rec.stop() }
         }
-        .alert("Error", isPresented: Binding(get: { rec.errorMessage != nil }, set: { _ in rec.errorMessage = nil })) {
+        .alert("Fetch coverage", isPresented: $showFetch) {
+            TextField("http://\u{2026}/coverage.json", text: $fetchText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+            Button("Fetch") { Task { await site.fetch(fetchText) } }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert("WalkScan", isPresented: Binding(get: { rec.errorMessage != nil }, set: { _ in rec.errorMessage = nil })) {
             Button("OK") {}
         } message: {
             Text(rec.errorMessage ?? "")
+        }
+        .alert("Site coverage", isPresented: Binding(get: { site.message != nil }, set: { _ in site.message = nil })) {
+            Button("OK") {}
+        } message: {
+            Text(site.message ?? "")
+        }
+    }
+
+    /// Free space and the recording time it buys, before and during a walk.
+    @ViewBuilder private var spacePill: some View {
+        if let free = rec.freeBytes, let minutes = rec.minutesLeft {
+            let low = free < Storage.lowSpaceWarn
+            Text("\(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free  \u{00B7}  about \(minutes >= 120 ? "\(minutes / 60) h \(minutes % 60) min" : "\(minutes) min") of recording")
+                .font(.footnote.monospacedDigit().bold())
+                .foregroundStyle(low ? .white : .primary)
+                .padding(.horizontal, 12).padding(.vertical, 5)
+                .background(low ? AnyShapeStyle(Color.red.opacity(0.85)) : AnyShapeStyle(.regularMaterial), in: Capsule())
         }
     }
 }
