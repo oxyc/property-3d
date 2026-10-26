@@ -52,6 +52,12 @@ struct Update: @unchecked Sendable {
     var bytesPerSecond: Double
     /// The engine has dropped optional work (gap search) because memory is short.
     var shedding: Bool
+    /// Time to return to the start mark (or a place already walked): distance and bearing like the hole target.
+    var loopPrompt: Bool
+    var loopDistance: Float
+    var loopAngle: Float
+    /// Set once on the update after a printed marker was first seen.
+    var markerToast: String?
 }
 
 /// A blind spot for the minimap. Position is world X/Z in metres.
@@ -79,6 +85,10 @@ final class Recorder: ObservableObject {
     @Published private(set) var targetAngle: Float = 0
     @Published private(set) var targetOnScreen = false
     @Published private(set) var trackingLost = false
+    @Published private(set) var loopPrompt = false
+    @Published private(set) var loopDistance: Float = 0
+    @Published private(set) var loopAngle: Float = 0
+    @Published private(set) var markerToast: String?
     @Published private(set) var freeBytes: Int64?
     @Published private(set) var bytesPerSecond: Double = 0
     /// Live compass heading in degrees (true north if available, else magnetic) and GPS position.
@@ -93,6 +103,7 @@ final class Recorder: ObservableObject {
 
     private static let meshOverlaySeconds = 180.0
     private var meshOffTask: Task<Void, Never>?
+    private var toastTask: Task<Void, Never>?
     private var memoryObserver: NSObjectProtocol?
 
     let session = ARSession()
@@ -143,10 +154,36 @@ final class Recorder: ObservableObject {
         }
     }
 
+    /// m1, m2, ... from the bundled PNGs (ios/markers/make_markers.py, 12 by default), printed 18 cm wide.
+    private static let markerImages: Set<ARReferenceImage> = {
+        var images = Set<ARReferenceImage>()
+        for id in (1...32).map({ "m\($0)" }) {
+            guard let url = Bundle.main.url(forResource: id, withExtension: "png"),
+                  let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+                  let cg = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
+            let image = ARReferenceImage(cg, orientation: .up, physicalWidth: 0.18)
+            image.name = id
+            images.insert(image)
+        }
+        return images
+    }()
+
     private static func makeConfig(mesh: Bool) -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravityAndHeading
         config.frameSemantics = .sceneDepth
+        // 30 fps at the same 1920 x 1440 as the default: the app only uses ~10 depth frames and 2 keyframes a
+        // second, so the extra 30 callbacks/s of a 60 fps format are wasted power. Falls back to ARKit's default.
+        if let format = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: {
+            $0.framesPerSecond == 30 && $0.imageResolution == CGSize(width: 1920, height: 1440)
+        }) {
+            config.videoFormat = format
+        }
+        // Printed markers taped to fixed spots: absolute anchors across passes and walks.
+        if !markerImages.isEmpty {
+            config.detectionImages = markerImages
+            config.maximumNumberOfTrackedImages = 1
+        }
         if mesh, ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
         }
@@ -229,6 +266,8 @@ final class Recorder: ObservableObject {
         gaps = 0
         target = nil
         trackingLost = false
+        loopPrompt = false
+        markerToast = nil
         bytesPerSecond = 0
         isRecording = true
     }
@@ -277,6 +316,17 @@ final class Recorder: ObservableObject {
         targetAngle = u.targetAngle
         targetOnScreen = u.targetOnScreen
         trackingLost = u.trackingLost
+        loopPrompt = u.loopPrompt
+        loopDistance = u.loopDistance
+        loopAngle = u.loopAngle
+        if let toast = u.markerToast {
+            markerToast = toast
+            toastTask?.cancel()
+            toastTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(3))
+                if !Task.isCancelled { self?.markerToast = nil }
+            }
+        }
         bytesPerSecond = u.bytesPerSecond
         if u.freeBytes != .max { freeBytes = u.freeBytes }
         if u.shedding, meshOverlay { setMeshOverlay(false) }
@@ -369,7 +419,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
     private var walk: Walk?
     private var viewport = CGSize(width: 390, height: 844)
-    private let ciContext = CIContext()
+    /// No intermediate cache: it would keep render buffers of 1920 x 1440 frames alive between keyframes.
+    private let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private let pedometer = CMPedometer()
     private let holeQueue = DispatchQueue(label: "walkscan.holes", qos: .utility)
     private let motionManager = CMMotionManager()
     private let motionQueue = OperationQueue()
@@ -389,6 +441,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let eventsFile: FileHandle
         let baroFile: FileHandle
         let diagFile: FileHandle
+        let loopsFile: FileHandle
+        let motionFile: FileHandle
+        let markersFile: FileHandle
         let encoder = JSONEncoder()
         var meta: [String: Any]
 
@@ -403,7 +458,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         var count = 0
         var bytesWritten: Int64 = 0
         var lastDepthT = -Double.infinity
-        var lastRGBT = -Double.infinity
+        var keyframes = KeyframeGate()
+        var lastCoverageT = -Double.infinity
         var lastPublish = 0.0
         var lastSnapshot = 0.0
         var lastDiskCheck = -Double.infinity
@@ -419,6 +475,14 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         var monitor = TrackingMonitor()
         var motion = MotionWindow()
         var lost = false
+        var degenerate = DegenerateMonitor()
+
+        // Return-to-start prompts, motion.jsonl buffer, marker sightings
+        var loop = LoopMonitor()
+        var motionBuf = Data()
+        var markerLastLogged: [String: Double] = [:]
+        var markerLastSeen: [String: Double] = [:]
+        var markerToast: String?
 
         // Blind-spot guidance
         var fine = FineGrid()
@@ -454,10 +518,11 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             self.startDate = startDate
             lastValidDepth = startUptime
             let fm = FileManager.default
-            for sub in ["depth", "conf", "rgb"] {
+            for sub in ["depth", "rgb"] {
                 try fm.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
             }
-            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl", "baro.jsonl", "diag.jsonl"] {
+            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl", "baro.jsonl", "diag.jsonl", "loops.jsonl",
+                         "motion.jsonl", "markers.jsonl"] {
                 guard fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: nil) else {
                     throw CocoaError(.fileWriteUnknown)
                 }
@@ -467,9 +532,12 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             eventsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("events.jsonl"))
             baroFile = try FileHandle(forWritingTo: dir.appendingPathComponent("baro.jsonl"))
             diagFile = try FileHandle(forWritingTo: dir.appendingPathComponent("diag.jsonl"))
+            loopsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("loops.jsonl"))
+            motionFile = try FileHandle(forWritingTo: dir.appendingPathComponent("motion.jsonl"))
+            markersFile = try FileHandle(forWritingTo: dir.appendingPathComponent("markers.jsonl"))
             meta = [
-                "format_version": 2,
-                "app_version": "0.5",
+                "format_version": 3,
+                "app_version": "0.6",
                 "depth_dtype": "f16",
                 "device": Engine.deviceModel,
                 "started_at": Engine.iso.string(from: startDate),
@@ -528,6 +596,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         /// Rewrites meta.json so a killed walk still has a sane frame count and a recent checkpoint time.
         func checkpoint() {
+            flushIntervals()
             meta["frame_count"] = count
             meta["last_checkpoint"] = Engine.iso.string(from: Date())
             writeMeta()
@@ -537,6 +606,30 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
             line.append(10)
             write(line, to: baroFile)
+        }
+
+        /// Writes what a killed app would otherwise lose: the open degenerate_view interval so far, and buffered motion lines.
+        func flushIntervals() {
+            if let event = degenerate.flush() { log(event) }
+            flushMotion()
+        }
+
+        /// motion.jsonl lines are buffered (20 Hz would otherwise be 20 writes a second) and written every ~4 s.
+        func logMotion(_ line: String) {
+            motionBuf.append(Data(line.utf8))
+            if motionBuf.count >= 4096 { flushMotion() }
+        }
+
+        func flushMotion() {
+            guard !motionBuf.isEmpty else { return }
+            write(motionBuf, to: motionFile)
+            motionBuf.removeAll(keepingCapacity: true)
+        }
+
+        func logLine(_ entry: [String: Any], to file: FileHandle) {
+            guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+            line.append(10)
+            write(line, to: file)
         }
 
         func log(_ event: TrackingEvent) {
@@ -563,15 +656,34 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         try q.sync { walk = try Walk(dir: dir, startUptime: startUptime, startDate: startDate, site: site, anchor: anchor) }
         // The accelerometer tells genuine fast motion from ARKit sliding while the phone is still.
         if motionManager.isDeviceMotionAvailable {
-            motionManager.deviceMotionUpdateInterval = 1.0 / 30
+            motionManager.deviceMotionUpdateInterval = 1.0 / 20
             motionManager.startDeviceMotionUpdates(to: motionQueue) { [weak self] motion, _ in
                 guard let self, let motion else { return }
                 let a = motion.userAcceleration
                 let magnitude = Float((a.x * a.x + a.y * a.y + a.z * a.z).squareRoot())
-                self.q.async { self.walk?.motion.add(t: motion.timestamp, magnitudeG: magnitude) }
+                // motion.jsonl: user acceleration in g, device axes, shortest exact Float text.
+                let line = String(format: "{\"k\":\"a\",\"t\":%.3f,\"a\":[", WalkClock.t(motion.timestamp, startUptime: startUptime))
+                    + "\(Float(a.x)),\(Float(a.y)),\(Float(a.z))]}\n"
+                self.q.async {
+                    self.walk?.motion.add(t: motion.timestamp, magnitudeG: magnitude)
+                    self.walk?.logMotion(line)
+                }
             }
         }
         startBarometer(startUptime: startUptime)
+        startPedometer(startDate: startDate)
+    }
+
+    /// Step count and walked distance from the pedometer (cumulative since the walk started), on updates.
+    private func startPedometer(startDate: Date) {
+        guard CMPedometer.isStepCountingAvailable() else { return }
+        pedometer.startUpdates(from: startDate) { [weak self] data, _ in
+            guard let self, let data else { return }
+            var line = String(format: "{\"k\":\"p\",\"t\":%.3f,\"s\":%d", data.endDate.timeIntervalSince(startDate), data.numberOfSteps.intValue)
+            if let d = data.distance { line += ",\"d\":\(Float(d.doubleValue))" }
+            line += "}\n"
+            self.q.async { self.walk?.logMotion(line) }
+        }
     }
 
     /// Barometer as an independent vertical reference, logged to baro.jsonl on the frame clock.
@@ -615,10 +727,13 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         guard walk === w else { return }
         walk = nil
         motionManager.stopDeviceMotionUpdates()
+        pedometer.stopUpdates()
         altimeter.stopRelativeAltitudeUpdates()
         altimeter.stopAbsoluteAltitudeUpdates()
         let duration = ProcessInfo.processInfo.systemUptime - w.startUptime
         if let event = w.monitor.finish(t: duration) { w.log(event) }
+        if let event = w.degenerate.finish(t: duration) { w.log(event) }
+        w.flushMotion()
         w.meta["ended_at"] = Self.iso.string(from: Date())
         w.meta["end_reason"] = reason
         w.meta["frame_count"] = w.count
@@ -628,6 +743,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         try? w.eventsFile.close()
         try? w.baroFile.close()
         try? w.diagFile.close()
+        try? w.loopsFile.close()
+        try? w.motionFile.close()
+        try? w.markersFile.close()
         if duration > 30 { Storage.saveRate(Double(w.bytesWritten) / duration) }
         if reason != "user" { onStopped?(reason) }
     }
@@ -643,12 +761,14 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     /// Memory is short: stop the optional gap search and free its structures. Stays on for the rest of the walk.
     func shed(reason: String) {
         q.async {
+            self.walk?.flushIntervals()  // a memory warning may precede a kill
             guard let w = self.walk, !w.shedding else { return }
             self.beginShedding(w, reason: reason)
         }
     }
 
     private func beginShedding(_ w: Walk, reason: String) {
+        w.flushIntervals()
         w.shedding = true
         w.comps = []
         w.lookCells = []
@@ -665,6 +785,30 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
     func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
         meshAnchors += anchors.reduce(0) { $0 + ($1 is ARMeshAnchor ? 1 : 0) }
+        for case let image as ARImageAnchor in anchors { markerSeen(image) }
+    }
+
+    func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
+        for case let image as ARImageAnchor in anchors { markerSeen(image) }
+    }
+
+    /// A printed marker's pose in the walk's world frame, at most 2 Hz per marker, to markers.jsonl.
+    private func markerSeen(_ anchor: ARImageAnchor) {
+        guard let w = walk, let id = anchor.referenceImage.name else { return }
+        let t = ProcessInfo.processInfo.systemUptime - w.startUptime
+        // Toast the first sighting, and again when it was out of sight for a minute (a new pass).
+        if t - (w.markerLastSeen[id] ?? -.infinity) > 60 { w.markerToast = "Marker \(id) seen" }
+        w.markerLastSeen[id] = t
+        guard t - (w.markerLastLogged[id] ?? -.infinity) >= 0.5 else { return }
+        w.markerLastLogged[id] = t
+        let tr = anchor.transform
+        let entry: [String: Any] = [
+            "t": (t * 1000).rounded() / 1000, "id": id,
+            "T": (0..<4).flatMap { c in (0..<4).map { r in tr[c][r] } },
+            "tracked": anchor.isTracked, "size_m": Double(anchor.referenceImage.physicalSize.width),
+            "scale": Double(anchor.estimatedScaleFactor),
+        ]
+        w.logLine(entry, to: w.markersFile)
     }
 
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
@@ -726,6 +870,11 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         w.lastPos = w.pos
         w.lastPosT = now
 
+        // Back at the start mark: tell the pipeline (loops.jsonl, not events.jsonl: this is good, not bad, tracking).
+        if w.loop.update(t: now - w.startUptime, pos: w.pos) {
+            w.logLine(["t": ((now - w.startUptime) * 1000).rounded() / 1000, "kind": "start_revisit"], to: w.loopsFile)
+        }
+
         if let t = w.target {
             let toTarget = SIMD3(t.x - w.pos.x, t.y - w.pos.y, t.z - w.pos.z)
             var onScreen = false
@@ -748,16 +897,27 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         // A frame is only logged if every file it refers to was written. Any failed write ends the walk
         // cleanly instead of logging frames whose files are missing.
         let stem = String(format: "%06d", w.count)
-        w.write(Self.float16(depthData), path: "depth/\(stem).bin")
-        w.write(confData, path: "conf/\(stem).bin")
+        w.write(Self.float16(depthData, confidence: confData), path: "depth/\(stem).bin")
+
+        // A view that is mostly one flat surface lets ARKit's pose slide: log it as low-trust odometry.
+        let fwd3 = SIMD3(fwd.x, fwd.y, fwd.z)
+        let planar: Bool? = depthData.withUnsafeBytes { raw in
+            let k = cam.intrinsics
+            return ViewShape.isDegenerate(depth: raw.bindMemory(to: Float.self), width: depthW, height: depthH,
+                                          fx: k[0][0], fy: k[1][1], cx: k[2][0], cy: k[2][1],
+                                          scale: Float(cam.imageResolution.width) / Float(depthW),
+                                          up: SIMD3(Double(cam.transform.columns.0.y), Double(cam.transform.columns.1.y),
+                                                    Double(cam.transform.columns.2.y)))  // world +Y in camera axes
+        }
+        if let planar, let event = w.degenerate.update(t: now - w.startUptime, degenerate: planar) { w.log(event) }
 
         var hasRGB = false
-        if now - w.lastRGBT >= 0.48 {
+        if w.keyframes.due(t: now, pos: w.pos, fwd: fwd3) {
             let image = CIImage(cvPixelBuffer: frame.capturedImage)
             let options = [CIImageRepresentationOption(rawValue: kCGImageDestinationLossyCompressionQuality as String): 0.8]
             if let jpeg = ciContext.jpegRepresentation(of: image, colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!, options: options) {
                 hasRGB = w.write(jpeg, path: "rgb/\(stem).jpg")
-                w.lastRGBT = now
+                w.keyframes.saved(t: now, pos: w.pos, fwd: fwd3)
             }
         }
         guard !w.writeFailed else { return finish(w, reason: "write_failed") }
@@ -784,6 +944,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         guard !w.writeFailed else { return finish(w, reason: "write_failed") }
         w.count += 1
 
+        // Coverage and hole bookkeeping is the heaviest per-frame work after encoding, and 3 Hz is plenty for it.
+        guard now - w.lastCoverageT >= 0.33 else { return }
+        w.lastCoverageT = now
         collectCoverage(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH)
         if !w.lost { registerLooks(w, frame: frame, depth: depthData, conf: confData, width: depthW, height: depthH) }
     }
@@ -1011,6 +1174,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             if w.speed > 1 { issues.append(String(format: "Walking too fast (%.1f m/s), slow down", w.speed)) }
             if w.trackingIssue == nil, now - w.lastValidDepth > 2 { issues.append("No valid depth (sky or too far), aim at the ground") }
         }
+        if w.degenerate.warning { issues.append(DegenerateConfig.message) }
         if let s = w.sessionIssue { issues.append(s) }
         if w.shedding { issues.append("Low memory: gap search and mesh paused to keep recording") }
         if w.diskFree < Storage.lowSpaceWarn {
@@ -1018,6 +1182,16 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                                  Double(w.diskFree) / 1e9, Double(Storage.lowSpaceStop) / 1e9))
         }
         if w.writeFailed { issues.append("Writing to disk failed") }
+
+        var loopAngle: Float = 0
+        if let s = w.loop.start {
+            let bearing = atan2(s.x - w.pos.x, -(s.z - w.pos.z))
+            loopAngle = bearing - w.yaw
+            while loopAngle > .pi { loopAngle -= 2 * .pi }
+            while loopAngle < -.pi { loopAngle += 2 * .pi }
+        }
+        let toast = w.markerToast
+        w.markerToast = nil
 
         let duration = now - w.startUptime
         onUpdate?(Update(snapshot: snapshot, x: w.pos.x, z: w.pos.z, yaw: w.yaw,
@@ -1027,7 +1201,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                          targetOnScreen: w.targetOnScreen, filled: guidance.filled,
                          trackingLost: w.lost, freeBytes: w.diskFree,
                          bytesPerSecond: duration > 15 ? Double(w.bytesWritten) / duration : 0,
-                         shedding: w.shedding))
+                         shedding: w.shedding, loopPrompt: w.loop.prompting && !w.lost,
+                         loopDistance: w.loop.distanceToStart(from: w.pos), loopAngle: loopAngle, markerToast: toast))
     }
 
     /// One health line for diag.jsonl: memory headroom and footprint, heat, battery, frame backlog, structure sizes.
@@ -1161,11 +1336,16 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         }
     }
 
-    /// Float32 depth bytes -> Float16 bytes (halves storage; ~2 mm precision at 4 m).
-    private static func float16(_ data: Data) -> Data {
+    /// Float32 depth bytes -> Float16 bytes (halves storage; ~2 mm precision at 4 m). Format v3: pixels that are
+    /// invalid or have low confidence (< 1) are written as 0, so no separate confidence file is needed.
+    private static func float16(_ data: Data, confidence: Data) -> Data {
         data.withUnsafeBytes { raw in
-            let src = raw.bindMemory(to: Float.self)
-            return src.map { Float16($0) }.withUnsafeBufferPointer { Data(buffer: $0) }
+            confidence.withUnsafeBytes { conf in
+                let src = raw.bindMemory(to: Float.self)
+                let c = conf.bindMemory(to: UInt8.self)
+                return src.indices.map { i -> Float16 in c[i] >= 1 && src[i].isFinite && src[i] > 0 ? Float16(src[i]) : 0 }
+                    .withUnsafeBufferPointer { Data(buffer: $0) }
+            }
         }
     }
 

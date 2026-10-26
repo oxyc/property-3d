@@ -29,9 +29,26 @@ struct ContentView: View {
             if rec.isRecording, rec.target != nil, !rec.targetOnScreen {
                 GuideArrow(angle: rec.targetAngle, distance: rec.targetDistance)
             }
+            if rec.isRecording, rec.loopPrompt {
+                GuideArrow(angle: rec.loopAngle, distance: rec.loopDistance, color: .blue)
+            }
 
             VStack(spacing: 10) {
                 if rec.isRecording {
+                    if rec.loopPrompt {
+                        Text("Close the loop: walk back to the start mark (\(Int(rec.loopDistance)) m)")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(10)
+                            .background(Color.blue.opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
+                    }
+                    if let toast = rec.markerToast {
+                        Text(toast)
+                            .font(.footnote.bold())
+                            .padding(.horizontal, 12).padding(.vertical, 6)
+                            .background(.regularMaterial, in: Capsule())
+                    }
                     ForEach(rec.warnings, id: \.self) { w in
                         let lost = w == Engine.lostMessage
                         Text(w)
@@ -162,7 +179,8 @@ struct ContentView: View {
     @ViewBuilder private var spacePill: some View {
         if let free = rec.freeBytes, let minutes = rec.minutesLeft {
             let low = free < Storage.lowSpaceWarn
-            Text("\(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free  \u{00B7}  about \(minutes >= 120 ? "\(minutes / 60) h \(minutes % 60) min" : "\(minutes) min") of recording")
+            let perHour = rec.isRecording && rec.bytesPerSecond > 0 ? String(format: "  \u{00B7}  %.1f GB/h", rec.bytesPerSecond * 3.6e-6) : ""
+            Text("\(ByteCountFormatter.string(fromByteCount: free, countStyle: .file)) free  \u{00B7}  about \(minutes >= 120 ? "\(minutes / 60) h \(minutes % 60) min" : "\(minutes) min") of recording\(perHour)")
                 .font(.footnote.monospacedDigit().bold())
                 .foregroundStyle(low ? .white : .primary)
                 .padding(.horizontal, 12).padding(.vertical, 5)
@@ -223,6 +241,7 @@ struct ARContainer: UIViewRepresentable {
 struct GuideArrow: View {
     let angle: Float
     let distance: Float
+    var color: Color = .pink
 
     var body: some View {
         GeometryReader { geo in
@@ -238,7 +257,7 @@ struct GuideArrow: View {
             }
             .foregroundStyle(.white)
             .padding(10)
-            .background(Color.pink.opacity(0.85), in: RoundedRectangle(cornerRadius: 16))
+            .background(color.opacity(0.85), in: RoundedRectangle(cornerRadius: 16))
             .position(x: geo.size.width / 2 + dir.dx * t, y: geo.size.height / 2 + dir.dy * t)
         }
         .allowsHitTesting(false)

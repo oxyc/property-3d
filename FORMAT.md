@@ -1,4 +1,8 @@
-# Walk recording format (v2)
+# Walk recording format (v3)
+
+v3: no conf/; depth 0 = invalid or low confidence. Also new in v3: RGB keyframes only when the camera moved
+or turned (or 3 s passed), and the optional files loops.jsonl, motion.jsonl and markers.jsonl, plus the
+`degenerate_view` reason in events.jsonl. A reader of v2 walks still finds conf/ and uses it.
 
 v2 changes from v1: depth is float16 (`meta.depth_dtype = "f16"`; absent means float32),
 RGB keyframes ~2 Hz, gps.jsonl written once per location fix.
@@ -14,15 +18,23 @@ walk_YYYYMMDD_HHMMSS/
   events.jsonl       optional: intervals where tracking was wrong (absent in older walks = none recorded)
   baro.jsonl         optional: barometer samples, an independent vertical reference (absent in older walks)
   diag.jsonl         optional: app health every ~5 s (memory, heat, battery, frame backlog), for debugging crashes
+  loops.jsonl        optional (v3): the user came back to the start mark (a loop closure)
+  motion.jsonl       optional (v3): accelerometer and pedometer, an independent check of distance walked
+  markers.jsonl      optional (v3): sightings of printed markers with their pose
   depth/000000.bin   Float16 little-endian (v1: Float32), metres, row-major, depth_w × depth_h
-  conf/000000.bin    UInt8 ARConfidenceLevel (0 low, 1 medium, 2 high), same layout
-  rgb/000000.jpg     only on some frames (~2 Hz), JPEG quality 0.8, full camera res
+  conf/000000.bin    v1 and v2 only: UInt8 ARConfidenceLevel (0 low, 1 medium, 2 high), same layout
+  rgb/000000.jpg     only on some frames (at most 2 Hz; v3: only if the camera moved >= 0.25 m or turned >= 8°
+                     since the last one, or >= 3 s passed), JPEG quality 0.8, full camera res
 ```
 
-Frame indices are zero-padded to 6 digits and shared between depth/conf/rgb.
+Frame indices are zero-padded to 6 digits and shared between depth/rgb (and conf in v1/v2).
 
 Depth is ARKit `sceneDepth`: planar z-depth (not ray length). Invalid pixels may be
 0 or NaN; readers should treat anything outside a sane range as invalid.
+
+**v3: no conf/; depth 0 = invalid or low confidence.** The app writes 0 for every pixel whose ARKit
+confidence was < 1 (low) and for invalid pixels (NaN, <= 0). All other pixels are medium or high confidence.
+A v3 walk has no `conf/` directory; for v1/v2 walks keep applying `conf` as before.
 
 Both `t` fields (frames and gps) are seconds since the same walk-start instant:
 frames use `ARFrame.timestamp − startUptime`, GPS uses `CLLocation.timestamp − startDate`,
@@ -38,8 +50,8 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 
 ```json
 {
-  "format_version": 2,
-  "app_version": "0.5",
+  "format_version": 3,                     // 2: has conf/ ; 3: no conf/, depth 0 = invalid or low confidence
+  "app_version": "0.6",
   "depth_dtype": "f16",
   "device": "iPhone16,1",
   "started_at": "2026-10-19T15:00:00Z",   // ISO 8601 UTC
@@ -93,7 +105,7 @@ One JSON object per recorded depth frame (~10 Hz), appended as recorded:
   "transform": [16 floats],          // ARCamera.transform, camera-to-world, COLUMN-major
   "intrinsics": [fx, fy, cx, cy],    // ARCamera.intrinsics, in RGB image pixels
   "tracking": "normal",              // normal | limited_* | not_available
-  "rgb": true                        // whether rgb/<i>.jpg exists
+  "rgb": true                        // whether rgb/<i>.jpg exists (v3: not on every ~0.5 s slot, see above)
 }
 ```
 
@@ -135,11 +147,21 @@ The pipeline should drop (or re-register) frames with `t_start <= t <= t_end`. `
 - `tracking_limited` / `relocalizing`: ARKit tracking state was limited or relocalizing for over 1 s
   (shorter dips are only a warning). Frames are not recorded while it lasts, so there is a gap.
 
+- `degenerate_view` (v3): the depth view was dominated by one flat surface (more than 85% of the sampled
+  points within a few cm of one plane) or had only one strong direction, for over 1.5 s. ARKit's pose can
+  slide along such a surface (e.g. a long uniform fence or wall). **Treat these intervals as low-trust
+  odometry, not as drops**: the frames are valid and recorded; down-weight their poses in optimisation
+  and prefer other constraints (loop closures, markers, GPS, barometer) over them. A ground-only view
+  counts too. Unlike the first two reasons, `t_start` is the first degenerate frame (no 10 s pre-roll) and
+  `t_end` is 1 s after the last one. A long interval may be written in several consecutive pieces
+  (the end of one is the start of the next): the app flushes the open interval every 30 s, on memory
+  warnings and when the walk stops, so a killed app loses at most 30 s of it. Adjacent pieces can be merged.
+
 `t_start` is 10 s before detection for the first two reasons (the pose drifts for a while before it
 is detectable; on the recorded failures it lands about at the real onset) and the moment tracking
 degraded for the last two. `t_end` is 1 s after the last anomaly, and the interval stays open until
-3 s of clean frames. The app also keeps these frames out of its live coverage map. An interval still
-open when the app dies is not written.
+3 s of clean frames. The app also keeps these frames out of its live coverage map. An interval of these
+four reasons still open when the app dies is not written (`degenerate_view` is flushed as above).
 
 ## baro.jsonl (optional)
 
@@ -159,6 +181,70 @@ Two line types, told apart by `type`; either may be missing on a device without 
   fit a slow drift out. Walking up a staircase or stopping at a taped mark gives the cleanest checks.
 - `absolute`: GPS-assisted altitude above sea level with its `accuracy_m` (metres, 68%) and
   `precision_m` (the barometric part); irregular, only when the system has an estimate.
+
+## loops.jsonl (optional, v3)
+
+Moments when the user physically came back to the walk's start mark, i.e. a loop closure with the start. This
+is good news, not bad tracking, so it is not in events.jsonl. `t` is on the frame clock:
+
+```json
+{"kind": "start_revisit", "t": 812.4}
+```
+
+- `start_revisit`: the camera was within 1.5 m (horizontal, in ARKit's own world coordinates) of the pose where
+  recording started, having been more than 5 m away since the start or the previous revisit. The user is
+  physically at the start at that `t`, while the ARKit pose there has drifted by the accumulated error: the
+  pipeline should use the time, not the position, and tie that frame's pose to the first frames of the walk.
+- The app prompts for this every ~8 min of walking or ~250 m of path since the last revisit, so a long walk
+  has them roughly that often if the user follows the prompt. The file may be empty or absent: no revisit.
+
+## motion.jsonl (optional, v3)
+
+An independent measure of distance walked, to detect ARKit sliding along a uniform surface. One JSON object per
+line, short keys, numbers at float32 precision. Two line types by `k`:
+
+```json
+{"k": "a", "t": 12.345, "a": [0.012, -0.034, 0.101]}
+{"k": "p", "t": 13.2, "s": 18, "d": 12.7}
+```
+
+- `a`: `CMDeviceMotion.userAcceleration` (gravity removed) in g, in the phone's own axes, about 20 Hz. `t` is
+  on the frame clock (CoreMotion and ARKit timestamps share the boot clock). The phone's orientation is not
+  logged here; use frames.jsonl poses to rotate it to the world frame. The accelerometer is noisy:
+  use its magnitude/variance as a "walking or standing" cue, not for double integration.
+- `p`: `CMPedometer` update, cumulative since the walk started: `s` step count, `d` distance in metres
+  (omitted when the device gives none). Updates come in batches every few seconds. `t` is the
+  update's `endDate` minus the walk start date (the GPS clock: wall time, which can differ from the frame clock
+  by milliseconds; negligible here). Pedometer distance is rough (stride model, about 5 to 10%) but
+  independent of ARKit: ARKit path length far above it over the same window means the pose slid.
+- Lines are buffered, so a killed app may be missing the last few seconds.
+
+## markers.jsonl (optional, v3)
+
+Sightings of printed reference markers taped to fixed spots (house wall, gate posts, start mark), detected by
+ARKit image detection. Each sighting gives the marker's exact pose in the walk's world frame, an absolute
+anchor that the same physical marker shares across passes and walks. `ios/markers/make_markers.py` generates the
+markers (ids `m1` to `m12`, A4 pages in `ios/markers/walkscan_markers.pdf`, printed with the square exactly
+18.0 cm wide).
+
+```json
+{"t": 12.3, "id": "m1", "T": [16 floats], "tracked": true, "size_m": 0.18, "scale": 1.0}
+```
+
+- `t`: frame clock, seconds since walk start. At most 2 lines per second per marker.
+- `id`: marker id, `m1` ... `m12`; the same id is always the same physical sheet.
+- `T`: `ARImageAnchor.transform`, marker-to-world, COLUMN-major like frames.jsonl, in this walk's world
+  frame. The marker's local +X is along the printed square's right edge, +Y is its surface normal
+  (out of the sheet) and +Z points to the bottom edge of the image (ARKit image anchor convention).
+- `tracked`: ARKit was actively tracking the image in this frame. When false the pose is the last known one
+  (the marker is out of view); prefer lines with `tracked: true`.
+- `size_m`: physical width the app assumed (0.18).
+- `scale`: `estimatedScaleFactor`, ARKit's estimate of how much larger the printed marker is than
+  `size_m` (1.0 = as assumed; a badly scaled print shows up here, and the pose then has the wrong range).
+- Pipeline use: the same `id` must have one pose in the merged model across every pass and every walk, so a
+  sighting is a loop constraint between the walk's drifting pose chain and a fixed point. Fit one world pose
+  per id and constrain each sighting to it. Poses near the edge of the field of view or at a grazing angle
+  are less accurate; the orientation is better than the position along the viewing ray.
 
 ## diag.jsonl (optional)
 
