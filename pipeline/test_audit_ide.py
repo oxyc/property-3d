@@ -21,7 +21,12 @@ CRS = "EPSG:5382"
 ERR_T, ERR_YAW, ERR_Z = (4.0, -3.0), np.deg2rad(3.0), 2.0
 
 
+FLAT = False  # featureless scene for the ambiguity test: dead-flat ground, no houses, no trees
+
+
 def ground(x, y):
+    if FLAT:
+        return 30 + 0 * x
     return 30 + 0.03 * x + 0.01 * y + 1.5 * np.sin(x / 17) * np.cos(y / 13)
 
 
@@ -34,6 +39,8 @@ def box(x, y, x0, x1, y0, y1, top):
 
 
 def houses(x, y):
+    if FLAT:
+        return np.full(np.shape(x), -np.inf)
     return np.maximum(box(x, y, -10, -2, 4, 14, 36.0), box(x, y, 10, 16, -12, -6, 33.5))
 
 
@@ -44,18 +51,20 @@ MODEL_TREES = [(-15, 15), (2, -8), (20, -15)]
 def ide_dsm(x, y):
     g = ground(x, y)
     rng = np.random.default_rng(5)
-    t = sum(dome(x, y, cx, cy) for cx, cy in IDE_TREES)
+    t = sum((dome(x, y, cx, cy) for cx, cy in ([] if FLAT else IDE_TREES)), np.zeros(np.shape(x)))
     return np.maximum(np.maximum(g + t * (1 + 0.15 * rng.standard_normal(x.shape)), g), houses(x, y))
 
 
 def model_top(x, y):
     g = ground(x, y)
+    if FLAT:
+        return g
     new_house = box(x, y, -4, 2, -24, -18, 34.0)  # newer than the aerial data
     return np.maximum(np.maximum(g + sum(dome(x, y, cx, cy) for cx, cy in MODEL_TREES), houses(x, y)), new_house)
 
 
 def in_tree(x, y):
-    return sum(dome(x, y, cx, cy) for cx, cy in MODEL_TREES) > 0
+    return sum((dome(x, y, cx, cy) for cx, cy in ([] if FLAT else MODEL_TREES)), np.zeros(np.shape(x))) > 0
 
 
 def write_ide(d):
@@ -181,7 +190,27 @@ def test_ground_from_points_only():
         assert np.hypot(E2 - (W[0] + px.ravel()), N2 - (W[1] + py.ravel())).max() < 0.3
 
 
+def test_ambiguous_scene_is_not_determinable():
+    global FLAT
+    FLAT = True
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            a = run(tmp, tilt_mm_per_m=8.0)  # a real tilt is present but must not be reported as a finding
+            f = a["fit_vs_gps_georef"]
+            assert f["placement_status"] == "ambiguous_gps_fallback" and f["ambiguity_reasons"], f["placement_status"]
+            assert (f["dE"], f["dN"], f["dyaw_deg_ccw"]) == (0.0, 0.0, 0.0)  # GPS placement kept, only dz fitted
+            assert abs(f["dz"] + ERR_Z) < 0.2
+            d = a["drift"]
+            assert d["status"] == "not_determinable" and d["ground_plane_and_bowl"] is None
+            assert d["tiles"]["spread"]["horizontal_drift_suspected"] is None
+            ide = json.loads((Path(tmp) / "rep" / "georef_ide.json").read_text())
+            assert ide["placement_status"] == "ambiguous_gps_fallback" and ide["yaw_deg"] == 0.0
+    finally:
+        FLAT = False
+
+
 if __name__ == "__main__":
+    test_ambiguous_scene_is_not_determinable()
     test_clean_model_reports_no_drift()
     test_recovers_offset_and_detects_tilt()
     test_ground_from_points_only()
