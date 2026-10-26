@@ -1,6 +1,6 @@
 """Merge several walks into one model in the first walk's frame.
 
-usage: merge.py <out_dir> <walk_dir> [<walk_dir> ...] [--jobs 3]
+usage: merge.py <out_dir> <walk_dir> [<walk_dir> ...] [--jobs 3] [--no-visual]
 
 Bad tracking is cut out first (optimize.find_failures: ARKit sliding for seconds then relocalising, jumps too
 big to ramp, long tracking loss; each padded by a second). A walk with such stretches is split into its clean
@@ -55,7 +55,11 @@ from optimize import INLIER_DIST, MIN_INLIERS, NEAR_DIST, gaps, reg, rot_y, shif
 
 GRID = 0.25  # raster cell for the coarse search (m)
 STRUCT_MIN = 0.15  # vertical extent per cell that counts as ground relief, not structure (m)
-SEARCH = 12.0  # translation search radius around the GPS guess (m)
+SEARCH = 25.0  # translation search radius around the GPS guess (m): GPS placements of two walks can be 15 m apart
+VISUAL_REGISTER_MIN = 3  # visual registration of a piece needs this many constraints that agree on one placement
+VISUAL_REGISTER_RADIUS, VISUAL_REGISTER_PAIRS = 18.0, 1500  # m, keyframe pairs: GPS can put a piece 15 m off, so look that far
+VISUAL_PAIR_RADIUS = 20.0  # m: pieces whose placed camera paths come closer than this get visual loops between them
+VISUAL_MAX_CORRECTION = 5.0  # m: a visual edge may not ask a fragment to move further than this from its placement
 YAW_RANGE, YAW_STEP = 20.0, 1.0  # degrees
 BLUR = 1.5  # cells
 N_CANDIDATES = 4  # coarse peaks ranked by ICP
@@ -231,9 +235,9 @@ def cloud_of(points, normals):
 def unit_job(args):
     """Worker: optimise one unit on its own, then build its fragments from the result. Returns (log lines, fragment
     data with each cloud as a (points, normals) pair: Open3D clouds cannot be pickled)."""
-    walk, out, frag_frames, ids = args
+    walk, out, frag_frames, ids, visual, jobs = args
     lines = []
-    optimize.optimize(walk, out, frag_frames, log=lines.append, frame_ids=ids)
+    optimize.optimize(walk, out, frag_frames, log=lines.append, frame_ids=ids, visual=visual, jobs=jobs)
     d = fragment_data(walk, Path(out) / "poses.npz", frag_frames)
     d["clouds"] = [(np.asarray(c.points), np.asarray(c.normals)) for c in d["clouds"]]
     return lines, d
@@ -264,6 +268,51 @@ def continuity(k, anchored, units, data):
     return None
 
 
+def visual_register(k, registered, walks, own, G, jobs, log):
+    """Place unit k by photo features when ICP could not (too little structure to match, or further off than the search
+    radius): visual constraints between k and every registered unit j each imply a placement of k's world in the
+    reference frame (G_j @ H); the placement most of them agree on, if at least VISUAL_REGISTER_MIN do, wins. The first
+    guess G[k] (GPS or neighbour) only chooses which keyframes to try; visual.visual_loops re-places k from the
+    constraints it finds and tries again. Returns (G_k or None, report)."""
+    import visual
+    kfs_k = visual.keyframes(walks[k], own[k])
+    at = np.mean([f["T"][:3, 3] for f in kfs_k], axis=0)  # the unit's own centre: the projection to yaw keeps it in place
+    report, guess = {"rounds": []}, G[k]
+    for rnd in range(2):
+        Gs, inl, against = [], [], []
+        for j in registered:
+            cons, summ = visual.visual_loops(walks[j], walks[k], poses_a=own[j], poses_b=own[k], init=np.linalg.inv(G[j]) @ guess,
+                                             max_pairs=VISUAL_REGISTER_PAIRS, workers=max(1, jobs), log=log,
+                                             radius=VISUAL_REGISTER_RADIUS, max_angle=90.0)  # GPS placements are metres off
+            if cons:
+                Gs += [G[j] @ H for H in visual.world_alignments(cons, visual.keyframes(walks[j], own[j]), kfs_k)]
+                inl += [c[6]["n_inliers"] for c in cons]
+            against.append({"unit": j, "pairs": summ["pairs"], "constraints": len(cons), "rejected": summ["rejected"]})
+        report["rounds"].append({"first_guess_m": guess[:3, 3].tolist(), "against": against, "constraints": len(Gs)})
+        if len(Gs) >= VISUAL_REGISTER_MIN or not Gs:
+            break
+        guess = Gs[int(np.argmax(inl))]  # one or two constraints: not enough to place the piece, but they say where to look
+    report["constraints"] = len(Gs)
+    if len(Gs) < VISUAL_REGISTER_MIN:
+        report["why"] = f"only {len(Gs)} visual constraints (need {VISUAL_REGISTER_MIN})"
+        return None, report
+    Gs = np.array(Gs)
+    best, mask = optimize.agreeing(Gs, at)
+    report["agreeing"] = int(mask.sum())
+    if mask.sum() < VISUAL_REGISTER_MIN:
+        report["why"] = f"{len(Gs)} visual constraints but only {int(mask.sum())} agree on a placement (need {VISUAL_REGISTER_MIN})"
+        return None, report
+    where = np.mean([g[:3, :3] @ at + g[:3, 3] for g in Gs[mask]], axis=0)  # mean of the agreeing placements
+    yaw = float(np.degrees(np.arctan2(np.mean([np.sin(yaw_of(g[:3, :3])) for g in Gs[mask]]),
+                                      np.mean([np.cos(yaw_of(g[:3, :3])) for g in Gs[mask]]))))
+    R = rot_y(np.radians(yaw))
+    Gk = make_G(np.radians(yaw), where - R @ at)
+    report.update(yaw_deg=yaw, translation_m=Gk[:3, 3].tolist(),
+                  spread_m=float(np.max([np.linalg.norm(g[:3, :3] @ at + g[:3, 3] - where) for g in Gs[mask]])),
+                  moved_from_first_guess_m=shift_at(Gk @ np.linalg.inv(G[k]), G[k][:3, :3] @ at + G[k][:3, 3]), search_rounds=rnd + 1)
+    return Gk, report
+
+
 def split_inputs(walks, log):
     """What gets merged: each walk whole, or, if it has bad-tracking stretches (optimize.find_failures), its clean
     segments, each handled as a walk of its own. Returns (units, plans): units [{walk, ids (None = whole walk),
@@ -291,7 +340,9 @@ def split_inputs(walks, log):
     return units, plans
 
 
-def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
+def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visual=False):
+    """visual: use photo-feature constraints (visual.py): to register a piece ICP could not place, and as loop edges in
+    the joint graph (optimize.py adds them within each walk too)."""
     t0 = time.time()
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -303,7 +354,8 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
         raise SystemExit("no walk has a clean stretch of tracking left to merge")
 
     # every unit is optimised on its own and its fragments built: independent, so one worker process each
-    done = cores.pmap(unit_job, [(u["walk"], out / f"walk{k}", frag_frames, u["ids"]) for k, u in enumerate(units)], jobs)
+    each = max(1, jobs // min(jobs, n))  # Open3D / SIFT threads per worker: the workers share the jobs budget
+    done = cores.pmap(unit_job, [(u["walk"], out / f"walk{k}", frag_frames, u["ids"], visual, each) for k, u in enumerate(units)], jobs)
     for k, (u, (lines, _)) in enumerate(zip(units, done)):
         log(f"walk {k}: optimising on its own" if not u["split"] else f"walk {k}: optimising {u['label']} on its own")
         for line in lines:
@@ -352,6 +404,40 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
             q = rep["registration"]
             log(f"  registered ({name}): yaw {q['yaw_deg']:+.2f} deg, {q['gps_error_m']:.2f} m from GPS, ratio {q['ratio']:.2f}, "
                 f"rmse {q['rmse'] * 100:.1f} cm, overlap {q['overlap']:.2f} ({time.time() - t0:.0f} s)")
+        if not progressed and visual:  # ICP found nothing for anyone left: try the photos
+            for k in list(still):
+                Gk, rep = visual_register(k, registered, walks, own, G, jobs, lambda s, k=k: log(f"  [{k}] {s}"))
+                attempts[k].append({"initial_guess": "visual", **rep})
+                if Gk is None:
+                    log(f"  visual registration of walk {k} failed: {rep['why']}")
+                    continue
+                G[k] = Gk
+                registered.append(k)
+                anchored.add(k)
+                still.remove(k)
+                progressed = True
+                reports[k] = {"method": "visual", "visual": rep}
+                ref = join([ref, place(join(data[k]["clouds"]), Gk)])
+                log(f"  registered visually: yaw {rep['yaw_deg']:+.2f} deg, {rep['agreeing']} of {rep['constraints']} constraints agree "
+                    f"(spread {rep['spread_m']:.2f} m), {rep['moved_from_first_guess_m']:.1f} m from its first guess ({time.time() - t0:.0f} s)")
+        if not progressed:  # a piece of a walk next to a registered piece of it: the walk's own frame survived the cut, and
+            for k in list(still):  # being placed there it becomes a reference for the photos of the others
+                cont = continuity(k, set(registered), units, data) if units[k]["split"] else None
+                if cont:
+                    s, dist, gap = cont
+                    last = attempts[k][-1]
+                    G[k] = G[s].copy()
+                    registered.append(k)
+                    anchored.add(k)
+                    still.remove(k)
+                    progressed = True
+                    msg = (f"{units[k]['label']} could not be registered ({last.get('why') or last['attempt']['why']}); placed in the frame of "
+                           f"{units[s]['label']} instead: ARKit's pose is continuous across the cut ({dist:.1f} m in {gap:.1f} s), "
+                           f"not verified geometrically")
+                    reports[k] = {"method": "continuity_placement", "sibling": s, "continuity_distance_m": dist, "gap_s": gap,
+                                  "attempts": attempts[k], "warnings": [msg]}
+                    warnings.append(msg)
+                    log("WARNING: " + msg)
         pending = still if progressed else []
         if not progressed:
             for k in still:
@@ -446,6 +532,53 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
         loops.append({"walks": [wa, wb], "fragments": [nodes[i][1], nodes[j][1]], **q})
     log(f"{len(loops)} inter-walk loops accepted, {len(found) - len(loops)} dropped by the corroboration guard ({time.time() - t0:.0f} s)")
 
+    visual_graph = {}
+    if visual and len(registered) > 1:  # photo-feature loops between the pieces whose paths come close once placed
+        import visual as vis
+        kfs = {k: vis.keyframes(walks[k], own[k]) for k in registered}
+        frag_of = {k: {data[k]["frames"][m]["i"]: f for f, g in enumerate(data[k]["groups"]) for m in g} for k in registered}
+        cam = {k: np.array([fr["T"][:3, 3] for fr in data[k]["frames"]]) @ G[k][:3, :3].T + G[k][:3, 3] for k in registered}
+        for ia, a in enumerate(registered):
+            for b in registered[ia + 1:]:
+                if np.linalg.norm(cam[a][::10, None] - cam[b][None, ::10], axis=2).min() > VISUAL_PAIR_RADIUS:
+                    continue
+                cons, summ = vis.visual_loops(walks[a], walks[b], poses_a=own[a], poses_b=own[b], init=np.linalg.inv(G[a]) @ G[b],
+                                              max_pairs=optimize.VISUAL_MAX_PAIRS, workers=max(1, jobs), log=lambda s, a=a, b=b: log(f"  [{a}-{b}] {s}"))
+                added = 0
+                for fa, fb, T, info, n_ok, n_all, _ in optimize.visual_edges(cons, kfs[a], kfs[b], frag_of[a], frag_of[b]):
+                    X = G[b] @ T  # where the edge would put fragment fa of walk a
+                    moved = float(np.linalg.norm(X[:3, :3] @ data[a]["cen"][fa] + X[:3, 3] - (G[a][:3, :3] @ data[a]["cen"][fa] + G[a][:3, 3])))
+                    if moved > VISUAL_MAX_CORRECTION:
+                        rejected.append({"walks": [a, b], "fragments": [fa, fb], "why": "visual: implausible correction", "moved_m": moved})
+                        continue
+                    pg.edges.append(reg.PoseGraphEdge(node_of[(a, fa)], node_of[(b, fb)], T, info, uncertain=True))
+                    loops.append({"walks": [a, b], "fragments": [fa, fb], "kind": "visual", "constraints": n_ok, "of": n_all, "moved_m": moved})
+                    added += 1
+                visual_graph[f"{a}-{b}"] = {"pairs": summ["pairs"], "constraints": len(cons), "edges_added": added}
+                log(f"visual: walks {a}-{b}: {len(cons)} constraints, {added} fragment-pair edges added ({time.time() - t0:.0f} s)")
+
+    # Open3D skips the whole optimisation ("graph is not connected", only visible at debug verbosity) when any piece has no
+    # edge to the rest, e.g. a piece placed by continuity that no loop reaches. Tie each such group to node 0 with a nearly
+    # free "stay where you are" edge, so the loops of everything else still get used.
+    parent = list(range(len(nodes)))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for e in pg.edges:
+        parent[find(e.source_node_id)] = find(e.target_node_id)
+    tied = 0
+    for i in range(len(nodes)):
+        if find(i) != find(0):
+            pg.edges.append(reg.PoseGraphEdge(0, i, np.linalg.inv(G[nodes[i][0]]) @ G[nodes[0][0]], np.eye(6) * optimize.GAP_INFO, uncertain=False))
+            parent[find(i)] = find(0)
+            tied += 1
+    if tied:
+        log(f"{tied} piece(s) without any edge to the rest were tied to the reference weakly (at their placement)")
+
     if loops:
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
         reg.global_optimization(pg, reg.GlobalOptimizationLevenbergMarquardt(), reg.GlobalOptimizationConvergenceCriteria(),
@@ -495,7 +628,7 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1):
                 "max_yaw_deg": float(max(abs(np.degrees(yaw_of((np.linalg.inv(G[k]) @ c)[:3, :3]))) for c in C[k]))}})
 
     stats = {"frame": "walk 0's ARKit frame; transforms map each walk's own frame into it (yaw about +Y, then translation)",
-             "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
+             "visual": visual, "visual_graph": visual_graph, "pieces_tied_weakly_to_the_reference": tied, "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
              "inter_walk_loops": loops, "rejected_loops": rejected, "candidates": len(candidates),
              "kept_loops": sum(lp["kept"] for lp in loops), "pruned_loops": sum(not lp["kept"] for lp in loops),
              "warnings": warnings}
@@ -516,8 +649,9 @@ if __name__ == "__main__":
     ap.add_argument("out_dir")
     ap.add_argument("walk_dirs", nargs="+")
     ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores to use (default %(default)s)")
+    ap.add_argument("--no-visual", action="store_true", help="no photo-feature constraints (registration fallback, loop edges)")
     a = ap.parse_args()
-    s = merge(a.out_dir, a.walk_dirs, jobs=a.jobs)
+    s = merge(a.out_dir, a.walk_dirs, jobs=a.jobs, visual=not a.no_visual)
     print(f"\nDone: {a.out_dir}")
     for w in s["warnings"]:
         print("WARNING:", w, file=sys.stderr)

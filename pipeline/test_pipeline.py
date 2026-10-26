@@ -293,6 +293,64 @@ def test_slide():
         assert pct(d, 50) < 0.10 and pct(d, 90) < 0.16  # uncorrected: 14.2 / 26.3 cm
 
 
+def gps_lines(path, positions, bias_en, rng):
+    """gps.jsonl for a walk whose camera is at `positions` (in the A frame: X east, Z south, origin = ORIGIN_EN) at frame times
+    i * 30 s, shifted by bias_en metres (east, north), with a little noise."""
+    from pyproj import Transformer
+    to_ll = Transformer.from_crs("EPSG:5382", "EPSG:4326", always_xy=True)
+    rows = []
+    for k, p in enumerate(positions):
+        lon, lat = to_ll.transform(synth.ORIGIN_EN[0] + p[0] + bias_en[0] + rng.normal() * 0.3, synth.ORIGIN_EN[1] - p[2] + bias_en[1] + rng.normal() * 0.3)
+        rows.append({"t": 30.0 * k, "lat": lat, "lon": lon, "alt": synth.ORIGIN_ALT + p[1], "h_acc": 3.0, "v_acc": 3.0})
+    path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_visual_registration():
+    """Two walks over the same textured ground. B has its own ARKit frame (turned 6 degrees, 4 m / 5.5 m off A's) and its GPS
+    is 6 m out; ICP finds nothing to register on (as on bare ground: here switched off), so B must be placed by photo
+    features alone (visual.py, via merge.py)."""
+    import test_visual as tv
+    scene = tv.Scene(3)
+    rng = np.random.default_rng(0)
+    # both walk forward over the same stretch of ground (looking towards -z), B 0.4 m aside and aimed a little differently
+    cams_a = [tv.lookat(np.array([-2.4 + 0.7 * k, 1.7 + 0.05 * k, 1.0 - 0.1 * k]), [0.3, 0.0, -3.0 + 0.1 * k]) for k in range(8)]
+    true_b = [tv.lookat(np.array([-2.0 + 0.7 * k, 1.8, 0.7 - 0.1 * k]), [0.0, 0.0, -3.2]) for k in range(8)]
+    H = np.eye(4)  # B's own world -> A's: p_A = H p_B
+    H[:3, :3], H[:3, 3] = optimize.rot_y(np.radians(6.0)), [4.0, 0.0, 5.5]
+    cams_b = [np.linalg.inv(H) @ T for T in true_b]  # what B recorded, in its own frame
+
+    quiet = lambda *_: None  # noqa: E731
+    real_register = merge.register_walk
+    merge.register_walk = lambda *a, **k: (None, {"why": "test: ICP switched off"})
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            a, b = tmp / "a", tmp / "b"
+            tv.write_walk(a, scene, cams_a, seed=1)
+            tv.write_walk(b, scene, true_b, seed=2)  # rendered from where B really was ...
+            lines = [json.loads(l) for l in (b / "frames.jsonl").read_text().splitlines()]
+            for line, T in zip(lines, cams_b):  # ... but it recorded the poses in its own ARKit frame
+                line["transform"] = T.flatten(order="F").tolist()
+            (b / "frames.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
+            for w, T in ((a, cams_a), (b, true_b)):  # the GPS sees the true positions (in A's frame); B's is 6 m east of the truth
+                gps_lines(w / "gps.jsonl", [t[:3, 3] for t in T], (0.0, 0.0) if w is a else (6.0, 0.0), rng)
+            stats = merge.merge(tmp / "m", [a, b], 8, log=quiet, visual=True)
+            w = stats["walks"][1]
+            v = w.get("visual", {})
+            yaw, shift = w["yaw_deg"], np.array(w["translation_m"])
+            c = np.mean([T[:3, 3] for T in cams_b], axis=0)  # compare where B's own centre lands
+            err = np.linalg.norm((optimize.rot_y(np.radians(yaw)) @ c + shift) - (H[:3, :3] @ c + H[:3, 3]))
+            gps_err = np.linalg.norm(np.array(w["gps_translation_m"]) - H[:3, 3])
+            print(f"visual: method {w['method']}; yaw {yaw:+.2f} deg (true +6.00); B's centre lands {err * 100:.1f} cm from the truth "
+                  f"(its GPS placement was {gps_err:.1f} m off); {v.get('agreeing')} of {v.get('constraints')} constraints agree")
+            if w["method"] != "visual":
+                print("visual attempt:", {k: w.get(k) for k in ("initial_guess", "why", "against", "constraints", "agreeing", "spread_m")})
+            assert w["method"] == "visual" and v["agreeing"] >= merge.VISUAL_REGISTER_MIN
+            assert abs(yaw - 6.0) < 0.5 and err < 0.15 and gps_err > 5.0
+    finally:
+        merge.register_walk = real_register
+
+
 def test_jobs():
     """--jobs only changes how long things take: fusing with worker threads and a mesh process, and merging with the
     walks optimised in parallel worker processes, must give exactly the serial result."""
@@ -308,18 +366,21 @@ def test_jobs():
             merge.merge(tmp / f"m{jobs}", [a, b], 40, log=quiet, jobs=jobs)
         # fuse: exactly the same. merge: Open3D's multi-threaded ICP sums in a different order with a different thread
         # count (and from run to run), so the poses agree to a fraction of a millimetre rather than bit for bit
+        synth_voxel = 0.02  # the fused cloud's voxel: no point may move more than that
         for name in ("f", "m"):
             p1, p3 = (o3d.io.read_point_cloud(str(tmp / f"{name}{j}" / "points.ply")) for j in (1, 3))
             m1, m3 = (o3d.io.read_triangle_mesh(str(tmp / f"{name}{j}" / "mesh.ply")) for j in (1, 3))
             n1, n3 = len(p1.points), len(p3.points)
             if n1 == n3:
-                dp = float(np.abs(np.asarray(p1.points) - np.asarray(p3.points)).max())
+                diff = np.abs(np.asarray(p1.points) - np.asarray(p3.points)).max(1)
+                dp, off = float(diff.max()), float((diff > 1e-3).mean())  # a point near a voxel edge can land in the next voxel
                 dc = float((np.abs(np.asarray(p1.colors) - np.asarray(p3.colors)).max(1) > 1e-3).mean())  # a near-tie flips a keyframe
             else:
-                dp = dc = float("inf")
+                dp = off = dc = float("inf")
             print(f"jobs:   {'fuse' if name == 'f' else 'merge'} jobs=1 vs jobs=3: {n1} / {n3} points, {len(m1.triangles)} / {len(m3.triangles)} triangles, "
-                  f"largest point difference {dp:.2e} m, share of points with another colour {dc:.4%}")
-            assert n1 == n3 and len(m1.triangles) == len(m3.triangles) and dp <= (0 if name == "f" else 1e-3) and dc <= (0 if name == "f" else 1e-3)
+                  f"largest point difference {dp:.2e} m ({off:.4%} of points more than 1 mm), share of points with another colour {dc:.4%}")
+            assert n1 == n3 and len(m1.triangles) == len(m3.triangles)
+            assert dp <= (0 if name == "f" else synth_voxel) and off <= (0 if name == "f" else 1e-3) and dc <= (0 if name == "f" else 1e-3)
         for k in (0, 1):
             t1, t3 = (np.load(tmp / f"m{j}" / f"walk{k}" / "poses_merged.npz")["T"] for j in (1, 3))
             d = float(np.abs(t1 - t3).max())
@@ -392,6 +453,6 @@ def test_consensus():
 
 
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_jobs", "test_consensus"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_visual_registration", "test_jobs", "test_consensus"]:  # optionally just some of them
         globals()[test]()
     print("OK")

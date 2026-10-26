@@ -1,6 +1,6 @@
 """Correct ARKit drift with a fragment pose graph.
 
-usage: optimize.py <walk_dir> <out_dir> [--jobs 3]
+usage: optimize.py <walk_dir> <out_dir> [--jobs 3] [--no-visual]
 
 Stage 1 removes ARKit relocalisation snaps (single-frame pose jumps faster than 3 m/s): the
 poses after a snap are the trustworthy ones, so the jump is ramped in linearly over the frames
@@ -66,7 +66,12 @@ RUNAWAY_MIN_STEP, RUNAWAY_GAP = 0.15, 5.0  # m, s: a spike is a step this big (a
 RUNAWAY_MIN_SPIKES, RUNAWAY_GROWTH = 6, 3.0  # a run of at least this many spikes, never shrinking by more than 10%, whose last is this many times its first
 FAIL_TRACKING = 1.0 # seconds of tracking != normal that count as a failure (shorter gaps keep the weak identity edge)
 FAIL_PAD = 1.0  # seconds dropped either side of a failure: tracking degrades before and recovers after it
-MIN_SEGMENT_SECONDS, MIN_SEGMENT_PATH = 10.0, 5.0  # a clean piece shorter than this is dropped (too little to register)
+VISUAL_AGREE_SHIFT, VISUAL_AGREE_YAW = 0.3, 2.0  # m, degrees: visual constraints agree if they place a camera this close
+VISUAL_BRACKET = 1.0  # s: keyframes this close either side of a snap are compared with the photos
+VISUAL_GLITCH_M = 0.3  # m: ARKit and the photos must differ by more than this (and 20% of ARKit's move) for a snap to be a glitch
+VISUAL_MIN_AGREE = 2 # a graph edge needs this many agreeing constraints between the same two fragments
+VISUAL_MAX_PAIRS = 800  # keyframe pairs matched per run of visual.visual_loops: bounds the SIFT work
+MIN_SEGMENT_SECONDS, MIN_SEGMENT_PATH = 10.0, 5.0 # a clean piece shorter than this is dropped (too little to register)
 
 
 def rot_y(a):
@@ -258,6 +263,88 @@ def _segment(frames, a, b):
             "path_m": float(np.linalg.norm(np.diff(P, axis=0), axis=1).sum()), "ids": [f["i"] for f in frames[a:b + 1]]}
 
 
+def visual_snap_check(walk, frames, snaps, log=print):
+    """Ask the photos about each snap. ARKit's relative pose between the last keyframe before the snap and the first after
+    it (at most VISUAL_BRACKET s either side) is compared with visual.match_pair's. Photos and ARKit agree to 1-2 cm
+    over ~1 s normally; where the jump is a pose error ARKit claims metres the photos do not see. Per snap, a dict or None
+    (no photos near it, or no match): arkit_m / visual_m (how far the camera moved between the keyframes), disagreement_m
+    (the position difference of the two relative poses) and glitch (the disagreement is more than max(VISUAL_GLITCH_M, 20% of
+    ARKit's displacement)): False means the snap is real, fast motion."""
+    import visual
+    kfs = [f for f in frames if f["rgb"] and f["tracking"] == "normal" and (Path(walk) / "rgb" / f"{f['i']:06d}.jpg").stat().st_size > 0]
+    pos = {f["i"]: n for n, f in enumerate(frames)}
+    kf_pos = np.array([pos[f["i"]] for f in kfs])
+    out, feats = [], {}
+    for s in snaps:
+        before = [f for f, p in zip(kfs, kf_pos) if p < s["first"] and frames[s["first"]]["t"] - f["t"] <= VISUAL_BRACKET]
+        after = [f for f, p in zip(kfs, kf_pos) if p >= s["n"] and f["t"] - frames[s["n"]]["t"] <= VISUAL_BRACKET]
+        if not before or not after:
+            out.append(None)
+            continue
+        a, b = before[-1], after[0]
+        for kf in (a, b):
+            if kf["i"] not in feats:
+                feats[kf["i"]] = visual.extract(Path(walk), kf)
+        r = visual.solve_pair(a, feats[a["i"]], b, feats[b["i"]], visual._meta(Path(walk)), visual._meta(Path(walk)))
+        if not r["ok"]:
+            out.append(None)
+            continue
+        ark = np.linalg.inv(a["T"]) @ b["T"]
+        disagreement = float(np.linalg.norm((np.linalg.inv(ark) @ r["T_rel"])[:3, 3]))
+        d_ark = float(np.linalg.norm(ark[:3, 3]))
+        out.append({"arkit_m": d_ark, "visual_m": float(np.linalg.norm(r["T_rel"][:3, 3])), "disagreement_m": disagreement,
+                    "glitch": bool(disagreement > max(VISUAL_GLITCH_M, 0.2 * d_ark)), "inliers": r["stats"]["n_inliers"]})
+        log(f"snap at t={s['t']:.1f} s: ARKit moved {d_ark:.2f} m between the keyframes either side, photos say {out[-1]['visual_m']:.2f} m "
+            f"(poses differ by {disagreement:.2f} m): {'a pose glitch' if out[-1]['glitch'] else 'real motion'}")
+    return out
+
+
+def agreeing(Gs, at):
+    """Of the world alignments Gs (n, 4, 4): the index of the one most others agree with, and the mask of those that do
+    (they move the point `at` less than VISUAL_AGREE_SHIFT apart and turn it less than VISUAL_AGREE_YAW apart)."""
+    where = np.array([G[:3, :3] @ at + G[:3, 3] for G in Gs])
+    yaw = np.degrees([yaw_of(G[:3, :3]) for G in Gs])
+    dy = np.abs((yaw[:, None] - yaw[None] + 180) % 360 - 180)
+    agree = (np.linalg.norm(where[:, None] - where[None], axis=2) <= VISUAL_AGREE_SHIFT) & (dy <= VISUAL_AGREE_YAW)
+    best = int(agree.sum(1).argmax())
+    return best, agree[best]
+
+
+def visual_edges(constraints, kfs_a, kfs_b, frag_a, frag_b):
+    """Pose-graph edges from visual constraints (visual.visual_loops): one per pair of fragments that at least
+    VISUAL_MIN_AGREE constraints agree on. Each constraint implies a world alignment H (B's world into A's: the same
+    physical camera sits at T_a[i] T_rel in A's world and at T_b[j] in B's); in the graph's terms the edge is
+    T_st = inv(H) (source = A's fragment, target = B's), like an ICP loop, projected to yaw + translation about the camera
+    (ARKit's gravity is accurate). Its information is diagonal (rotation, translation, Open3D's order): the
+    constraints' own (pixel noise + lidar floor) variances, added up over the agreeing ones (at most 5: constraints from
+    neighbouring keyframes are not independent). frag_a / frag_b: frame id -> fragment index.
+    Returns [(fa, fb, T_st, info, n_agreeing, n_between_these_fragments, H)]."""
+    import visual
+    if not constraints:
+        return []
+    Gs = visual.world_alignments(constraints, kfs_a, kfs_b)
+    cam_b = {f["i"]: f["T"][:3, 3] for f in kfs_b}
+    groups = {}
+    for n, (_, i, _, j, _, _, _) in enumerate(constraints):
+        if i not in frag_a or j not in frag_b or (frag_a is frag_b and frag_a[i] == frag_b[j]):
+            continue  # a frame outside every fragment, or both ends in one fragment of one walk
+        groups.setdefault((frag_a[i], frag_b[j]), []).append(n)
+    out = []
+    for (fa, fb), idx in groups.items():
+        at = np.mean([cam_b[constraints[n][3]] for n in idx], axis=0)
+        best, mask = agreeing(Gs[idx], at)
+        n_ok = int(mask.sum())
+        if n_ok < VISUAL_MIN_AGREE:
+            continue
+        H = yaw_only(Gs[idx][best], at)
+        var = [np.trace(np.linalg.inv(constraints[n][5])[:3, :3]) / 3 for n in np.array(idx)[mask]]
+        var_r = [np.trace(np.linalg.inv(constraints[n][5])[3:, 3:]) / 3 for n in np.array(idx)[mask]]
+        n_eff = min(n_ok, 5)
+        info = np.diag([n_eff * np.mean(1 / np.array(var_r))] * 3 + [n_eff * np.mean(1 / np.array(var))] * 3)
+        out.append((fa, fb, np.linalg.inv(H), info, n_ok, len(idx), H))
+    return out
+
+
 def fragment_groups(frames, frag_frames, cuts=()):
     """Lists of frame positions: runs of tracking-normal frames (also cut at `cuts`), in ~frag_frames pieces."""
     runs = []
@@ -346,8 +433,9 @@ def frame_poses(frames, centres, theta, trans):
     return out
 
 
-def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None):
-    """frame_ids: optimise only these frames (a clean segment from split_walk); poses.npz then lists only them."""
+def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visual=False, jobs=1):
+    """frame_ids: optimise only these frames (a clean segment from split_walk); poses.npz then lists only them.
+    visual: also add photo-feature loop constraints (visual.py) to the pose graph; jobs: threads for its SIFT work."""
     t0 = time.time()
     walk, out = Path(walk), Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -359,6 +447,12 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None):
     snaps = detect_snaps(frames)
     for s in snaps:
         log(f"snap at t={s['t']:.1f} s: {s['frames']} frame(s), largest step {s['jump_m']:.2f} m, {s['rot_deg']:.1f} deg")
+    not_glitches = []
+    if visual and snaps:  # the photos see whether ARKit's jump is a pose error or the camera really moved that fast
+        for s, c in zip(snaps, visual_snap_check(walk, frames, snaps, log)):
+            s["visual"] = c
+        not_glitches = [s for s in snaps if s["visual"] is not None and not s["visual"]["glitch"]]
+        snaps = [s for s in snaps if s not in not_glitches]  # real motion: nothing to ramp away
     remove_snaps(frames, snaps)  # frames' T are snap-free from here on
     groups = fragment_groups(frames, frag_frames, {s["n"] for s in snaps})
 
@@ -422,6 +516,28 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None):
         loops.append({"pair": [i, j], **q})
     log(f"{len(loops)} loops accepted, {len(found) - len(loops)} dropped by the corroboration guard ({time.time() - t0:.0f} s)")
 
+    vstats = {}
+    if visual:  # photo-feature loops: where the walk revisits a place in a way ICP could not see (vegetation, no structure)
+        import visual as vis  # heavy (OpenCV, SciPy): only when used
+        stage1 = out / "poses_stage1.npz"  # the snap-free poses the fragments were built from
+        np.savez(stage1, i=np.array([f["i"] for f in frames]), T=np.array([f["T"] for f in frames]))
+        cons, vsum = vis.visual_loops(walk, poses_a=stage1, max_pairs=VISUAL_MAX_PAIRS, workers=max(1, jobs), log=lambda s: log(f"  {s}"))
+        kfs = vis.keyframes(walk, stage1)
+        frag_of = {frames[n]["i"]: k for k, g in enumerate(groups) for n in g}
+        edges = visual_edges(cons, kfs, kfs, frag_of, frag_of)
+        added = 0
+        for fa, fb, T, info, n_ok, n_all, _ in edges:
+            shift, yaw_deg = shift_at(T, cen[fa]), float(np.degrees(yaw_of(T[:3, :3])))
+            if shift > MAX_SHIFT or abs(yaw_deg) > MAX_YAW:  # the same plausibility bound as an ICP loop
+                rejected.append({"pair": [fa, fb], "why": "visual: implausible correction", "shift": shift, "yaw": yaw_deg})
+                continue
+            pg.edges.append(reg.PoseGraphEdge(fa, fb, T, info, uncertain=True))
+            loops.append({"pair": [fa, fb], "kind": "visual", "constraints": n_ok, "of": n_all, "shift": shift, "yaw": yaw_deg})
+            added += 1
+        vstats = {k: v for k, v in vsum.items() if k != "alignment"}
+        vstats.update(constraints=len(cons), edges=len(edges), edges_added=added)
+        log(f"visual: {len(cons)} constraints -> {len(edges)} fragment-pair edges, {added} added to the graph ({time.time() - t0:.0f} s)")
+
     if loops:
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
         reg.global_optimization(pg, reg.GlobalOptimizationLevenbergMarquardt(), reg.GlobalOptimizationConvergenceCriteria(),
@@ -457,12 +573,13 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None):
     total = np.linalg.norm(poses[:, :3, 3] - recorded[:, :3, 3], axis=1)
     stats = {
         "fragments": len(groups), "frames": len(frames), "candidates": len(candidates), "snaps": snaps,
+        "snaps_the_photos_say_are_real_motion": not_glitches,
         "max_frame_to_frame_step_m": {"raw": float(raw.max()), "corrected": float(step(poses).max())},
         "total_position_change_m": {"max": float(total.max()), "median": float(np.median(total))},
         "accepted_loops": len(loops), "pruned_loops": len(loops) - n_kept, "kept_loops": n_kept,
         "graph_correction_translation_m": {"max": float(move.max()), "median": float(np.median(move))},
         "graph_correction_yaw_deg": {"max": float(yaw.max()), "median": float(np.median(yaw))},
-        "loops": loops, "rejected": rejected, "seconds": round(time.time() - t0, 1),
+        "visual": vstats, "loops": loops, "rejected": rejected, "seconds": round(time.time() - t0, 1),
     }
     (out / "optimize.json").write_text(json.dumps(stats, indent=1))
     log(f"pose graph correction translation max {move.max():.2f} m, median {np.median(move):.2f} m; yaw max {yaw.max():.2f} deg; "
@@ -477,5 +594,6 @@ if __name__ == "__main__":
     ap.add_argument("walk_dir")
     ap.add_argument("out_dir")
     ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores for Open3D (default %(default)s); merge.py also runs walks in parallel")
+    ap.add_argument("--no-visual", action="store_true", help="no photo-feature loop constraints")
     a = ap.parse_args()
-    optimize(a.walk_dir, a.out_dir)
+    optimize(a.walk_dir, a.out_dir, visual=not a.no_visual, jobs=a.jobs)
