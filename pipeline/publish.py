@@ -194,7 +194,9 @@ if a.walk_start:
 for key in ("walk_start", "splat", "splat_bytes"):  # set by other steps: don't lose them when the model is re-published
     if key not in entry and key in old:
         entry[key] = old[key]
-index = [m for m in index if m["name"] != a.name] + [entry]
+if "sun_location" in entry and "utc" not in entry["sun_location"] and "utc" in old.get("sun_location", {}):
+    entry["sun_location"]["utc"] = old["sun_location"]["utc"]
+index =[m for m in index if m["name"] != a.name] + [entry]
 index_path.write_text(json.dumps(index, indent=1) + "\n")
 shutil.copy(HERE / "viewer.html", site / "index.html")
 print(f"published {a.name}: {len(pcd.points):,} points, {size / 1e6:.1f} MB -> {dest}")
