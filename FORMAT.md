@@ -13,6 +13,7 @@ walk_YYYYMMDD_HHMMSS/
   gps.jsonl
   events.jsonl       optional: intervals where tracking was wrong (absent in older walks = none recorded)
   baro.jsonl         optional: barometer samples, an independent vertical reference (absent in older walks)
+  diag.jsonl         optional: app health every ~5 s (memory, heat, battery, frame backlog), for debugging crashes
   depth/000000.bin   Float16 little-endian (v1: Float32), metres, row-major, depth_w × depth_h
   conf/000000.bin    UInt8 ARConfidenceLevel (0 low, 1 medium, 2 high), same layout
   rgb/000000.jpg     only on some frames (~2 Hz), JPEG quality 0.8, full camera res
@@ -38,12 +39,13 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 ```json
 {
   "format_version": 2,
-  "app_version": "0.4",
+  "app_version": "0.5",
   "depth_dtype": "f16",
   "device": "iPhone16,1",
   "started_at": "2026-10-19T15:00:00Z",   // ISO 8601 UTC
-  "ended_at": "2026-10-19T15:45:00Z",      // null if the app crashed or was killed mid-walk
-  "end_reason": "user",                    // optional: "user" | "low_space" | "write_failed"
+  "ended_at": "2026-10-19T15:45:00Z",      // null while recording, or if the app died and was never reopened
+  "end_reason": "user",                    // optional: "user" | "low_space" | "write_failed" | "thermal" | "interrupted"
+  "last_checkpoint": "2026-10-19T15:44:40Z", // optional: last 30 s metadata rewrite while recording
   "world_alignment": "gravityAndHeading",
   "depth_w": 256, "depth_h": 192,
   "rgb_w": 1920, "rgb_h": 1440,
@@ -58,11 +60,21 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 }
 ```
 
-`end_reason` is written when the app closes the walk itself: `low_space` (free space fell below
-500 MB) and `write_failed` (a file write failed) end the walk cleanly, with `ended_at` and an exact
-`frame_count`; every frame listed in `frames.jsonl` then has its files. Walks from older app versions
-have no `end_reason`; `ended_at: null` still means the app died mid-walk, and the last few frames may
-list files that were never written.
+`end_reason` says how the walk ended:
+
+- `user`: Stop was pressed.
+- `low_space` (free space fell below 500 MB), `write_failed` (a file write failed), `thermal` (the phone
+  reached the critical heat state; iOS would have paused the camera): the app closed the walk itself,
+  cleanly, with `ended_at` and an exact `frame_count`; every frame listed in `frames.jsonl` has its files.
+- `interrupted`: the app was killed or crashed (typically out of memory) and repaired the walk the next
+  time it was opened. `ended_at` is the walk start plus the `t` of the last complete line of
+  `frames.jsonl`, and `frame_count` the number of complete lines. A killed app may have written the files
+  of one more frame than listed (extra files, never missing ones).
+
+While recording, `meta.json` is rewritten atomically every 30 s with the current `frame_count` and
+`last_checkpoint`, so even a walk the app could not repair (`ended_at: null`: not reopened yet) has a
+frame count at most 30 s stale. Walks from older app versions have no `end_reason`; `ended_at: null`
+there means the app died and the last few frames may list files that were never written.
 
 `site_anchor` is the initial guess for merging with the earlier model: the coverage frame is east/north
 metres, ARKit's world is already north-aligned (`gravityAndHeading`, +X east, −Z north), so a walk point
@@ -147,6 +159,29 @@ Two line types, told apart by `type`; either may be missing on a device without 
   fit a slow drift out. Walking up a staircase or stopping at a taped mark gives the cleanest checks.
 - `absolute`: GPS-assisted altitude above sea level with its `accuracy_m` (metres, 68%) and
   `precision_m` (the barometric part); irregular, only when the system has an estimate.
+
+## diag.jsonl (optional)
+
+One line about every 5 s while recording (plus one when the app starts shedding load), to find out why a
+long walk died. `t` is on the frame clock. For debugging only; the pipeline can ignore it.
+
+```json
+{"t": 305.0, "avail_mb": 2810, "footprint_mb": 640, "thermal": "fair", "battery": 0.71,
+ "queue_lag_s": 0.04, "frames_dropped": 0, "mesh_anchors": 0, "frames": 3050,
+ "coarse_cells": 41000, "fine_tiles": 120, "hole_cells": 312, "shedding": false}
+```
+
+- `avail_mb`: `os_proc_available_memory()`, what the app may still allocate before iOS kills it (0 if the OS
+  cannot say). `footprint_mb`: `phys_footprint`, the figure iOS compares against that limit.
+- `thermal`: `nominal | fair | serious | critical`. `battery`: 0 to 1, or null.
+- `queue_lag_s`: the worst age of an ARKit frame when the app got to it since the previous line (the
+  write/processing backlog: it should be well under 0.1). `frames_dropped`: frames skipped so far because
+  they were more than 0.5 s stale (they leave a gap in `frames.jsonl`).
+- `mesh_anchors`: ARKit mesh anchors alive (0 unless the mesh overlay is on, which is off by default).
+- `coarse_cells`, `fine_tiles` (64 x 64-cell tiles of the 10 cm hole grid), `hole_cells`: sizes of the
+  app's coverage structures.
+- `shedding`: gap search and mesh were switched off because available memory fell below 500 MB or iOS sent a
+  memory warning. The line written at that moment has a `note` (`low_memory` or `memory_warning`).
 
 ## coverage.json (Mac → phone, "continue a site")
 

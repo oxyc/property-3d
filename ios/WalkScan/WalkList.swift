@@ -5,6 +5,8 @@ struct WalkInfo: Identifiable {
     let duration: TimeInterval?
     let bytes: Int64
     let frames: Int
+    /// meta.json `end_reason`: user, low_space, write_failed, thermal, interrupted (absent in older walks).
+    var reason: String? = nil
     var id: String { url.lastPathComponent }
 }
 
@@ -34,7 +36,7 @@ private func scanWalks() -> [WalkInfo] {
         if ended == nil, let data = try? Data(contentsOf: dir.appendingPathComponent("frames.jsonl")) {
             frames = data.reduce(0) { $1 == 10 ? $0 + 1 : $0 }  // unfinished walk: count lines
         }
-        return WalkInfo(url: dir, duration: duration, bytes: bytes, frames: frames)
+        return WalkInfo(url: dir, duration: duration, bytes: bytes, frames: frames, reason: meta["end_reason"] as? String)
     }
 }
 
@@ -124,7 +126,8 @@ struct WalkListView: View {
     private func details(_ w: WalkInfo) -> String {
         let size = ByteCountFormatter.string(fromByteCount: w.bytes, countStyle: .file)
         let time = w.duration.map(clock) ?? "unfinished"
-        return "\(time)  \u{00B7}  \(size)  \u{00B7}  \(w.frames) frames"
+        let why = w.reason.flatMap { ["interrupted": "app was killed", "low_space": "disk full", "write_failed": "write failed", "thermal": "too hot"][$0] }
+        return "\(time)  \u{00B7}  \(size)  \u{00B7}  \(w.frames) frames" + (why.map { "  \u{00B7}  \($0)" } ?? "")
     }
 
     private func share(_ walk: WalkInfo) {

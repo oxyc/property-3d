@@ -29,6 +29,8 @@ struct CoverageGrid {
 
     private var cells: [Int64: Cell] = [:]
 
+    var cellCount: Int { cells.count }
+
     private static func key(_ ix: Int32, _ iz: Int32) -> Int64 {
         Int64(ix) << 32 | Int64(UInt32(bitPattern: iz))
     }

@@ -18,10 +18,13 @@ struct ContentView: View {
     @State private var showImporter = false
     @State private var showFetch = false
     @State private var fetchText = ""
+    /// Walks the app died in are closed on launch; Start waits for that so a new walk is never mistaken for one.
+    @State private var recovering = true
 
     var body: some View {
         ZStack {
-            ARContainer(session: rec.session, target: rec.isRecording ? rec.target : nil).ignoresSafeArea()
+            ARContainer(session: rec.session, target: rec.isRecording ? rec.target : nil, meshOverlay: rec.meshOverlay)
+                .ignoresSafeArea()
 
             if rec.isRecording, rec.target != nil, !rec.targetOnScreen {
                 GuideArrow(angle: rec.targetAngle, distance: rec.targetDistance)
@@ -62,10 +65,20 @@ struct ContentView: View {
                         }
                     }
                     Spacer()
-                    MinimapView(rec: rec)
-                        .frame(width: 170, height: 170)
-                        .clipShape(RoundedRectangle(cornerRadius: 12))
-                        .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.6)))
+                    VStack(alignment: .trailing, spacing: 8) {
+                        MinimapView(rec: rec)
+                            .frame(width: 170, height: 170)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                            .overlay(RoundedRectangle(cornerRadius: 12).stroke(.white.opacity(0.6)))
+                        // The mesh grows with the walked area and is the most memory-hungry part: off by default,
+                        // switches itself off after 3 minutes.
+                        Button { rec.setMeshOverlay(!rec.meshOverlay) } label: {
+                            Label(rec.meshOverlay ? "Mesh on (3 min)" : "Show mesh", systemImage: "square.grid.3x3")
+                                .font(.footnote.bold())
+                                .padding(.horizontal, 10).padding(.vertical, 6)
+                                .background(.regularMaterial, in: Capsule())
+                        }
+                    }
                 }
 
                 Spacer()
@@ -94,11 +107,16 @@ struct ContentView: View {
                         .frame(height: 72)
                         .background(rec.isRecording ? Color.red : Color.green, in: RoundedRectangle(cornerRadius: 20))
                 }
+                .disabled(recovering && !rec.isRecording)
             }
             .padding()
         }
         .onGeometryChange(for: CGSize.self, of: \.size) { rec.setViewport($0) }
         .onAppear { rec.startPreview() }
+        .task {
+            _ = await Task.detached { Recovery.recoverAll(in: Storage.documents) }.value
+            recovering = false
+        }
         .task {
             // Free space can change while idle (e.g. after deleting walks).
             while !Task.isCancelled {
@@ -158,6 +176,7 @@ struct ContentView: View {
 struct ARContainer: UIViewRepresentable {
     let session: ARSession
     let target: SIMD3<Float>?
+    let meshOverlay: Bool
 
     final class Coordinator {
         let anchor = AnchorEntity(world: .zero)
@@ -171,7 +190,7 @@ struct ARContainer: UIViewRepresentable {
         let view = ARView(frame: .zero)
         view.automaticallyConfigureSession = false
         view.session = session
-        view.debugOptions = [.showSceneUnderstanding]
+        view.debugOptions = []
         view.renderOptions = [.disableMotionBlur, .disableDepthOfField, .disablePersonOcclusion, .disableGroundingShadows]
 
         let material = UnlitMaterial(color: .magenta)
@@ -187,6 +206,7 @@ struct ARContainer: UIViewRepresentable {
     }
 
     func updateUIView(_ uiView: ARView, context: Context) {
+        uiView.debugOptions = meshOverlay ? [.showSceneUnderstanding] : []
         let c = context.coordinator
         guard c.last != target else { return }
         c.last = target

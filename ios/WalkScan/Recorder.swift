@@ -50,6 +50,8 @@ struct Update: @unchecked Sendable {
     var trackingLost: Bool
     var freeBytes: Int64
     var bytesPerSecond: Double
+    /// The engine has dropped optional work (gap search) because memory is short.
+    var shedding: Bool
 }
 
 /// A blind spot for the minimap. Position is world X/Z in metres.
@@ -83,7 +85,15 @@ final class Recorder: ObservableObject {
     @Published private(set) var heading: Double?
     @Published private(set) var headingIsTrue = false
     @Published private(set) var coordinate: CLLocationCoordinate2D?
+    /// ARKit scene mesh + its RealityKit rendering. Off by default: the mesh grows with the walked area and was
+    /// the largest memory consumer; coverage comes from depth, not from the mesh. When switched on it turns
+    /// itself off again after `meshOverlaySeconds`, and it is dropped on any memory pressure.
+    @Published private(set) var meshOverlay = false
     @Published var errorMessage: String?
+
+    private static let meshOverlaySeconds = 180.0
+    private var meshOffTask: Task<Void, Never>?
+    private var memoryObserver: NSObjectProtocol?
 
     let session = ARSession()
     private let engine = Engine()
@@ -127,16 +137,41 @@ final class Recorder: ObservableObject {
         engine.onLocation = { [weak self] coordinate in
             Task { @MainActor in self?.coordinate = coordinate }
         }
+        memoryObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor in self?.memoryWarning() }
+        }
     }
 
-    private static func makeConfig() -> ARWorldTrackingConfiguration {
+    private static func makeConfig(mesh: Bool) -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravityAndHeading
         config.frameSemantics = .sceneDepth
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+        if mesh, ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
             config.sceneReconstruction = .mesh
         }
         return config
+    }
+
+    /// Mesh overlay on or off without resetting tracking (re-running a config keeps the world). Turning it off
+    /// makes ARKit drop all mesh anchors, which frees their memory.
+    func setMeshOverlay(_ on: Bool) {
+        guard on != meshOverlay else { return }
+        meshOverlay = on
+        session.run(Self.makeConfig(mesh: on))
+        meshOffTask?.cancel()
+        if on {
+            meshOffTask = Task { [weak self] in
+                try? await Task.sleep(for: .seconds(Self.meshOverlaySeconds))
+                if !Task.isCancelled { self?.setMeshOverlay(false) }
+            }
+        }
+    }
+
+    /// iOS says memory is short: drop the mesh and pause the gap search, which frees the most.
+    private func memoryWarning() {
+        setMeshOverlay(false)
+        engine.shed(reason: "memory_warning")
     }
 
     /// Runs the session so the camera and mesh preview show before a walk starts, and keeps
@@ -145,7 +180,7 @@ final class Recorder: ObservableObject {
         location.requestWhenInUseAuthorization()
         location.startUpdatingLocation()
         location.startUpdatingHeading()
-        session.run(Self.makeConfig())
+        session.run(Self.makeConfig(mesh: meshOverlay))
         refreshFreeSpace()
     }
 
@@ -177,8 +212,11 @@ final class Recorder: ObservableObject {
             errorMessage = "Could not create walk folder: \(error.localizedDescription)"
             return
         }
-        // Reset so the world origin (and gravityAndHeading axes) are where the walk starts.
-        session.run(Self.makeConfig(), options: [.resetTracking, .removeExistingAnchors])
+        // Reset so the world origin (and gravityAndHeading axes) are where the walk starts. Every walk starts
+        // without the mesh; it can be switched on from the screen for a few minutes.
+        meshOffTask?.cancel()
+        meshOverlay = false
+        session.run(Self.makeConfig(mesh: false), options: [.resetTracking, .removeExistingAnchors])
         UIDevice.current.isBatteryMonitoringEnabled = true
         UIApplication.shared.isIdleTimerDisabled = true
         snapshot = nil
@@ -215,10 +253,14 @@ final class Recorder: ObservableObject {
         refreshFreeSpace()
         haptics.notificationOccurred(.error)
         let free = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "little"
-        errorMessage = (reason == "low_space"
-            ? "Recording stopped: the phone is almost out of space (\(free) free). "
-            : "Recording stopped: writing to disk failed, most likely because the phone is full (\(free) free). ")
-            + "The walk so far was saved and closed cleanly. Send it to your Mac and delete it from the phone before starting another."
+        switch reason {
+        case "thermal":
+            errorMessage = "Recording stopped: the phone is critically hot and iOS was about to shut the camera down. The walk so far was saved and closed cleanly. Let the phone cool in the shade, then start a new walk (use Continue a site to carry on)."
+        case "low_space":
+            errorMessage = "Recording stopped: the phone is almost out of space (\(free) free). The walk so far was saved and closed cleanly. Send it to your Mac and delete it from the phone before starting another."
+        default:
+            errorMessage = "Recording stopped: writing to disk failed, most likely because the phone is full (\(free) free). The walk so far was saved and closed cleanly. Send it to your Mac and delete it from the phone before starting another."
+        }
     }
 
     private func apply(_ u: Update) {
@@ -237,11 +279,13 @@ final class Recorder: ObservableObject {
         trackingLost = u.trackingLost
         bytesPerSecond = u.bytesPerSecond
         if u.freeBytes != .max { freeBytes = u.freeBytes }
+        if u.shedding, meshOverlay { setMeshOverlay(false) }
 
         var list = u.issues
         let thermal = ProcessInfo.processInfo.thermalState
-        if thermal == .serious || thermal == .critical { list.append("Phone is overheating (\(thermal == .critical ? "critical" : "serious"))") }
+        if thermal == .serious || thermal == .critical { list.append("Phone is hot: shade it, or pause and let it cool") }
         let battery = UIDevice.current.batteryLevel
+        engine.setBattery(battery)
         if battery >= 0, battery < 0.2 { list.append("Battery low (\(Int(battery * 100))%)") }
         warnings = list
 
@@ -331,6 +375,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     private let motionQueue = OperationQueue()
     private let altimeter = CMAltimeter()
     private let altimeterQueue = OperationQueue()
+    private var meshAnchors = 0
+    private var battery: Float = -1
 
     private static let iso: ISO8601DateFormatter = ISO8601DateFormatter()
 
@@ -342,8 +388,17 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let gpsFile: FileHandle
         let eventsFile: FileHandle
         let baroFile: FileHandle
+        let diagFile: FileHandle
         let encoder = JSONEncoder()
         var meta: [String: Any]
+
+        // Health: memory/thermal log, metadata checkpoints, frame backlog
+        var lastDiag = -Double.infinity
+        var lastCheckpoint = 0.0
+        var queueLag = 0.0  // worst age of a frame when we got to it, since the last diag line
+        var framesDropped = 0
+        var shedding = false
+        var lastLowMemory = false
 
         var count = 0
         var bytesWritten: Int64 = 0
@@ -358,7 +413,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         // Previous coverage of a loaded site, resampled to this walk's world cells.
         var prior25: [Int64: UInt8] = [:]
-        var priorFine = Set<Int64>()
+        var priorFine: FineGrid?
 
         // Tracking failure detection
         var monitor = TrackingMonitor()
@@ -402,7 +457,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             for sub in ["depth", "conf", "rgb"] {
                 try fm.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
             }
-            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl", "baro.jsonl"] {
+            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl", "baro.jsonl", "diag.jsonl"] {
                 guard fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: nil) else {
                     throw CocoaError(.fileWriteUnknown)
                 }
@@ -411,9 +466,10 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             gpsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("gps.jsonl"))
             eventsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("events.jsonl"))
             baroFile = try FileHandle(forWritingTo: dir.appendingPathComponent("baro.jsonl"))
+            diagFile = try FileHandle(forWritingTo: dir.appendingPathComponent("diag.jsonl"))
             meta = [
                 "format_version": 2,
-                "app_version": "0.4",
+                "app_version": "0.5",
                 "depth_dtype": "f16",
                 "device": Engine.deviceModel,
                 "started_at": Engine.iso.string(from: startDate),
@@ -425,7 +481,9 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             ]
             if let site, let anchor {
                 prior25 = site.worldCells(cellSize: CoverageGrid.cellSize, anchor: anchor)
-                priorFine = Set(site.worldCells(cellSize: HoleConfig.cellSize, anchor: anchor).keys)
+                var fine = FineGrid()
+                for key in site.worldCells(cellSize: HoleConfig.cellSize, anchor: anchor).keys { fine.insert(key: key) }
+                priorFine = fine
                 meta["site_anchor"] = anchor.metaJSON
                 dirty = true  // draw the old coverage right away
             }
@@ -460,6 +518,19 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                 writeFailed = true
                 return false
             }
+        }
+
+        func logDiag(_ entry: [String: Any]) {
+            guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+            line.append(10)
+            write(line, to: diagFile)
+        }
+
+        /// Rewrites meta.json so a killed walk still has a sane frame count and a recent checkpoint time.
+        func checkpoint() {
+            meta["frame_count"] = count
+            meta["last_checkpoint"] = Engine.iso.string(from: Date())
+            writeMeta()
         }
 
         func logBaro(_ entry: [String: Any]) {
@@ -556,6 +627,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         try? w.gpsFile.close()
         try? w.eventsFile.close()
         try? w.baroFile.close()
+        try? w.diagFile.close()
         if duration > 30 { Storage.saveRate(Double(w.bytesWritten) / duration) }
         if reason != "user" { onStopped?(reason) }
     }
@@ -564,11 +636,52 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         q.async { self.viewport = size }
     }
 
+    func setBattery(_ level: Float) {
+        q.async { self.battery = level }
+    }
+
+    /// Memory is short: stop the optional gap search and free its structures. Stays on for the rest of the walk.
+    func shed(reason: String) {
+        q.async {
+            guard let w = self.walk, !w.shedding else { return }
+            self.beginShedding(w, reason: reason)
+        }
+    }
+
+    private func beginShedding(_ w: Walk, reason: String) {
+        w.shedding = true
+        w.comps = []
+        w.lookCells = []
+        w.looks = [:]
+        w.blockedKeys = []
+        w.firstSeen = [:]
+        w.target = nil
+        w.targetKey = nil
+        w.priorFine = nil
+        logDiag(w, note: reason)
+    }
+
     // MARK: ARSessionDelegate (called on q)
+
+    func session(_ session: ARSession, didAdd anchors: [ARAnchor]) {
+        meshAnchors += anchors.reduce(0) { $0 + ($1 is ARMeshAnchor ? 1 : 0) }
+    }
+
+    func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
+        meshAnchors = max(0, meshAnchors - anchors.reduce(0) { $0 + ($1 is ARMeshAnchor ? 1 : 0) })
+    }
 
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
         guard let w = walk else { return }
         let now = frame.timestamp
+        // If we are behind (slow disk, heat), ARKit's frames queue up here, each holding several MB. Skip
+        // stale frames instead of piling them up; the gap shows in frames.jsonl and in diag.jsonl.
+        let lag = ProcessInfo.processInfo.systemUptime - now
+        w.queueLag = max(w.queueLag, lag)
+        if lag > 0.5 {
+            w.framesDropped += 1
+            return
+        }
         // Frames shortly after the reset may still carry the old world origin.
         guard now > w.startUptime + 0.5 else { return }
 
@@ -766,27 +879,42 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     private func applyHoles(_ w: Walk, _ found: [FoundHole]) {
         guard walk === w else { return }
         w.holeJobRunning = false
+        guard !w.shedding else { return }
         let now = ProcessInfo.processInfo.systemUptime
 
+        // Every hole cell, to tell "filled" from "merely not tracked right now".
         var raw = Set<Int64>()
-        var seen: [Int64: Double] = [:]
-        var comps: [HoleComp] = []
+        // Only the holes nearest to the user are tracked (bounded count and cells), recomputed every second.
+        var candidates: [(hole: FoundHole, center: SIMD2<Float>, distance: Float)] = []
         for hole in found {
-            var settled = false
             var sum = SIMD2<Float>(0, 0)
             for key in hole.keys {
                 raw.insert(key)
+                sum += FineGrid.center(key)
+            }
+            let center = sum / Float(hole.keys.count)
+            candidates.append((hole, center, hypot(center.x - w.pos.x, center.y - w.pos.z)))
+        }
+        candidates.sort { $0.distance < $1.distance }
+
+        var seen: [Int64: Double] = [:]
+        var comps: [HoleComp] = []
+        var cellBudget = HoleConfig.maxTrackedCells
+        for (hole, center, _) in candidates {
+            guard comps.count < HoleConfig.maxTrackedHoles, hole.keys.count <= cellBudget else { break }
+            cellBudget -= hole.keys.count
+            var settled = false
+            for key in hole.keys {
                 let first = w.firstSeen[key] ?? now
                 seen[key] = first
                 if now - first >= HoleConfig.settleSeconds { settled = true }
-                sum += FineGrid.center(key)
             }
             if settled {
                 let n = Float(hole.keys.count)
                 let radius = max(HoleConfig.cellSize, (n / .pi).squareRoot() * HoleConfig.cellSize)
                 // Holes bordered only by old coverage have no ground height of their own: assume the phone is held ~1.4 m up.
                 let ground = hole.groundY.isNaN ? w.pos.y - 1.4 : hole.groundY
-                comps.append(HoleComp(keys: hole.keys, groundY: ground, center: sum / n, radius: radius))
+                comps.append(HoleComp(keys: hole.keys, groundY: ground, center: center, radius: radius))
             }
         }
         w.firstSeen = seen
@@ -794,8 +922,10 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         // A hole that was open and has no hole cells left was filled (blocked ones don't count).
         for c in w.comps where !c.blocked && !c.keys.contains(where: raw.contains) { w.pendingFilled += 1 }
 
-        w.looks = w.looks.filter { raw.contains($0.key) }
-        w.blockedKeys.formIntersection(raw)
+        // Look state is kept only for cells that are tracked (at most maxTrackedCells).
+        let tracked = Set(comps.lazy.flatMap(\.keys))
+        w.looks = w.looks.filter { tracked.contains($0.key) }
+        w.blockedKeys.formIntersection(tracked)
         w.comps = comps
         w.lookCells = comps.flatMap { comp in
             comp.keys.map { key -> LookCell in
@@ -835,6 +965,24 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             if w.diskFree < Storage.lowSpaceStop { return finish(w, reason: "low_space") }
         }
 
+        // Memory first: iOS kills an app that goes over its limit without warning. Below the headroom
+        // threshold, drop the optional work (gap search; the screen also drops the mesh) while there is still time.
+        let available = Memory.availableBytes()
+        if !w.shedding, available > 0, available < Memory.lowAvailable { beginShedding(w, reason: "low_memory") }
+
+        // Heat is secondary: iOS throttles first and only pauses the camera at critical. Close the walk cleanly before that.
+        if ProcessInfo.processInfo.thermalState == .critical { return finish(w, reason: "thermal") }
+
+        // Crash safety: frame_count and a checkpoint time in meta.json every 30 s, and a health line every 5 s.
+        if now - w.lastCheckpoint >= 30 {
+            w.lastCheckpoint = now
+            w.checkpoint()
+        }
+        if now - w.lastDiag >= 5 {
+            w.lastDiag = now
+            logDiag(w)
+        }
+
         var snapshot: CoverageSnapshot?
         if w.dirty, now - w.lastSnapshot >= 1 {
             snapshot = w.grid.render(prior: w.prior25)
@@ -842,11 +990,11 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             w.dirty = false
         }
         // Hole search runs on its own queue on a copy of the fine grid, at most once a second.
-        if w.fineDirty, !w.holeJobRunning, now - w.lastHoleJob >= 1 {
+        if w.fineDirty, !w.holeJobRunning, !w.shedding, now - w.lastHoleJob >= 1 {
             w.fineDirty = false
             w.holeJobRunning = true
             w.lastHoleJob = now
-            let fine = w.fine
+            let fine = w.fine  // shallow copy: tiles are copy-on-write, so this costs a few hundred pointers
             let prior = w.priorFine
             holeQueue.async {
                 let found = fine.holes(prior: prior)
@@ -864,6 +1012,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             if w.trackingIssue == nil, now - w.lastValidDepth > 2 { issues.append("No valid depth (sky or too far), aim at the ground") }
         }
         if let s = w.sessionIssue { issues.append(s) }
+        if w.shedding { issues.append("Low memory: gap search and mesh paused to keep recording") }
         if w.diskFree < Storage.lowSpaceWarn {
             issues.append(String(format: "Low disk space (%.1f GB free), recording stops at %.1f GB",
                                  Double(w.diskFree) / 1e9, Double(Storage.lowSpaceStop) / 1e9))
@@ -877,7 +1026,41 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                          targetDistance: guidance.distance, targetAngle: guidance.angle,
                          targetOnScreen: w.targetOnScreen, filled: guidance.filled,
                          trackingLost: w.lost, freeBytes: w.diskFree,
-                         bytesPerSecond: duration > 15 ? Double(w.bytesWritten) / duration : 0))
+                         bytesPerSecond: duration > 15 ? Double(w.bytesWritten) / duration : 0,
+                         shedding: w.shedding))
+    }
+
+    /// One health line for diag.jsonl: memory headroom and footprint, heat, battery, frame backlog, structure sizes.
+    private func logDiag(_ w: Walk, note: String? = nil) {
+        let now = ProcessInfo.processInfo.systemUptime
+        var entry: [String: Any] = [
+            "t": WalkClock.t(now, startUptime: w.startUptime),
+            "avail_mb": Memory.availableBytes() / 1_000_000,
+            "footprint_mb": Int(Memory.footprintBytes() / 1_000_000),
+            "thermal": Self.thermalName(ProcessInfo.processInfo.thermalState),
+            "battery": battery >= 0 ? Double(battery) as Any : NSNull(),
+            "queue_lag_s": (w.queueLag * 1000).rounded() / 1000,
+            "frames_dropped": w.framesDropped,
+            "mesh_anchors": meshAnchors,
+            "frames": w.count,
+            "coarse_cells": w.grid.cellCount,
+            "fine_tiles": w.fine.tileCount,
+            "hole_cells": w.lookCells.count,
+            "shedding": w.shedding,
+        ]
+        if let note { entry["note"] = note }
+        w.queueLag = 0
+        w.logDiag(entry)
+    }
+
+    private static func thermalName(_ state: ProcessInfo.ThermalState) -> String {
+        switch state {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
+        }
     }
 
     /// Marks blocked holes, counts open ones and picks the nearest open hole cell as the target.

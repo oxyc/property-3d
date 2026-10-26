@@ -7,6 +7,12 @@ enum HoleConfig {
     static let cellSize: Float = 0.10
     /// Smallest enclosed gap that counts, in fine cells. 1 = any gap, however small.
     static let minHoleCells = 1
+    /// Enclosed regions bigger than this (40 m2) are unscanned interiors, not blind spots: ignored, so a loop
+    /// around a big unseen patch cannot make the hole structures grow without bound.
+    static let maxHoleCells = 4000
+    /// At most this many holes (nearest to the user first) and this many hole cells are tracked at once.
+    static let maxTrackedHoles = 400
+    static let maxTrackedCells = 20000
     /// A hole must have existed this long before it is reported (filters sampling speckle while moving).
     static let settleSeconds = 2.0
     /// Depth beyond this is too sparse to mark fine cells reliably.
@@ -20,19 +26,33 @@ enum HoleConfig {
     static let lookMargin: Float = 0.15
 }
 
-struct FineCell {
-    var hits: UInt8 = 0
-    var minY = Float.infinity
-}
-
 struct FoundHole {
     var keys: [Int64]
     var groundY: Float
 }
 
-/// 10 cm occupancy grid in world X/Z. Value type, so a copy can be searched on another queue.
+/// 10 cm occupancy grid in world X/Z, stored in 64 x 64 cell tiles (6.4 m, 20 KB each).
+///
+/// It is a value type whose tiles hold arrays, so `let copy = grid` is a shallow copy of a small dictionary
+/// (a few hundred tiles) and a later `mark` only duplicates the one tile it touches (copy-on-write),
+/// instead of the whole grid. The hole search runs on such a copy.
 struct FineGrid {
-    private(set) var cells: [Int64: FineCell] = [:]
+    static let tileBits: Int32 = 6
+    private static let tileCells = 1 << (2 * Int(tileBits))
+
+    struct Tile {
+        var hits = [UInt8](repeating: 0, count: FineGrid.tileCells)
+        var minY = [Float](repeating: .infinity, count: FineGrid.tileCells)
+
+        mutating func mark(_ i: Int, y: Float) {
+            if hits[i] < .max { hits[i] += 1 }
+            minY[i] = min(minY[i], y)
+        }
+    }
+
+    private(set) var tiles: [Int64: Tile] = [:]
+
+    var tileCount: Int { tiles.count }
 
     static func key(_ ix: Int32, _ iz: Int32) -> Int64 {
         Int64(ix) << 32 | Int64(UInt32(bitPattern: iz))
@@ -48,50 +68,62 @@ struct FineGrid {
         return SIMD2((Float(ix) + 0.5) * HoleConfig.cellSize, (Float(iz) + 0.5) * HoleConfig.cellSize)
     }
 
-    mutating func mark(x: Float, y: Float, z: Float) {
-        guard abs(x) < 1e5, abs(z) < 1e5 else { return }
-        let k = Self.key(Int32((x / HoleConfig.cellSize).rounded(.down)), Int32((z / HoleConfig.cellSize).rounded(.down)))
-        var c = cells[k] ?? FineCell()
-        if c.hits < .max { c.hits += 1 }
-        c.minY = min(c.minY, y)
-        cells[k] = c
+    private static func locate(_ ix: Int32, _ iz: Int32) -> (tile: Int64, index: Int) {
+        let mask = (Int32(1) << tileBits) - 1
+        return (key(ix >> tileBits, iz >> tileBits), Int(((iz & mask) << tileBits) | (ix & mask)))
     }
 
-    /// Unseen regions fully enclosed by seen cells. Ground height is the mean lowest-Y of the seen cells around each hole
-    /// (NaN when only `prior` cells surround it, so the caller picks a fallback).
-    /// `prior` are cells already covered by a previous walk (fine-grid keys): they count as seen.
-    func holes(minCells: Int = HoleConfig.minHoleCells, maxSide: Int = 2048, prior: Set<Int64> = []) -> [FoundHole] {
-        guard !cells.isEmpty else { return [] }
+    mutating func mark(x: Float, y: Float, z: Float) {
+        guard abs(x) < 1e5, abs(z) < 1e5 else { return }
+        let (tile, index) = Self.locate(Int32((x / HoleConfig.cellSize).rounded(.down)), Int32((z / HoleConfig.cellSize).rounded(.down)))
+        tiles[tile, default: Tile()].mark(index, y: y)
+    }
+
+    /// Marks a cell by key as seen, with no height (used for the previous walk's coverage).
+    mutating func insert(key k: Int64) {
+        let (ix, iz) = Self.decode(k)
+        let (tile, index) = Self.locate(ix, iz)
+        tiles[tile, default: Tile()].hits[index] = 1
+    }
+
+    /// Unseen regions fully enclosed by seen cells, between `minCells` and `maxCells` cells each. Ground height is the
+    /// mean lowest-Y of the seen cells around each hole (NaN when only `prior` cells surround it, so the caller
+    /// picks a fallback). `prior` is coverage from a previous walk: it counts as seen.
+    func holes(minCells: Int = HoleConfig.minHoleCells, maxCells: Int = HoleConfig.maxHoleCells,
+               maxSide: Int = 2048, prior: FineGrid? = nil) -> [FoundHole] {
+        guard !tiles.isEmpty else { return [] }
+        let grids = [self] + (prior.map { [$0] } ?? [])
+
+        // Bounds from the tiles (a few cells wider than the data, which is harmless: the extra is "outside").
         var minX = Int32.max, maxX = Int32.min, minZ = Int32.max, maxZ = Int32.min
-        for k in cells.keys {
-            let (ix, iz) = Self.decode(k)
-            minX = min(minX, ix); maxX = max(maxX, ix)
-            minZ = min(minZ, iz); maxZ = max(maxZ, iz)
-        }
-        for k in prior {
-            let (ix, iz) = Self.decode(k)
-            minX = min(minX, ix); maxX = max(maxX, ix)
-            minZ = min(minZ, iz); maxZ = max(maxZ, iz)
+        let side = Int32(1) << Self.tileBits
+        for grid in grids {
+            for k in grid.tiles.keys {
+                let (tx, tz) = Self.decode(k)
+                minX = min(minX, tx * side); maxX = max(maxX, tx * side + side - 1)
+                minZ = min(minZ, tz * side); maxZ = max(maxZ, tz * side + side - 1)
+            }
         }
         // One cell of padding on every side guarantees the border is "outside".
         let w = min(Int(maxX) - Int(minX) + 3, maxSide), h = min(Int(maxZ) - Int(minZ) + 3, maxSide)
         let ox = Int(minX) - 1, oz = Int(minZ) - 1
         var covered = [Bool](repeating: false, count: w * h)
         var minY = [Float](repeating: .infinity, count: w * h)
-        for k in prior {
-            let (ix, iz) = Self.decode(k)
-            let col = Int(ix) - ox, row = Int(iz) - oz
-            if col >= 0, col < w, row >= 0, row < h { covered[row * w + col] = true }
-        }
-        for (k, c) in cells {
-            let (ix, iz) = Self.decode(k)
-            let col = Int(ix) - ox, row = Int(iz) - oz
-            if col >= 0, col < w, row >= 0, row < h {
-                covered[row * w + col] = true
-                minY[row * w + col] = c.minY
+        let tileSide = Int(side)
+        for grid in grids {  // prior cells carry no height, so only this walk sets minY
+            for (k, tile) in grid.tiles {
+                let (tx, tz) = Self.decode(k)
+                for i in 0..<tile.hits.count where tile.hits[i] != 0 {
+                    let col = Int(tx) * tileSide + (i & (tileSide - 1)) - ox
+                    let row = Int(tz) * tileSide + (i >> Int(Self.tileBits)) - oz
+                    if col >= 0, col < w, row >= 0, row < h {
+                        covered[row * w + col] = true
+                        if tile.minY[i].isFinite { minY[row * w + col] = tile.minY[i] }
+                    }
+                }
             }
         }
-        return findEnclosed(covered: covered, width: w, height: h, minCells: minCells).map { comp in
+        return findEnclosed(covered: covered, width: w, height: h, minCells: minCells, maxCells: maxCells).map { comp in
             var sum: Float = 0, n: Float = 0
             var keys: [Int64] = []
             keys.reserveCapacity(comp.count)
@@ -108,8 +140,8 @@ struct FineGrid {
 }
 
 /// Connected components (4-neighbour) of uncovered cells that cannot reach the grid border through
-/// uncovered cells. Returns flat indices (row * width + col) per component with at least `minCells` cells.
-func findEnclosed(covered: [Bool], width: Int, height: Int, minCells: Int) -> [[Int]] {
+/// uncovered cells. Returns flat indices (row * width + col) per component with `minCells...maxCells` cells.
+func findEnclosed(covered: [Bool], width: Int, height: Int, minCells: Int, maxCells: Int = .max) -> [[Int]] {
     guard width > 2, height > 2 else { return [] }
     var visited = covered  // covered cells are never visited
     var stack: [Int] = []
@@ -140,7 +172,7 @@ func findEnclosed(covered: [Bool], width: Int, height: Int, minCells: Int) -> [[
             comp.append(i)
             seedNeighbours(i)
         }
-        if comp.count >= minCells { result.append(comp) }
+        if comp.count >= minCells, comp.count <= maxCells { result.append(comp) }
     }
     return result
 }
