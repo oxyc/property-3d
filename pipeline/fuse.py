@@ -98,15 +98,16 @@ def project_into_keyframe(pts, kf, kf_img, kf_depth, kf_conf, meta):
     h, w = kf_img.shape[:2]
     ui, vi = np.round(u).astype(int), np.round(v).astype(int)
     ok = (z > 0.1) & (ui >= 0) & (ui < w) & (vi >= 0) & (vi < h)
-    ud = np.clip(np.round(u * meta["depth_w"] / w).astype(int), 0, meta["depth_w"] - 1)
-    vd = np.clip(np.round(v * meta["depth_h"] / h).astype(int), 0, meta["depth_h"] - 1)
-    ok &= (kf_conf[vd, ud] >= 1) & (np.abs(kf_depth[vd, ud] - z) < 0.1)
+    k = np.flatnonzero(ok)  # the depth check only for the points in the image
+    ud = np.clip(np.round(u[k] * meta["depth_w"] / w).astype(int), 0, meta["depth_w"] - 1)
+    vd = np.clip(np.round(v[k] * meta["depth_h"] / h).astype(int), 0, meta["depth_h"] - 1)
+    ok[k] = (kf_conf[vd, ud] >= 1) & (np.abs(kf_depth[vd, ud] - z[k]) < 0.1)
     col = np.zeros((len(pts), 3))
     col[ok] = kf_img[vi[ok], ui[ok]] / 255.0
     return ok, z, col
 
 
-CELL = 3.0  # m: coarse grid for finding the points around a camera
+CELL = 0.5  # m: grid for finding the points in a camera's view (coarser cells fetch many points outside it)
 CELL_OFF = 1 << 20
 
 
@@ -148,10 +149,11 @@ def colour_points(pcd, sources, jobs=1):
     sources: [(walk, meta, keyframes)], one per walk. The keyframes are decoded and projected in `jobs` threads
     (JPEG decoding and numpy release the GIL); their results are applied in keyframe order, so the colours do not
     depend on jobs."""
-    pts = np.asarray(pcd.points)
+    order, skeys = grid_index(np.asarray(pcd.points))
+    pts = np.asarray(pcd.points)[order]  # sorted by grid cell, so the points around a camera are read from a few contiguous runs
+    index = (np.arange(len(pts)), skeys)
     cols = np.full((len(pts), 3), 0.5)
     best = np.full(len(pts), np.inf)
-    index = grid_index(pts)
 
     def project(job):
         walk, meta, kf = job
@@ -177,7 +179,9 @@ def colour_points(pcd, sources, jobs=1):
                     better = z < best[idx]
                     best[idx[better]] = z[better]
                     cols[idx[better]] = col[better]
-    pcd.colors = o3d.utility.Vector3dVector(cols)
+    out = np.empty_like(cols)
+    out[order] = cols  # back to the cloud's own point order
+    pcd.colors = o3d.utility.Vector3dVector(out)
     return np.isfinite(best).mean()
 
 
