@@ -1,6 +1,7 @@
 """Gaussian splats from a walk: export a COLMAP-format training set, train with Brush, convert for the web.
 
 usage: splat.py export <walk_dir> <out_dir> [--width 1600] [--max-points 200000] [--drop-blurry 0.35]
+       splat.py export-merged <merge_out_dir> [--walks ../walks] [same options as export]
        splat.py train <out_dir> [--steps 30000] [--max-splats 1200000]
        splat.py convert <out_dir> [--min-opacity 0.05] [--max-scale 0.5] [--max-gap 0.5] [--max-splats 1250000]
 
@@ -14,6 +15,7 @@ The trainer is Brush (https://github.com/ArthurBrussee/brush): $BRUSH, else brus
 the binary under ../tools/.
 """
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -79,39 +81,65 @@ def select_sharp(frames, scores, drop=0.35, cover_dist=0.5, cover_deg=25):
 
 
 def export(walk, out, width=1600, max_points=200_000, drop_blurry=0.35):
-    walk, out = Path(walk), Path(out)
-    meta, frames = fuse.read_walk(walk)
-    if (out / "poses.npz").exists():
-        z = np.load(out / "poses.npz")
-        corrected = dict(zip(z["i"].tolist(), z["T"]))
-        for f in frames:
-            f["T"] = corrected[f["i"]]
-    else:
+    out = Path(out)
+    poses = out / "poses.npz"
+    if not poses.exists():
         print("no poses.npz in out_dir: using the recorded (uncorrected) poses")
+    write_dataset([(Path(walk), poses if poses.exists() else None)], out, width, max_points, drop_blurry)
+
+
+def export_merged(out, walks_root, width=1600, max_points=200_000, drop_blurry=0.35):
+    """Training set from a merge.py output: every placed piece's frames, at its merged poses."""
+    out, walks_root = Path(out), Path(walks_root)
+    pieces = json.loads((out / "merge.json").read_text())["walks"]
+    units = [(walks_root / p["walk"], out / f"walk{k}" / "poses_merged.npz") for k, p in enumerate(pieces)]
+    write_dataset([u for u in units if u[1].exists()], out, width, max_points, drop_blurry)
+
+
+def write_dataset(units, out, width, max_points, drop_blurry):
+    """units: (walk_dir, poses.npz or None) pairs. A poses file also limits its walk to the frames it lists
+    (a split walk's piece lists only its own). Image names get a unit prefix when there is more than one."""
     data = out / "splat" / "data"
     shutil.rmtree(data, ignore_errors=True)
     (data / "images").mkdir(parents=True)
     (data / "sparse" / "0").mkdir(parents=True)
 
-    cand = [f for f in frames if f["rgb"] and f["tracking"] == "normal"]
-    scores = [sharpness(Image.open(walk / "rgb" / f"{f['i']:06d}.jpg")) for f in cand]
-    chosen = select_sharp(cand, scores, drop_blurry)
-    print(f"{len(chosen)} of {len(cand)} keyframes kept (sharpness median {np.median(scores):.0f}, "
-          f"kept median {np.median([scores[k] for k in chosen]):.0f})")
     cameras, images = {}, []
-    for f in (cand[k] for k in chosen):
-        img = Image.open(walk / "rgb" / f"{f['i']:06d}.jpg").convert("RGB")
-        w, h = width, round(width * img.height / img.width)
-        img.resize((w, h), Image.LANCZOS).save(data / "images" / f"{f['i']:06d}.jpg", quality=92)
-        s = w / img.width
-        fx, fy, cx, cy = (v * s for v in f["intrinsics"])  # intrinsics are in full-size RGB pixels
-        cam = cameras.setdefault((w, h, round(fx, 3), round(fy, 3), round(cx, 3), round(cy, 3)), len(cameras) + 1)
-        images.append((f["i"], cam, colmap_pose(f["T"])))
+    for u, (walk, poses) in enumerate(units):
+        meta, frames = fuse.read_walk(walk)
+        if poses is not None:
+            z = np.load(poses)
+            corrected = dict(zip(z["i"].tolist(), z["T"]))
+            frames = [f for f in frames if f["i"] in corrected]
+            for f in frames:
+                f["T"] = corrected[f["i"]]
+        cand, scores = [], []
+        for f in frames:
+            if not (f["rgb"] and f["tracking"] == "normal"):
+                continue
+            try:  # a walk cut short by a full disk can end on an empty or truncated JPEG
+                scores.append(sharpness(Image.open(walk / "rgb" / f"{f['i']:06d}.jpg")))
+            except OSError:
+                print(f"{walk.name}: skipped unreadable rgb/{f['i']:06d}.jpg")
+                continue
+            cand.append(f)
+        chosen = select_sharp(cand, scores, drop_blurry)
+        print(f"{walk.name}: {len(chosen)} of {len(cand)} keyframes kept (sharpness median {np.median(scores):.0f}, "
+              f"kept median {np.median([scores[k] for k in chosen]):.0f})")
+        for f in (cand[k] for k in chosen):
+            name = f"{u}_{f['i']:06d}.jpg" if len(units) > 1 else f"{f['i']:06d}.jpg"
+            img = Image.open(walk / "rgb" / f"{f['i']:06d}.jpg").convert("RGB")
+            w, h = width, round(width * img.height / img.width)
+            img.resize((w, h), Image.LANCZOS).save(data / "images" / name, quality=92)
+            s = w / img.width
+            fx, fy, cx, cy = (v * s for v in f["intrinsics"])  # intrinsics are in full-size RGB pixels
+            cam = cameras.setdefault((w, h, round(fx, 3), round(fy, 3), round(cx, 3), round(cy, 3)), len(cameras) + 1)
+            images.append((name, cam, colmap_pose(f["T"])))
     (data / "sparse" / "0" / "cameras.txt").write_text("".join(
         f"{cid} PINHOLE {w} {h} {fx} {fy} {cx} {cy}\n" for (w, h, fx, fy, cx, cy), cid in cameras.items()))
     # second line of each image is its 2D points: none
     (data / "sparse" / "0" / "images.txt").write_text("".join(
-        f"{k + 1} {' '.join(repr(float(v)) for v in pose)} {cam} {i:06d}.jpg\n\n" for k, (i, cam, pose) in enumerate(images)))
+        f"{k + 1} {' '.join(repr(float(v)) for v in pose)} {cam} {name}\n\n" for k, (name, cam, pose) in enumerate(images)))
 
     pcd = thin(o3d.io.read_point_cloud(str(out / "points.ply")), max_points)
     pts, cols = np.asarray(pcd.points), (np.asarray(pcd.colors) * 255).round().astype(int)
@@ -207,6 +235,12 @@ if __name__ == "__main__":
     e.add_argument("--width", type=int, default=1600, help="training image width in px")
     e.add_argument("--max-points", type=int, default=200_000, help="initial points")
     e.add_argument("--drop-blurry", type=float, default=0.35, help="fraction of blurriest keyframes to drop (coverage kept)")
+    m = sub.add_parser("export-merged", help="training set from a merge.py output (all pieces, merged poses)")
+    m.add_argument("out_dir")
+    m.add_argument("--walks", default=str(HERE.parent / "walks"), help="folder holding the walk_* folders")
+    for flag, kw in (("--width", dict(type=int, default=1600)), ("--max-points", dict(type=int, default=200_000)),
+                     ("--drop-blurry", dict(type=float, default=0.35))):
+        m.add_argument(flag, **kw)
     for name in ("train", "convert"):
         p = sub.add_parser(name)
         p.add_argument("out_dir")
@@ -221,6 +255,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     if a.cmd == "export":
         export(a.walk_dir, a.out_dir, a.width, a.max_points, a.drop_blurry)
+    elif a.cmd == "export-merged":
+        export_merged(a.out_dir, a.walks, a.width, a.max_points, a.drop_blurry)
     else:
         prune = dict(min_opacity=a.min_opacity, max_scale=a.max_scale, max_gap=a.max_gap)
         if a.cmd == "train":

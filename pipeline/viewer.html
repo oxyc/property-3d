@@ -66,6 +66,20 @@
   #labels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
   .lbl { position: absolute; left: 0; top: 0; background: rgba(20,22,26,.82); color: #fff; padding: 2px 6px; border-radius: 5px; font-size: 12px; white-space: nowrap; text-align: center; }
   .lbl b { display: block; font-size: 14px; color: #ffd23f; }
+  #walkhud { position: absolute; inset: 0; pointer-events: none; }
+  #walkhud > * { pointer-events: auto; }
+  #walkhint { position: absolute; left: 50%; top: 14px; transform: translateX(-50%); width: min(440px, calc(100vw - 100px)); padding: 10px 14px; background: rgba(20,22,26,.92); color: #eee; font-size: 13px; line-height: 1.5; cursor: pointer; border-color: #555; }
+  #walkhint b { color: #ffd23f; }
+  #minimap { position: absolute; inset: auto 12px 76px auto; width: 160px; height: 110px; border-radius: 8px; background: rgba(20,22,26,.75); border: 1px solid #555; pointer-events: none !important; }
+  #walkinfo { position: absolute; right: 12px; bottom: 192px; color: #fff; font: 12px ui-monospace, monospace; text-shadow: 0 0 3px #000; pointer-events: none !important; white-space: nowrap; }
+  #walkbar { position: absolute; right: 12px; bottom: 12px; display: flex; gap: 6px; padding: 6px; }
+  #walkbar button { min-height: 44px; min-width: 56px; padding: 0 12px; }
+  #joy { position: absolute; left: 22px; bottom: 22px; width: 128px; height: 128px; border-radius: 50%; background: rgba(255,255,255,.14); border: 2px solid rgba(255,255,255,.45); touch-action: none; display: none; }
+  #joy i { position: absolute; left: 50%; top: 50%; width: 56px; height: 56px; margin: -28px 0 0 -28px; border-radius: 50%; background: rgba(255,255,255,.55); pointer-events: none; }
+  body.touch #joy, body.small #joy { display: block; }
+  body.walking #scale, body.walking #pad { display: none; }
+  body.walking #toast { bottom: 200px; }
+  @media (max-width: 600px) { #minimap, #walkinfo { display: none; } #walkbar { right: 8px; bottom: 8px; } #walkhint { top: 60px; } }
   .lbl.pt { font-size: 11px; margin-top: -18px; padding: 1px 5px; }
   .lbl.tip { margin-top: 20px; font-size: 11px; padding: 1px 5px; background: rgba(20,22,26,.9); }
   .lbl.sum { margin-top: 18px; background: #5a4a00; }
@@ -206,6 +220,7 @@
     <button id="bTop" title="Top view, north up (T)">Top</button>
     <button id="bHome" title="Perspective view (P)">3D</button>
     <button id="bPlan" title="Plan view: orthographic, north up (L)" aria-pressed="false">Plan</button>
+    <button id="bWalk" title="Walk through the model in first person (G)" aria-pressed="false">Walk</button>
     <button id="bFit" title="Fit to model (F)">Fit</button>
     <button id="bMeasure" title="Measure distances (M)" aria-pressed="false">Ruler</button>
     <button id="bClear" title="Clear measurements (Esc)">Clear</button>
@@ -219,6 +234,17 @@
   </div>
 </div>
 
+<div id="walkhud" hidden>
+  <div id="walkhint" class="card" hidden></div>
+  <canvas id="minimap" width="160" height="110" aria-label="Map: you are here"></canvas>
+  <div id="walkinfo"></div>
+  <div id="walkbar" class="card">
+    <button id="wFly" type="button" aria-pressed="false" title="Fly: ignore the ground (V). Space / C or Q / E go up and down">Fly</button>
+    <button id="wRun" type="button" aria-pressed="false" title="Run (hold Shift)">Run</button>
+    <button id="wLeave" type="button" title="Back to the orbit view (Esc, then Esc again)">Leave</button>
+  </div>
+  <div id="joy" aria-label="Move: virtual joystick"><i></i></div>
+</div>
 <div id="scale"><i></i><span></span></div>
 <canvas id="loupe" width="120" height="120" hidden></canvas>
 <div id="vcb" hidden></div>
@@ -235,6 +261,7 @@
 <div id="drop">Drop .ply to view</div>
 <div id="help" hidden><div class="card"><h3>Mouse &amp; trackpad</h3><dl id="gestures"></dl><h3 style="margin-top:12px">Shortcuts</h3><dl>
   <dt>T P L F</dt><dd>Top · Perspective · Plan (orthographic) · Fit</dd>
+  <dt>G</dt><dd>Walk: first person at eye height. WASD / arrows move, Shift runs, V flies, click captures the mouse, Esc releases, Esc again leaves</dd>
   <dt>S</dt><dd>Cycle display: points / solid / surface</dd>
   <dt>M</dt><dd>Measure (tape): click points, it snaps to endpoints, midpoints and surfaces, and to the red / green / blue axes</dd>
   <dt>Shift</dt><dd>While measuring: lock the direction</dd><dt>0-9 Enter</dt><dd>Type a length, Enter places the point</dd>
@@ -296,7 +323,7 @@ scene.add(grid);
 const persp = new THREE.PerspectiveCamera(60, 1, 0.05, 2000);
 const ortho = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.5, 100);  // plan view
 let camera = persp, plan = false;
-let dirty = true, anim = null;
+let dirty = true, anim = null, walking = false;  // walking: first-person mode, which owns the camera and the input
 const invalidate = () => { dirty = true; };
 // Camera state: the camera sits at target + off and looks at target (Y-up, so it can't roll).
 // In plan view off is straight up and nav.planH is the visible height in metres.
@@ -423,6 +450,7 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   }
   const pos = geom.attributes.position, n = pos.count;
   if (!n) throw new Error("empty");
+  if (walking) leaveWalk();
   if (cloud) { scene.remove(cloud.obj); cloud.geom.dispose(); }
   if (surf) { scene.remove(surf.obj); surf.geom.dispose(); surf = null; }
   if (photo) { scene.remove(photo.obj); photo = null; }
@@ -483,6 +511,7 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   startView = null;
   updateQualityHint();
   applyQuality(quality);
+  if (sv && sv.w && sv.cam) enterWalk(true);  // a shared Walk link: stand where the camera is
   invalidate();
 }
 
@@ -611,6 +640,7 @@ function applyQualityView() {  // pixel ratio and point budget for the current s
   setPointStride(moving ? Math.max(2, q.stride * 2) : q.stride);
 }
 function markMoving() {
+  if (walking) return;  // walking is continuous movement: no adaptive downscaling
   if (!moving) { moving = true; applyQualityView(); }
   clearTimeout(moveTimer);
   moveTimer = setTimeout(() => { moving = false; applyQualityView(); }, 200);
@@ -894,15 +924,16 @@ function stepAnim() {
   applyNav();
   if (k === 1) anim = null;
 }
-const viewTop = () => { if (cloud) { setPlan(false); goView(0.0005, 0); } };
-const viewHome = () => { if (cloud) { setPlan(false); goView(0.85, Math.PI / 4); } };
+const viewTop = () => { if (walking) leaveWalk(); if (cloud) { setPlan(false); goView(0.0005, 0); } };
+const viewHome = () => { if (walking) leaveWalk(); if (cloud) { setPlan(false); goView(0.85, Math.PI / 4); } };
 const viewFit = () => {
+  if (walking) leaveWalk();
   if (!cloud) return;
   if (plan) return fitPlan();
   const s = currentSpherical();
   goView(s.phi, s.theta);
 };
-$("compass").onclick = () => { if (!plan) { const s = currentSpherical(); flyTo(nav.target.clone(), new THREE.Spherical(s.radius, s.phi, 0)); } };
+$("compass").onclick = () => { if (!plan && !walking) { const s = currentSpherical(); flyTo(nav.target.clone(), new THREE.Spherical(s.radius, s.phi, 0)); } };
 
 // Plan view: orthographic, straight down, north up. Leaving it (3D, Top, any orbit) goes back to a perspective top view.
 function updateOrtho() {
@@ -938,7 +969,7 @@ function setPlan(on) {
 
 function parseHash() {
   const q = new URLSearchParams(location.hash.slice(1)), v = (q.get("cam") || "").split(",").map(Number);
-  return { cam: v.length === 6 && v.every(Number.isFinite) ? v : null, d: q.get("d"), z: +q.get("z") || 0, m: q.get("m") };
+  return { cam: v.length === 6 && v.every(Number.isFinite) ? v : null, d: q.get("d"), z: +q.get("z") || 0, m: q.get("m"), w: q.get("w") === "1" };
 }
 let hashTimer;
 function scheduleHash() {
@@ -949,6 +980,7 @@ function scheduleHash() {
     const c = camera.position, t = nav.target;
     const q = [`cam=${[c.x, c.y, c.z, t.x, t.y, t.z].map((x) => +x.toFixed(2)).join(",")}`, `d=${display}`];
     if (plan) q.push(`z=${+nav.planH.toFixed(2)}`);
+    if (walking) q.push("w=1");  // the camera is then the eye; the link opens in Walk mode at the same spot
     const m = chainsToHash();
     if (m && m.length < 1500) q.push(`m=${m}`);  // measurements travel with the link while they stay short
     history.replaceState(null, "", `${location.pathname}${location.search}#${q.join("&")}`);
@@ -966,6 +998,7 @@ function applyNav() {
 // ---- Navigation primitives (SketchUp-style: orbit about a pivot, zoom toward a point, pan in screen plane)
 const UP = new THREE.Vector3(0, 1, 0), clamp = (v, a, b) => Math.min(b, Math.max(a, v));
 function orbit(dTheta, dPhi, pivot = nav.target) {  // rotate camera+target about pivot; pitch is clamped at the poles
+  if (walking) return;
   setPlan(false);
   pivot = pivot.clone();
   const phi = Math.acos(clamp(nav.off.y / nav.off.length(), -1, 1)), theta = Math.atan2(nav.off.x, nav.off.z);
@@ -978,13 +1011,14 @@ function orbit(dTheta, dPhi, pivot = nav.target) {  // rotate camera+target abou
   applyNav();
 }
 function pan(dx, dy) {  // dx, dy: how far the scene is dragged, in screen px
+  if (walking) return;
   const s = plan ? nav.planH / innerHeight : 2 * nav.off.length() * Math.tan(persp.fov * Math.PI / 360) / innerHeight;
   nav.target.addScaledVector(new THREE.Vector3(1, 0, 0).applyQuaternion(camera.quaternion), -dx * s)
     .addScaledVector(new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion), dy * s);
   applyNav();
 }
 function zoomAt(f, P) {  // dolly along the ray to P; never closer than 15 cm to it
-  if (!cloud) return;
+  if (!cloud || walking) return;
   if (plan) {  // orthographic: scale the view height, keeping P under the cursor
     const h = clamp(nav.planH * f, 0.5, nav.maxDist);
     f = h / nav.planH;
@@ -1296,6 +1330,7 @@ function clearMeasures() {  // always removes everything, whatever state the too
   if (cloud) { rebuild(); updateRubber(); }
 }
 function setMeasuring(on) {
+  if (on && walking) return toast("Leave Walk mode to measure");
   measuring = on;
   $("bMeasure").setAttribute("aria-pressed", on);
   $("mbar").hidden = !on;
@@ -1484,7 +1519,8 @@ function render() {
   $("scale").firstElementChild.style.width = `${nice / mpp}px`;
   if (text !== scaleText) $("scale").lastElementChild.textContent = scaleText = text;
 }
-renderer.setAnimationLoop(() => {
+renderer.setAnimationLoop((now) => {
+  if (walking) updateWalk(now);
   if (anim) stepAnim();
   if (dirty) { dirty = false; render(); }
 });
@@ -1505,7 +1541,7 @@ $("toggle").onclick = () => {
 if (matchMedia("(max-width: 600px)").matches) $("toggle").click();
 $("bTop").onclick = viewTop;
 $("bHome").onclick = viewHome;
-const viewPlan = () => { if (!plan) setPlan(true); else fitPlan(); };
+const viewPlan = () => { if (walking) leaveWalk(); if (!plan) setPlan(true); else fitPlan(); };
 $("bPlan").onclick = viewPlan;
 $("bFit").onclick = viewFit;
 $("bMeasure").onclick = () => setMeasuring(!measuring);
@@ -1542,6 +1578,7 @@ const pinchState = () => {
 };
 cv.addEventListener("contextmenu", (e) => e.preventDefault());
 cv.addEventListener("pointerdown", (e) => {
+  if (walking) return;
   try { cv.setPointerCapture(e.pointerId); } catch {}
   ptrs.set(e.pointerId, { x: e.clientX, y: e.clientY });
   anim = null;
@@ -1551,7 +1588,7 @@ cv.addEventListener("pointerdown", (e) => {
 });
 cv.addEventListener("pointermove", (e) => {
   const p = ptrs.get(e.pointerId);
-  if (!p || !cloud) return;
+  if (!p || !cloud || walking) return;
   const dx = e.clientX - p.x, dy = e.clientY - p.y;
   p.x = e.clientX; p.y = e.clientY;
   if (pinch && ptrs.size === 2) {
@@ -1575,7 +1612,7 @@ for (const t of ["pointerup", "pointercancel"]) cv.addEventListener(t, (e) => {
   if (!ptrs.size) drag = null;
 });
 cv.addEventListener("dblclick", (e) => {
-  const p = !measuring && cloud && pick(e.clientX, e.clientY, 10);
+  const p = !measuring && !walking && cloud && pick(e.clientX, e.clientY, 10);
   if (!p) return;
   const s = currentSpherical();
   flyTo(p, new THREE.Spherical(Math.max(s.radius, 0.5), s.phi, s.theta));
@@ -1586,6 +1623,7 @@ cv.addEventListener("wheel", (e) => {
   if (!cloud) return;
   anim = null;
   const k = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? 100 : 1, dx = e.deltaX * k, dy = e.deltaY * k;
+  if (walking) return e.ctrlKey ? undefined : walkLook(-dx * 0.004, -dy * 0.004);  // two-finger swipe looks around (swipe direction = look direction)
   if (e.ctrlKey) zoomAt(Math.exp(clamp(dy * 0.01, -0.4, 0.4)), anchor(e.clientX, e.clientY));  // trackpad pinch
   else if (!trackpad) zoomAt(Math.exp(clamp((dy || dx) * 0.002, -0.35, 0.35)), anchor(e.clientX, e.clientY));
   else if (e.shiftKey || plan) pan(-dx, -dy);  // in Plan, scrolling pans instead of orbiting
@@ -1595,7 +1633,7 @@ let gScale = 1;  // Safari reports trackpad pinch as gesture events
 for (const t of ["gesturestart", "gesturechange", "gestureend"]) document.addEventListener(t, (e) => {
   e.preventDefault();
   if (t === "gesturestart") gScale = 1;
-  else if (t === "gesturechange" && cloud) { zoomAt(gScale / e.scale, anchor(e.clientX, e.clientY)); gScale = e.scale; }
+  else if (t === "gesturechange" && cloud && !walking) { zoomAt(gScale / e.scale, anchor(e.clientX, e.clientY)); gScale = e.scale; }
 });
 
 // On-screen pad: press and hold to repeat. Directions mirror dragging the scene that way.
@@ -1625,6 +1663,8 @@ document.querySelectorAll("#pad [data-s]").forEach((b) => {
 addEventListener("keyup", (e) => { if (e.key === "Shift") { lockDir = null; if (measuring && hoverPos) updateHover(hoverPos.x, hoverPos.y, false); } });
 addEventListener("keydown", (e) => {
   if (/^(SELECT|TEXTAREA)$/.test(e.target.tagName) || (e.target.tagName === "INPUT" && !/^(range|checkbox)$/.test(e.target.type))) return;
+  if (walking) return walkKeyDown(e);
+  if (e.key.toLowerCase() === "g" && !e.ctrlKey && !e.metaKey && !e.altKey) return enterWalk();
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z" && chains.length) { e.preventDefault(); return undo(); }
   if ((e.key === "Delete" || e.key === "Backspace") && selected !== null && !vcb) { e.preventDefault(); return removeMeasurement(selected); }  // delete the selected measurement
   if (measuring && !e.ctrlKey && !e.metaKey) {  // SketchUp-style: Shift locks the direction, digits + Enter set the length
@@ -1663,6 +1703,237 @@ addEventListener("drop", (e) => {
   document.body.classList.remove("dragging");
   openFile(e.dataTransfer.files[0]);
 });
+
+// ---- Walk: first person at eye height. The ground and what is in the way come from the terrain grid built in the
+// worker (walkGrid): it keeps the eye 1.6 m above the ground (smoothed), steps up rises of up to 30 cm, stops at walls,
+// trunks and other obstacles taller than 50 cm, and at the edge of the scanned area. Fly ignores all of that.
+const EYE = 1.6, WALK_SPEED = 1.4, RUN_SPEED = 4, STEP_UP = 0.3, MAX_DROP = 0.8, BODY_R = 0.2;
+const walk = { yaw: 0, pitch: 0, pos: new THREE.Vector3(), flyOffset: 0, fly: false, run: false, joy: [0, 0], lastG: 0, looked: false, saved: null, last: 0, info: 0, lockEnd: 0 };
+const keys = new Set();
+let walkData = null, lookPtr = null, miniMap = null;
+const updateBodyClasses = () => { document.body.classList.toggle("touch", matchMedia("(pointer: coarse)").matches); document.body.classList.toggle("small", innerWidth <= 600); };
+updateBodyClasses();
+addEventListener("resize", updateBodyClasses);
+
+function walkCell(x, z) {  // grid index of the cell under world (x, z), or -1 outside the scanned area
+  const G = walkData.grid, c = Math.floor((x - G.west) / G.cell), r = Math.floor((G.north + z) / G.cell);
+  return r < 0 || c < 0 || r >= G.nr || c >= G.nc ? -1 : r * G.nc + c;
+}
+function groundHeight(x, z) { const k = walkCell(x, z); return k < 0 ? NaN : walkData.grid.a[k]; }
+function walkable(x, z, g0, r = BODY_R) {  // can the body (a small circle) stand at (x, z), given the ground height g0 it came from?
+  for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
+    const k = walkCell(x + dx, z + dz), h = k < 0 ? NaN : walkData.grid.a[k];
+    if (h !== h || walkData.blocked[k] || h - g0 > STEP_UP || g0 - h > MAX_DROP) return false;
+  }
+  return true;
+}
+function findSpawn(x0, z0) {  // the nearest free cell to a spot (all five body samples fine)
+  const G = walkData.grid;
+  let best = null, bd = Infinity;
+  for (let r = 0; r < G.nr; r++) for (let c = 0; c < G.nc; c++) {
+    const k = r * G.nc + c, h = G.a[k];
+    if (h !== h || walkData.blocked[k]) continue;
+    const x = G.west + (c + 0.5) * G.cell, z = -(G.north - (r + 0.5) * G.cell), d = (x - x0) ** 2 + (z - z0) ** 2;
+    if (d < bd && walkable(x, z, h)) { bd = d; best = { x, z, h }; }
+  }
+  return best;
+}
+async function loadWalkData() {
+  if (cloud.walkData) return cloud.walkData;
+  progress("Preparing walk mode: finding the ground…", 0.3);
+  const src = pointSource(false), bb = cloud.geom.boundingBox;
+  const r = await kernel("walk", { p: src.p, c: src.c, f: src.f, bounds: { minx: bb.min.x - 0.1, maxx: bb.max.x + 0.1, minz: bb.min.z - 0.1, maxz: bb.max.z + 0.1 } });
+  $("loader").hidden = true;
+  return (cloud.walkData = { grid: r.grid, blocked: r.blocked });
+}
+function buildMiniMap() {  // the scanned ground as a small image: grey = walkable, dark red = blocked
+  const G = walkData.grid, img = new ImageData(G.nc, G.nr), s = Math.min(160 / G.nc, 110 / G.nr);
+  for (let k = 0; k < G.a.length; k++) {
+    const h = G.a[k];
+    if (h !== h) continue;
+    const v = walkData.blocked[k] ? [150, 60, 60] : [170, 175, 170];
+    img.data.set([...v, 255], 4 * k);
+  }
+  const cvs = Object.assign(document.createElement("canvas"), { width: G.nc, height: G.nr });
+  cvs.getContext("2d").putImageData(img, 0, 0);
+  miniMap = { cvs, s };
+}
+function drawMiniMap() {
+  if (!miniMap || !walkData) return;
+  const G = walkData.grid, { cvs, s } = miniMap, m = $("minimap"), ctx = m.getContext("2d"), ox = (m.width - G.nc * s) / 2, oy = (m.height - G.nr * s) / 2;
+  ctx.clearRect(0, 0, m.width, m.height);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(cvs, ox, oy, G.nc * s, G.nr * s);
+  const px = ox + (walk.pos.x - G.west) / G.cell * s, py = oy + (G.north + walk.pos.z) / G.cell * s;
+  ctx.save();
+  ctx.translate(px, py);
+  ctx.rotate(-walk.yaw);  // heading, clockwise from north (up)
+  ctx.fillStyle = "#ffd23f";
+  ctx.strokeStyle = "#000";
+  ctx.beginPath();
+  ctx.moveTo(0, -8); ctx.lineTo(5, 5); ctx.lineTo(0, 2); ctx.lineTo(-5, 5); ctx.closePath();
+  ctx.fill(); ctx.stroke();
+  ctx.restore();
+}
+function walkLook(dx, dy) {  // like a mouse: right / down positive
+  walk.yaw -= dx;
+  walk.pitch = clamp(walk.pitch - dy, -1.45, 1.45);
+  walk.looked = true;
+  invalidate();
+}
+async function enterWalk(fromLink = false) {
+  if (walking || !cloud) return;
+  try { walkData = await loadWalkData(); } catch (err) { console.error(err); $("loader").hidden = true; return toast("Walk mode needs the ground: this model has none"); }
+  if (walking || !cloud) return;
+  if (measuring) setMeasuring(false);
+  if (selecting) setSelecting(false);
+  setPlan(false);
+  const saved = { target: nav.target.clone(), off: nav.off.clone(), fov: persp.fov, near: persp.near };
+  let x, z, h, yaw, pitch;
+  if (fromLink) {  // the shared camera is the eye
+    const d = nav.target.clone().sub(camera.position).normalize();
+    x = camera.position.x; z = camera.position.z; h = groundHeight(x, z); yaw = Math.atan2(-d.x, -d.z); pitch = Math.asin(d.y);
+    if (h !== h) h = camera.position.y - EYE;
+  } else {  // stand on the nearest scanned ground to where the view is centred, facing where it looks
+    const spot = findSpawn(nav.target.x, nav.target.z), f = nav.off.clone().negate().normalize();
+    if (!spot) return toast("No walkable ground was found in this model");
+    x = spot.x; z = spot.z; h = spot.h;
+    yaw = Math.hypot(f.x, f.z) > 0.05 ? Math.atan2(-f.x, -f.z) : 0;
+    pitch = clamp(Math.asin(f.y), -0.4, 0.4);
+  }
+  Object.assign(walk, { yaw, pitch, saved, fly: false, run: false, flyOffset: 0, joy: [0, 0], lastG: h, looked: true, last: 0 });
+  walk.pos.set(x, fromLink ? camera.position.y : h + EYE, z);
+  walking = true;
+  anim = null;
+  persp.fov = 70;
+  persp.near = 0.05;  // close objects must not vanish
+  persp.updateProjectionMatrix();
+  document.body.classList.add("walking");
+  $("walkhud").hidden = false;
+  $("bWalk").setAttribute("aria-pressed", true);
+  $("wFly").setAttribute("aria-pressed", false);
+  $("wRun").setAttribute("aria-pressed", false);
+  buildMiniMap();
+  showWalkHint();
+  invalidate();
+}
+function leaveWalk() {
+  if (!walking) return;
+  walking = false;
+  keys.clear();
+  walk.joy = [0, 0];
+  if (document.pointerLockElement) document.exitPointerLock();
+  persp.fov = walk.saved.fov;
+  persp.near = walk.saved.near;
+  persp.updateProjectionMatrix();
+  nav.target.copy(walk.saved.target);
+  nav.off.copy(walk.saved.off);
+  document.body.classList.remove("walking");
+  $("walkhud").hidden = true;
+  $("bWalk").setAttribute("aria-pressed", false);
+  applyNav();
+}
+function showWalkHint() {
+  const el = $("walkhint");
+  let seen = false;
+  try { seen = localStorage.getItem("walkHint") === "1"; localStorage.setItem("walkHint", "1"); } catch {}
+  el.hidden = seen;
+  el.innerHTML = "<b>Walk mode.</b> Click the view to capture the mouse and look around. <b>W A S D</b> or the arrows move, <b>Shift</b> runs, <b>V</b> flies (Space / C or Q / E go up and down). <b>Esc</b> lets the mouse go, <b>Esc</b> again leaves. Trackpad: swipe to look. Phone: the joystick moves you, drag anywhere else to look. <i>(click to dismiss)</i>";
+  clearTimeout(showWalkHint.t);
+  showWalkHint.t = setTimeout(() => { el.hidden = true; }, 12000);
+}
+$("walkhint").onclick = () => { $("walkhint").hidden = true; };
+function updateWalk(now) {  // every frame while walking
+  const dt = Math.min(0.05, walk.last ? (now - walk.last) / 1000 : 0);
+  walk.last = now;
+  const key = (...codes) => codes.some((c) => keys.has(c));
+  let fwd = (key("KeyW", "ArrowUp") ? 1 : 0) - (key("KeyS", "ArrowDown") ? 1 : 0) - walk.joy[1], str = (key("KeyD", "ArrowRight") ? 1 : 0) - (key("KeyA", "ArrowLeft") ? 1 : 0) + walk.joy[0];
+  const mag = Math.hypot(fwd, str);
+  if (mag > 1) { fwd /= mag; str /= mag; }
+  const run = walk.run || key("ShiftLeft", "ShiftRight") || Math.hypot(...walk.joy) > 0.9, p = walk.pos;
+  let changed = walk.looked;
+  walk.looked = false;
+  const g0 = groundHeight(p.x, p.z), here = g0 === g0 ? g0 : walk.lastG;
+  if (fwd || str) {
+    const sy = Math.sin(walk.yaw), cy = Math.cos(walk.yaw), step = (run ? RUN_SPEED : WALK_SPEED) * (walk.fly ? 1.5 : 1) * dt;
+    const dx = (-sy * fwd + cy * str) * step, dz = (-cy * fwd - sy * str) * step;
+    if (walk.fly) { p.x += dx; p.z += dz; changed = true; }
+    else {  // each axis on its own, so you slide along a wall instead of sticking to it
+      const r = walkable(p.x, p.z, here) ? BODY_R : 0;  // squeezed into a tight spot (e.g. after flying): test only the centre, so you can get out
+      if (dx && walkable(p.x + dx, p.z, here, r)) { p.x += dx; changed = true; }
+      if (dz && walkable(p.x, p.z + dz, here, r)) { p.z += dz; changed = true; }
+    }
+  }
+  if (walk.fly) walk.flyOffset = Math.max(-1.2, walk.flyOffset + ((key("Space", "KeyQ") ? 1 : 0) - (key("KeyC", "KeyE") ? 1 : 0)) * 2.5 * dt);
+  if (g0 === g0) walk.lastG = g0;
+  const target = walk.lastG + EYE + (walk.fly ? walk.flyOffset : 0), dy = (target - p.y) * (1 - Math.exp(-dt * 10));
+  if (Math.abs(target - p.y) > 1e-4) { p.y += dy; changed = true; }
+  if (changed) {
+    const cp = Math.cos(walk.pitch), f = new THREE.Vector3(-Math.sin(walk.yaw) * cp, Math.sin(walk.pitch), -Math.cos(walk.yaw) * cp);
+    nav.target.copy(p).addScaledVector(f, 3);
+    nav.off.copy(f).multiplyScalar(-3);
+    applyNav();
+  }
+  if (changed || now - walk.info > 250) {
+    walk.info = now;
+    $("walkinfo").textContent = `E ${p.x.toFixed(1)}  N ${(-p.z).toFixed(1)}  ground ${walk.lastG.toFixed(2)}  eye ${(p.y - walk.lastG).toFixed(2)} m  facing ${Math.round(((-walk.yaw * 180 / Math.PI) % 360 + 360) % 360)}°${document.pointerLockElement ? "  · mouse captured" : ""}`;
+    drawMiniMap();
+  }
+}
+// -- input
+function walkKeyDown(e) {
+  if (e.code === "Escape") {
+    if (document.pointerLockElement || performance.now() - walk.lockEnd < 400) return;  // that Esc only released the mouse
+    return leaveWalk();
+  }
+  if (e.ctrlKey || e.metaKey || e.altKey) return;
+  if (e.code === "KeyG") return leaveWalk();
+  if (e.code === "KeyV") { walk.fly = !walk.fly; walk.flyOffset = 0; $("wFly").setAttribute("aria-pressed", walk.fly); return; }
+  if (e.key === "?") return $("bHelp").onclick();
+  if (/^(Key[WASDQEC]|Arrow(Up|Down|Left|Right)|Shift(Left|Right)|Space)$/.test(e.code)) { keys.add(e.code); e.preventDefault(); }
+}
+addEventListener("keyup", (e) => keys.delete(e.code));
+addEventListener("blur", () => keys.clear());
+document.addEventListener("pointerlockchange", () => {
+  if (!document.pointerLockElement) { walk.lockEnd = performance.now(); if (walking) toast("Mouse released: click the view to capture it again, Esc to leave", 2500); }
+});
+cv.addEventListener("pointerdown", (e) => {  // drag to look (touch and mouse); a plain click captures the mouse
+  if (!walking || document.pointerLockElement) return;
+  lookPtr = { id: e.pointerId, x: e.clientX, y: e.clientY, sx: e.clientX, sy: e.clientY, touch: e.pointerType !== "mouse" };
+  try { cv.setPointerCapture(e.pointerId); } catch {}
+});
+cv.addEventListener("pointermove", (e) => {
+  if (!walking) return;
+  if (document.pointerLockElement === cv) return walkLook(e.movementX * 0.0022, e.movementY * 0.0022);
+  if (!lookPtr || e.pointerId !== lookPtr.id) return;
+  const k = lookPtr.touch ? 0.005 : 0.004;
+  walkLook((e.clientX - lookPtr.x) * k, (e.clientY - lookPtr.y) * k);
+  lookPtr.x = e.clientX; lookPtr.y = e.clientY;
+});
+for (const t of ["pointerup", "pointercancel"]) cv.addEventListener(t, (e) => {
+  if (!walking || !lookPtr || e.pointerId !== lookPtr.id) return;
+  const tap = t === "pointerup" && Math.hypot(e.clientX - lookPtr.sx, e.clientY - lookPtr.sy) < 5;
+  lookPtr = null;
+  if (tap && e.pointerType === "mouse") { try { cv.requestPointerLock?.()?.catch?.(() => {}); } catch {} }  // not every browser / context allows it: drag-look still works
+});
+const joy = $("joy"), knob = joy.firstElementChild;
+let joyId = null;
+function joyMove(e) {
+  const r = joy.getBoundingClientRect();
+  let dx = (e.clientX - r.left - r.width / 2) / (r.width / 2), dy = (e.clientY - r.top - r.height / 2) / (r.height / 2);
+  const m = Math.hypot(dx, dy);
+  if (m > 1) { dx /= m; dy /= m; }
+  walk.joy = [dx, dy];
+  knob.style.transform = `translate(${dx * 36}px, ${dy * 36}px)`;
+  invalidate();
+}
+joy.addEventListener("pointerdown", (e) => { joyId = e.pointerId; try { joy.setPointerCapture(e.pointerId); } catch {} joyMove(e); e.preventDefault(); });
+joy.addEventListener("pointermove", (e) => { if (e.pointerId === joyId) joyMove(e); });
+for (const t of ["pointerup", "pointercancel"]) joy.addEventListener(t, (e) => { if (e.pointerId === joyId) { joyId = null; walk.joy = [0, 0]; knob.style.transform = ""; } });
+$("bWalk").onclick = () => (walking ? leaveWalk() : enterWalk());
+$("wLeave").onclick = leaveWalk;
+$("wFly").onclick = () => { walk.fly = !walk.fly; walk.flyOffset = 0; $("wFly").setAttribute("aria-pressed", walk.fly); };
+$("wRun").onclick = () => { walk.run = !walk.run; $("wRun").setAttribute("aria-pressed", walk.run); };
 
 // ---- Export: files are built in the browser. SketchUp frame: x = east, y = north (= -Z), z = up (= Y), metres.
 // Mirrors pipeline/export_sketchup.py (terrain grid cleaning, orthophoto, COLLADA, KMZ), minus any georeferencing.
@@ -2195,6 +2466,18 @@ function classify(m) {
   return out;
 }
 
+// Walk mode: the cleaned ground grid (10 cm cells) plus a flag for every cell that has something at body height
+// (0.5-1.8 m above the ground: walls, trunks, furniture, dense plants), found by counting points there.
+function walkGrid({ p, c, f, bounds }) {
+  const g = buildTerrain({ p, c, f, bounds, region: null, cell: 0.1, auto: false, px: 0.03, photo: false }).grid, count = new Uint8Array(g.nr * g.nc);
+  for (let i = 0; i < p.length; i += 3) {
+    const col = Math.floor((p[i] - g.west) / g.cell), row = Math.floor((g.north + p[i + 2]) / g.cell);
+    if (row < 0 || col < 0 || row >= g.nr || col >= g.nc) continue;
+    const k = row * g.nc + col, dz = p[i + 1] - g.a[k];
+    if (dz > 0.5 && dz < 1.8 && count[k] < 255) count[k]++;
+  }
+  return { grid: g, blocked: Uint8Array.from(count, (n) => (n >= 3 ? 1 : 0)) };
+}
 function pointInPoly(x, z, poly) {  // even-odd rule, poly [[x, z], ...]
   let inside = false;
   for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -2220,7 +2503,7 @@ function surfaceInPolygon({ p, c, f, bounds, poly }) {
 }
 
 // -- Worker: the terrain kernel runs off the main thread so fine resolutions don't freeze the page
-const KERNEL = [nth, medianOf, lowestGrid, cleanGrid, cropGrid, maskRegion, upsampleGrid, triangulate, nearestSet, orthophoto, groundAt, countFaces, buildTerrain, classify, pointInPoly, surfaceInPolygon];
+const KERNEL = [nth, medianOf, lowestGrid, cleanGrid, cropGrid, maskRegion, upsampleGrid, triangulate, nearestSet, orthophoto, groundAt, countFaces, buildTerrain, classify, walkGrid, pointInPoly, surfaceInPolygon];
 function kernelSource() {
   const consts = { TERRAIN_MAX_FACES, OUTLIER, BUMP, BUMP_WINDOW, MAX_SLOPE, MAX_HOLE, GROUND_BAND, ORTHO_MAX, ORTHO_FILL, STRUCTURE_ABOVE, D8, D4 };
   return `const ${Object.entries(consts).map(([k, v]) => `${k} = ${JSON.stringify(v)}`).join(", ")};\n` +
@@ -2229,7 +2512,7 @@ const bufs = (o) => Object.values(o).flatMap((v) => ArrayBuffer.isView(v) ? [v.b
 onmessage = (e) => {
   const { id, op, ...m } = e.data;
   self.job = id;
-  try { const r = op === "terrain" ? buildTerrain(m) : op === "surface" ? surfaceInPolygon(m) : classify(m); postMessage({ id, result: r }, [...new Set(bufs(r))]); }
+  try { const r = op === "terrain" ? buildTerrain(m) : op === "surface" ? surfaceInPolygon(m) : op === "walk" ? walkGrid(m) : classify(m); postMessage({ id, result: r }, [...new Set(bufs(r))]); }
   catch (err) { postMessage({ id, error: err.message }); }
 };`;
 }
