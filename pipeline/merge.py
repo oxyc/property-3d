@@ -41,6 +41,8 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # python -I drops the script dir from sys.path
 
 import cache  # noqa: E402
+import drift  # noqa: E402
+import ground  # noqa: E402
 import cores  # noqa: E402
 
 if __name__ == "__main__":
@@ -59,6 +61,7 @@ STRUCT_MIN = 0.15  # vertical extent per cell that counts as ground relief, not 
 SEARCH = 25.0  # translation search radius around the GPS guess (m): GPS placements of two walks can be 15 m apart
 VISUAL_REGISTER_MIN = 3  # visual registration of a piece needs this many constraints that agree on one placement
 VISUAL_REGISTER_RADIUS, VISUAL_REGISTER_PAIRS = 18.0, 1500  # m, keyframe pairs: GPS can put a piece 15 m off, so look that far
+GROUND_TILT_SIGMA = 0.3  # degrees: pieces that see the same ground are not tilted against each other, to this
 RETRY_VISUAL_RADIUS = 8.0  # m: the search of a retried piece (second chance after the first pass) starts this close
 VISUAL_PAIR_RADIUS = 20.0  # m: pieces whose placed camera paths come closer than this get visual loops between them
 VISUAL_MAX_CORRECTION = 5.0  # m: a visual edge may not ask a fragment to move further than this from its placement
@@ -240,7 +243,7 @@ def unit_job(args):
     walk, out, frag_frames, ids, visual, jobs, cache_dir = args
     entry = None
     if cache_dir:
-        code = [optimize, fuse, fragment_data]
+        code = [optimize, drift, ground, fuse, fragment_data]
         if visual:
             import visual as vis
             cache.install(cache_dir)  # photo features and visual pair results are cached too (this runs in a worker process)
@@ -553,14 +556,16 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
     walked = [data[k]["walked"][f] for k, f in nodes]
 
     pg = reg.PoseGraph()
+    infos = {"odometry": [], "tracking_gap": [], "icp_loop_as_computed": [], "icp_loop": [], "visual_as_computed": [], "visual": [], "tie": []}
     for k, f in nodes:
         pg.nodes.append(reg.PoseGraphNode(G[k]))
     for k in registered:
         g = data[k]["groups"]
         for f in range(len(g) - 1):
             gap = g[f + 1][0] - g[f][-1] > 1  # tracking was lost in between
-            pg.edges.append(reg.PoseGraphEdge(node_of[(k, f)], node_of[(k, f + 1)], np.eye(4),
-                                              np.eye(6) * (optimize.GAP_INFO if gap else optimize.ODOM_INFO), uncertain=False))
+            info = np.eye(6) * optimize.GAP_INFO if gap else drift.odometry_info(data[k]["walked"][f + 1] - data[k]["walked"][f])
+            infos["tracking_gap" if gap else "odometry"].append(info)
+            pg.edges.append(reg.PoseGraphEdge(node_of[(k, f)], node_of[(k, f + 1)], np.eye(4), info, uncertain=False))
 
     candidates = []
     for ia, a in enumerate(registered):
@@ -602,6 +607,9 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
                              "why": "large correction, no agreeing loop nearby", "quality": q})
             continue
         info = reg.get_information_matrix_from_point_clouds(placed[i], placed[j], INLIER_DIST, R)
+        infos["icp_loop_as_computed"].append(info)
+        info, _ = drift.cap_loop_info(info)
+        infos["icp_loop"].append(info)
         edge = np.linalg.inv(G[wb]) @ R @ G[wa]  # fragment i's own frame -> fragment j's own frame
         pg.edges.append(reg.PoseGraphEdge(i, j, edge, info, uncertain=True))
         loops.append({"walks": [wa, wb], "fragments": [nodes[i][1], nodes[j][1]], **q})
@@ -626,11 +634,27 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
                     if moved > VISUAL_MAX_CORRECTION:
                         rejected.append({"walks": [a, b], "fragments": [fa, fb], "why": "visual: implausible correction", "moved_m": moved})
                         continue
+                    infos["visual_as_computed"].append(info)
+                    info = drift.cap_visual_info(info)
+                    infos["visual"].append(info)
                     pg.edges.append(reg.PoseGraphEdge(node_of[(a, fa)], node_of[(b, fb)], T, info, uncertain=True))
                     loops.append({"walks": [a, b], "fragments": [fa, fb], "kind": "visual", "constraints": n_ok, "of": n_all, "moved_m": moved})
                     added += 1
                 visual_graph[f"{a}-{b}"] = {"pairs": summ["pairs"], "constraints": len(cons), "edges_added": added}
                 log(f"visual: walks {a}-{b}: {len(cons)} constraints, {added} fragment-pair edges added ({time.time() - t0:.0f} s)")
+
+    # pieces that see the same ground must agree on its height (the walks' vertical drifts differ): constraints on height only
+    # (only between pieces registered on evidence: a piece sitting by continuity or GPS hangs by a thread, and a graph that tugs it
+    # vertically throws it metres sideways; it gets a height profile along the piece afterwards, below)
+    placed_on_evidence = lambda i: reports[nodes[i][0]]["method"] not in weak_methods  # noqa: E731
+    gedges = ground.edges([ground.cells(p) for p in pts], [p[:, [0, 2]].mean(0) for p in pts],
+                          lambda i, j: nodes[i][0] != nodes[j][0] and placed_on_evidence(i) and placed_on_evidence(j))
+    for e in gedges:
+        wa, wb = nodes[e["i"]][0], nodes[e["j"]][0]
+        info = ground.info(e["mad"])
+        info[0, 0] = info[2, 2] = 1 / np.radians(GROUND_TILT_SIGMA) ** 2  # gravity is accurate: the two see the same level, they are not tilted against each other
+        pg.edges.append(reg.PoseGraphEdge(e["i"], e["j"], np.linalg.inv(G[wb]) @ ground.translation(e["dz"]) @ G[wa], info, uncertain=True))
+    log(f"{len(gedges)} height constraints between pieces ({time.time() - t0:.0f} s)")
 
     # Open3D skips the whole optimisation ("graph is not connected", only visible at debug verbosity) when any piece has no
     # edge to the rest, e.g. a piece placed by continuity that no loop reaches. Tie each such group to node 0 with a nearly
@@ -648,13 +672,14 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
     tied = 0
     for i in range(len(nodes)):
         if find(i) != find(0):
+            infos["tie"].append(np.eye(6) * optimize.GAP_INFO)
             pg.edges.append(reg.PoseGraphEdge(0, i, np.linalg.inv(G[nodes[i][0]]) @ G[nodes[0][0]], np.eye(6) * optimize.GAP_INFO, uncertain=False))
             parent[find(i)] = find(0)
             tied += 1
     if tied:
         log(f"{tied} piece(s) without any edge to the rest were tied to the reference weakly (at their placement)")
 
-    if loops:
+    if loops or gedges:
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
         reg.global_optimization(pg, reg.GlobalOptimizationLevenbergMarquardt(), reg.GlobalOptimizationConvergenceCriteria(),
                                 reg.GlobalOptimizationOption(max_correspondence_distance=INLIER_DIST, edge_prune_threshold=0.25,
@@ -666,6 +691,52 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
     C = {k: [G[k]] * len(data[k]["clouds"]) for k in range(n)}  # fallback walks stay at their GPS placement
     for i, (k, f) in enumerate(nodes):
         C[k][f] = yaw_only(np.array(pg.nodes[i].pose), data[k]["cen"][f])
+    lift = lambda i: C[nodes[i][0]][nodes[i][1]][1, 3] - G[nodes[i][0]][1, 3]  # noqa: E731  how far the graph raised fragment i
+    # a piece placed by continuity / GPS: its height against the pieces placed on evidence, from the ground both see
+    weak_height = {}
+    weak_nodes = [i for i in range(len(nodes)) if not placed_on_evidence(i)]
+    if weak_nodes and len(weak_nodes) < len(nodes):
+        final = [ground.cells(np.asarray(place(data[k]["clouds"][f], C[k][f]).points)) for k, f in nodes]
+        cen_xz = [(C[k][f][:3, :3] @ data[k]["cen"][f] + C[k][f][:3, 3])[[0, 2]] for k, f in nodes]  # where each fragment ended up
+        for k in sorted({nodes[i][0] for i in weak_nodes}):
+            es = ground.edges(final, cen_xz, lambda i, j, k=k: (nodes[i][0] == k) != (nodes[j][0] == k) and placed_on_evidence(i if nodes[j][0] == k else j))
+            raises = [e["dz"] if nodes[e["i"]][0] == k else -e["dz"] for e in es]  # how far the piece must rise to meet the other one's ground
+            if len(raises) >= 3 and sum(e["n"] for e in es) >= 1000:
+                # one height per fragment where it has enough ground in common with the evidence pieces, interpolated along the piece between
+                # them (vertical drift grows along a walk); a single shift if too few fragments have any
+                per_frag = {}
+                for e, r in zip(es, raises):
+                    f = nodes[e["i"] if nodes[e["i"]][0] == k else e["j"]][1]
+                    per_frag.setdefault(f, []).append((r, e["n"]))
+                meas = {f: float(np.median([r for r, _ in v])) for f, v in per_frag.items() if sum(n for _, n in v) >= 300}
+                nf = len(data[k]["clouds"])
+                if len(meas) >= 4:
+                    fs = sorted(meas)
+                    profile = np.interp(np.arange(nf), fs, [meas[f] for f in fs])
+                else:
+                    profile = np.full(nf, float(np.median(raises)))
+                for f in range(nf):
+                    C[k][f] = C[k][f].copy()
+                    C[k][f][1, 3] += profile[f]
+                resid = [r - profile[nodes[e["i"] if nodes[e["i"]][0] == k else e["j"]][1]] for e, r in zip(es, raises)]
+                weak_height[k] = {"pairs": len(es), "shared_cells": int(sum(e["n"] for e in es)), "fragments_measured": len(meas), "of": nf,
+                                  "raised_m": {"min": float(profile.min()), "median": float(np.median(profile)), "max": float(profile.max())},
+                                  "median_abs_residual_m": float(np.median(np.abs(resid)))}
+                log(f"{units[k]['label']} (placed by {reports[k]['method']}): raised by {profile.min() * 100:+.0f} .. {profile.max() * 100:+.0f} cm (median {np.median(profile) * 100:+.0f}) to meet the "
+                    f"ground of the pieces placed on evidence ({len(es)} pairs, {weak_height[k]['shared_cells']} shared cells, {len(meas)} of {nf} fragments measured, "
+                    f"residual {weak_height[k]['median_abs_residual_m'] * 100:.0f} cm)")
+    by_pair = {}
+    for e in gedges:
+        by_pair.setdefault(f"{nodes[e['i']][0]}-{nodes[e['j']][0]}", []).append(e)
+    ground_stats = {}
+    for key, es in by_pair.items():
+        before = np.array([e["dz"] for e in es])
+        after = before + np.array([lift(e["j"]) - lift(e["i"]) for e in es])
+        ground_stats[key] = {"pairs": len(es), "shared_cells": int(sum(e["n"] for e in es)), "median_mad_m": float(np.median([e["mad"] for e in es])),
+                             "median_dz_m": {"before": float(np.median(before)), "after": float(np.median(after))},
+                             "median_abs_dz_m": {"before": float(np.median(np.abs(before))), "after": float(np.median(np.abs(after)))}}
+        log(f"height offset between pieces {key}: {len(es)} pairs, {ground_stats[key]['shared_cells']} shared cells, median {np.median(before) * 100:+.0f} -> "
+            f"{np.median(after) * 100:+.0f} cm, median |dz| {np.median(np.abs(before)) * 100:.0f} -> {np.median(np.abs(after)) * 100:.0f} cm")
     merged = []
     for k, w in enumerate(walks):
         d = data[k]
@@ -704,7 +775,7 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
 
     stats = {"frame": "walk 0's ARKit frame; transforms map each walk's own frame into it (yaw about +Y, then translation)",
              "cache": {"dir": str(cache_dir) if cache_dir else None, "units_from_cache": from_cache},
-             "fuse_stride": stride, "visual": visual, "visual_graph": visual_graph, "pieces_tied_weakly_to_the_reference": tied, "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
+             "fuse_stride": stride, "graph_information": {kind: drift.summary(v) for kind, v in infos.items()}, "ground_height_constraints": ground_stats, "weak_pieces_raised_to_the_ground": weak_height, "visual": visual, "visual_graph": visual_graph, "pieces_tied_weakly_to_the_reference": tied, "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
              "inter_walk_loops": loops, "rejected_loops": rejected, "candidates": len(candidates),
              "kept_loops": sum(lp["kept"] for lp in loops), "pruned_loops": sum(not lp["kept"] for lp in loops),
              "warnings": warnings}

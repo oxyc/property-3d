@@ -36,7 +36,9 @@ if __name__ == "__main__":
 import numpy as np  # noqa: E402
 import open3d as o3d  # noqa: E402
 
+import drift  # noqa: E402
 import fuse  # noqa: E402
+import ground  # noqa: E402
 
 reg = o3d.pipelines.registration
 
@@ -52,8 +54,7 @@ MIN_INLIERS = 2000
 MIN_INLIER_RATIO = 0.5  # aligned / overlapping points, after the yaw-only projection
 MAX_RMSE = 0.05
 MAX_SHIFT, MAX_YAW, MAX_TILT = 3.0, 15.0, 3.0  # plausible correction: m, degrees, degrees (ICP tilt before projection)
-ODOM_INFO = 1e4  # per-axis information of consecutive-fragment edges
-GAP_INFO = 1.0  # same, across a tracking gap
+GAP_INFO = 1.0  # per-axis information of a consecutive-fragment edge across a tracking gap (drift.py: the ones without)
 ANCHOR_INFO = 1e5  # ties a fragment that starts at a snap to the start: no correction beyond stage 1
 SNAP_SPEED = 3.0  # m/s between consecutive frames; walking is ~1 m/s, relocalisation snaps are 4-10 m/s
 GUARD_SHIFT, GUARD_YAW = 0.5, 3.0  # a loop correcting more than this needs another loop to agree with it
@@ -472,7 +473,8 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visu
         pg.nodes.append(reg.PoseGraphNode(np.eye(4)))
     for k in range(len(groups) - 1):
         gap = groups[k + 1][0] - groups[k][-1] > 1  # tracking was lost in between
-        pg.edges.append(reg.PoseGraphEdge(k, k + 1, np.eye(4), np.eye(6) * (GAP_INFO if gap else ODOM_INFO), uncertain=False))
+        info = np.eye(6) * GAP_INFO if gap else drift.odometry_info(walked[k + 1] - walked[k])
+        pg.edges.append(reg.PoseGraphEdge(k, k + 1, np.eye(4), info, uncertain=False))
     for k, g in enumerate(groups):
         if k > 0 and any(s["n"] == g[0] for s in snaps):  # stage 1 left the poses after a snap alone: keep them so
             pg.edges.append(reg.PoseGraphEdge(0, k, np.eye(4), np.eye(6) * ANCHOR_INFO, uncertain=False))
@@ -511,7 +513,7 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visu
         if (q["shift"] > GUARD_SHIFT or abs(q["yaw"]) > GUARD_YAW) and not corroborated(i, j, Tp, q, c):
             rejected.append({"pair": [i, j], "why": "large correction, no agreeing loop nearby", "quality": q})
             continue
-        info = reg.get_information_matrix_from_point_clouds(clouds[i], clouds[j], INLIER_DIST, Tp)
+        info, _ = drift.cap_loop_info(reg.get_information_matrix_from_point_clouds(clouds[i], clouds[j], INLIER_DIST, Tp))
         pg.edges.append(reg.PoseGraphEdge(i, j, Tp, info, uncertain=True))
         loops.append({"pair": [i, j], **q})
     log(f"{len(loops)} loops accepted, {len(found) - len(loops)} dropped by the corroboration guard ({time.time() - t0:.0f} s)")
@@ -531,14 +533,23 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visu
             if shift > MAX_SHIFT or abs(yaw_deg) > MAX_YAW:  # the same plausibility bound as an ICP loop
                 rejected.append({"pair": [fa, fb], "why": "visual: implausible correction", "shift": shift, "yaw": yaw_deg})
                 continue
-            pg.edges.append(reg.PoseGraphEdge(fa, fb, T, info, uncertain=True))
+            pg.edges.append(reg.PoseGraphEdge(fa, fb, T, drift.cap_visual_info(info), uncertain=True))
             loops.append({"pair": [fa, fb], "kind": "visual", "constraints": n_ok, "of": n_all, "shift": shift, "yaw": yaw_deg})
             added += 1
         vstats = {k: v for k, v in vsum.items() if k != "alignment"}
         vstats.update(constraints=len(cons), edges=len(edges), edges_added=added)
         log(f"visual: {len(cons)} constraints -> {len(edges)} fragment-pair edges, {added} added to the graph ({time.time() - t0:.0f} s)")
 
-    if loops:
+    # where the walk revisits ground, the two visits must agree on its height: vertical drift accumulates along the walk, and
+    # these constraints bend the chain between the visits (ARKit's gravity is accurate, so they say nothing about tilt)
+    gedges = ground.edges([ground.cells(p) for p in pts], [c[[0, 2]] for c in cen], lambda i, j: walked[j] - walked[i] >= MIN_LOOP_PATH)
+    for e in gedges:
+        pg.edges.append(reg.PoseGraphEdge(e["i"], e["j"], ground.translation(e["dz"]), ground.info(e["mad"]), uncertain=True))
+    if gedges:
+        log(f"{len(gedges)} height constraints from revisited ground, median |offset| {np.median(np.abs([e['dz'] for e in gedges])) * 100:.0f} cm "
+            f"({time.time() - t0:.0f} s)")
+
+    if loops or gedges:
         o3d.utility.set_verbosity_level(o3d.utility.VerbosityLevel.Error)
         reg.global_optimization(pg, reg.GlobalOptimizationLevenbergMarquardt(), reg.GlobalOptimizationConvergenceCriteria(),
                                 reg.GlobalOptimizationOption(max_correspondence_distance=INLIER_DIST, edge_prune_threshold=0.25,
@@ -549,6 +560,15 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visu
     C = [yaw_only(np.array(nd.pose), cen[k]) for k, nd in enumerate(pg.nodes)]
     theta = np.array([yaw_of(c[:3, :3]) for c in C])
     trans = np.array([c[:3, 3] for c in C])
+    gstats = {}
+    if gedges:  # the height difference of each pair before, and after the graph moved its fragments
+        dz0 = np.array([e["dz"] for e in gedges])
+        dz1 = dz0 + trans[[e["j"] for e in gedges], 1] - trans[[e["i"] for e in gedges], 1]
+        gstats = {"pairs": len(gedges), "shared_cells": int(sum(e["n"] for e in gedges)), "median_mad_m": float(np.median([e["mad"] for e in gedges])),
+                  "median_abs_offset_m": {"before": float(np.median(np.abs(dz0))), "after": float(np.median(np.abs(dz1)))},
+                  "max_abs_offset_m": {"before": float(np.abs(dz0).max()), "after": float(np.abs(dz1).max())}}
+        log(f"height offsets of revisited ground: median |dz| {gstats['median_abs_offset_m']['before'] * 100:.1f} -> {gstats['median_abs_offset_m']['after'] * 100:.1f} cm, "
+            f"max {gstats['max_abs_offset_m']['before'] * 100:.0f} -> {gstats['max_abs_offset_m']['after'] * 100:.0f} cm")
     centres = [np.mean(g) for g in groups]
     poses = frame_poses(frames, centres, theta, trans)
     np.savez(out / "poses.npz", i=np.array([f["i"] for f in frames]), T=poses)
@@ -579,7 +599,7 @@ def optimize(walk, out, frag_frames=FRAG_FRAMES, log=print, frame_ids=None, visu
         "accepted_loops": len(loops), "pruned_loops": len(loops) - n_kept, "kept_loops": n_kept,
         "graph_correction_translation_m": {"max": float(move.max()), "median": float(np.median(move))},
         "graph_correction_yaw_deg": {"max": float(yaw.max()), "median": float(np.median(yaw))},
-        "visual": vstats, "loops": loops, "rejected": rejected, "seconds": round(time.time() - t0, 1),
+        "ground": gstats, "visual": vstats, "loops": loops, "rejected": rejected, "seconds": round(time.time() - t0, 1),
     }
     (out / "optimize.json").write_text(json.dumps(stats, indent=1))
     log(f"pose graph correction translation max {move.max():.2f} m, median {np.median(move):.2f} m; yaw max {yaw.max():.2f} deg; "

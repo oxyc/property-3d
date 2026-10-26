@@ -148,6 +148,31 @@ def test_drift():
         assert c_opt[0] < c_raw[0] + 0.003 and c_opt[1] < c_raw[1] + 0.005 and pe[1] < 0.05
 
 
+def test_ground():
+    """Two passes over the same ground with 0.5 m of vertical drift on the recorded poses (and none of the other kinds): where the
+    walk revisits ground, the height constraints must bring the two visits to the same height, and the poses back to the truth."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        walk = tmp / "drift"
+        synth.generate(walk, 440, drift=True)  # for its true transforms
+        v = true_pose_walk(walk, tmp / "vdrift")
+        frames = [json.loads(l) for l in (v / "frames.jsonl").read_text().splitlines()]
+        for n, f in enumerate(frames):
+            f["transform"][13] += 0.5 * n / (len(frames) - 1)  # column-major: [12:15] is the translation, 13 its height
+        (v / "frames.jsonl").write_text("".join(json.dumps(f) + "\n" for f in frames))
+        raw = pose_error(None, walk, recorded=v)
+
+        stats = optimize.optimize(v, tmp / "opt", 40, log=lambda *_: None)
+        pe = pose_error(tmp / "opt" / "poses.npz", walk)
+        g = stats["ground"]
+        print(f"ground: camera position error mean/max raw {raw[0]:.2f}/{raw[1]:.2f} m -> optimised {pe[0]:.3f}/{pe[1]:.3f} m; "
+              f"{g['pairs']} height constraints on {g['shared_cells']} shared cells, median |offset| between the visits "
+              f"{g['median_abs_offset_m']['before'] * 100:.1f} -> {g['median_abs_offset_m']['after'] * 100:.1f} cm, max {g['max_abs_offset_m']['before'] * 100:.0f} -> {g['max_abs_offset_m']['after'] * 100:.0f} cm")
+        assert g["pairs"] >= 5 and g["median_abs_offset_m"]["before"] > 0.15
+        assert g["median_abs_offset_m"]["after"] < 0.03 and g["max_abs_offset_m"]["after"] < 0.08
+        assert pe[0] < 0.05 and pe[1] < 0.1
+
+
 def max_step(poses):
     return float(np.linalg.norm(np.diff(np.load(poses)["T"][:, :3, 3], axis=0), axis=1).max())
 
@@ -487,6 +512,6 @@ def test_consensus():
 
 
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_visual_registration", "test_cache", "test_jobs", "test_consensus"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_ground", "test_snap", "test_merge", "test_slide", "test_visual_registration", "test_cache", "test_jobs", "test_consensus"]:  # optionally just some of them
         globals()[test]()
     print("OK")
