@@ -1,5 +1,12 @@
 import Foundation
 
+enum WalkClock {
+    /// Walk-relative seconds, the `t` of frames.jsonl and baro.jsonl. ARFrame.timestamp and CMLogItem.timestamp
+    /// (CoreMotion, including CMAltimeter) are both seconds since boot, the same base as `ProcessInfo.systemUptime`,
+    /// which is what `startUptime` is captured from.
+    static func t(_ timestamp: TimeInterval, startUptime: TimeInterval) -> Double { timestamp - startUptime }
+}
+
 /// A stretch of the walk where ARKit tracking was clearly wrong. Times are seconds since walk start
 /// (same clock as frames.jsonl). `tStart` includes a margin before detection because the pose slides
 /// for a while before it is detectable; the pipeline should drop frames inside [tStart, tEnd].

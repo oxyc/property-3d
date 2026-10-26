@@ -6,6 +6,8 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>WalkScan sends a recorded walk to your Mac over your local Wi-Fi network.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>WalkScan uses the motion sensors and barometer to detect tracking failures and to record height changes along the walk.</string>
 	<key>NSBonjourServices</key>
 	<array>
 		<string>_walkscan._tcp</string>

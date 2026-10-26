@@ -12,6 +12,7 @@ walk_YYYYMMDD_HHMMSS/
   frames.jsonl
   gps.jsonl
   events.jsonl       optional: intervals where tracking was wrong (absent in older walks = none recorded)
+  baro.jsonl         optional: barometer samples, an independent vertical reference (absent in older walks)
   depth/000000.bin   Float16 little-endian (v1: Float32), metres, row-major, depth_w × depth_h
   conf/000000.bin    UInt8 ARConfidenceLevel (0 low, 1 medium, 2 high), same layout
   rgb/000000.jpg     only on some frames (~2 Hz), JPEG quality 0.8, full camera res
@@ -37,7 +38,7 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 ```json
 {
   "format_version": 2,
-  "app_version": "0.3",
+  "app_version": "0.4",
   "depth_dtype": "f16",
   "device": "iPhone16,1",
   "started_at": "2026-10-19T15:00:00Z",   // ISO 8601 UTC
@@ -127,6 +128,25 @@ is detectable; on the recorded failures it lands about at the real onset) and th
 degraded for the last two. `t_end` is 1 s after the last anomaly, and the interval stays open until
 3 s of clean frames. The app also keeps these frames out of its live coverage map. An interval still
 open when the app dies is not written.
+
+## baro.jsonl (optional)
+
+Barometer samples from `CMAltimeter`, for checking vertical drift of the ARKit poses against something
+independent. `t` is on the same clock as `frames.jsonl` (seconds since walk start: CoreMotion's
+`timestamp` and `ARFrame.timestamp` are both seconds since boot, minus the walk's `startUptime`).
+Two line types, told apart by `type`; either may be missing on a device without the sensor:
+
+```json
+{"type": "relative", "t": 12.4, "relative_altitude_m": 0.31, "pressure_kpa": 100.912}
+{"type": "absolute", "t": 12.9, "altitude_m": 41.2, "accuracy_m": 8.0, "precision_m": 0.6}
+```
+
+- `relative`: altitude change since the first barometer sample of the walk (that sample is ~0, not exactly
+  at `t = 0`), about 1 Hz, resolution a few cm, short-term very good. Weather moves the pressure, so over
+  tens of minutes it can wander by decimetres: use it for differences between nearby times or places, and
+  fit a slow drift out. Walking up a staircase or stopping at a taped mark gives the cleanest checks.
+- `absolute`: GPS-assisted altitude above sea level with its `accuracy_m` (metres, 68%) and
+  `precision_m` (the barometric part); irregular, only when the system has an estimate.
 
 ## coverage.json (Mac → phone, "continue a site")
 

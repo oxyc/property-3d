@@ -329,6 +329,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
     private let holeQueue = DispatchQueue(label: "walkscan.holes", qos: .utility)
     private let motionManager = CMMotionManager()
     private let motionQueue = OperationQueue()
+    private let altimeter = CMAltimeter()
+    private let altimeterQueue = OperationQueue()
 
     private static let iso: ISO8601DateFormatter = ISO8601DateFormatter()
 
@@ -339,6 +341,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         let framesFile: FileHandle
         let gpsFile: FileHandle
         let eventsFile: FileHandle
+        let baroFile: FileHandle
         let encoder = JSONEncoder()
         var meta: [String: Any]
 
@@ -399,7 +402,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             for sub in ["depth", "conf", "rgb"] {
                 try fm.createDirectory(at: dir.appendingPathComponent(sub), withIntermediateDirectories: true)
             }
-            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl"] {
+            for name in ["frames.jsonl", "gps.jsonl", "events.jsonl", "baro.jsonl"] {
                 guard fm.createFile(atPath: dir.appendingPathComponent(name).path, contents: nil) else {
                     throw CocoaError(.fileWriteUnknown)
                 }
@@ -407,9 +410,10 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             framesFile = try FileHandle(forWritingTo: dir.appendingPathComponent("frames.jsonl"))
             gpsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("gps.jsonl"))
             eventsFile = try FileHandle(forWritingTo: dir.appendingPathComponent("events.jsonl"))
+            baroFile = try FileHandle(forWritingTo: dir.appendingPathComponent("baro.jsonl"))
             meta = [
                 "format_version": 2,
-                "app_version": "0.3",
+                "app_version": "0.4",
                 "depth_dtype": "f16",
                 "device": Engine.deviceModel,
                 "started_at": Engine.iso.string(from: startDate),
@@ -458,6 +462,12 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
             }
         }
 
+        func logBaro(_ entry: [String: Any]) {
+            guard var line = try? JSONSerialization.data(withJSONObject: entry, options: [.sortedKeys]) else { return }
+            line.append(10)
+            write(line, to: baroFile)
+        }
+
         func log(_ event: TrackingEvent) {
             let entry: [String: Any] = ["t_start": (event.tStart * 1000).rounded() / 1000,
                                         "t_end": (event.tEnd * 1000).rounded() / 1000, "reason": event.reason]
@@ -490,6 +500,37 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
                 self.q.async { self.walk?.motion.add(t: motion.timestamp, magnitudeG: magnitude) }
             }
         }
+        startBarometer(startUptime: startUptime)
+    }
+
+    /// Barometer as an independent vertical reference, logged to baro.jsonl on the frame clock.
+    /// Relative altitude is measured from the first sample after start; absolute altitude (GPS + pressure) is optional.
+    private func startBarometer(startUptime: TimeInterval) {
+        if CMAltimeter.isRelativeAltitudeAvailable() {
+            altimeter.startRelativeAltitudeUpdates(to: altimeterQueue) { [weak self] data, _ in
+                guard let self, let data else { return }
+                let entry: [String: Any] = [
+                    "type": "relative",
+                    "t": WalkClock.t(data.timestamp, startUptime: startUptime),
+                    "relative_altitude_m": data.relativeAltitude.doubleValue,
+                    "pressure_kpa": data.pressure.doubleValue,
+                ]
+                self.q.async { self.walk?.logBaro(entry) }
+            }
+        }
+        if CMAltimeter.isAbsoluteAltitudeAvailable() {
+            altimeter.startAbsoluteAltitudeUpdates(to: altimeterQueue) { [weak self] data, _ in
+                guard let self, let data else { return }
+                let entry: [String: Any] = [
+                    "type": "absolute",
+                    "t": WalkClock.t(data.timestamp, startUptime: startUptime),
+                    "altitude_m": data.altitude,
+                    "accuracy_m": data.accuracy,
+                    "precision_m": data.precision,
+                ]
+                self.q.async { self.walk?.logBaro(entry) }
+            }
+        }
     }
 
     func end() {
@@ -503,6 +544,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         guard walk === w else { return }
         walk = nil
         motionManager.stopDeviceMotionUpdates()
+        altimeter.stopRelativeAltitudeUpdates()
+        altimeter.stopAbsoluteAltitudeUpdates()
         let duration = ProcessInfo.processInfo.systemUptime - w.startUptime
         if let event = w.monitor.finish(t: duration) { w.log(event) }
         w.meta["ended_at"] = Self.iso.string(from: Date())
@@ -512,6 +555,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         try? w.framesFile.close()
         try? w.gpsFile.close()
         try? w.eventsFile.close()
+        try? w.baroFile.close()
         if duration > 30 { Storage.saveRate(Double(w.bytesWritten) / duration) }
         if reason != "user" { onStopped?(reason) }
     }
@@ -615,7 +659,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         let record = FrameRecord(
             i: w.count,
-            t: now - w.startUptime,
+            t: WalkClock.t(now, startUptime: w.startUptime),
             transform: (0..<4).flatMap { c in (0..<4).map { r in tr[c][r] } },
             intrinsics: [cam.intrinsics[0][0], cam.intrinsics[1][1], cam.intrinsics[2][0], cam.intrinsics[2][1]],
             tracking: trackingName,
