@@ -123,12 +123,20 @@ def grid_index(pts):
     return order, key[order]
 
 
-def points_near(index, pts, centre, radius):
-    """Indices of the points within radius of centre (what a KD-tree radius search returns, without building a tree)."""
+def points_near(index, pts, centre, radius, forward=None, half_angle=None):
+    """Indices of the points within radius of centre (what a KD-tree radius search returns, without building a tree).
+    With forward (unit vector) and half_angle (radians): only from the cells that reach into that cone, e.g. a camera's view."""
     order, skeys = index
     lo, hi = np.floor((centre - radius) / CELL).astype(int), np.floor((centre + radius) / CELL).astype(int)
     axes = np.meshgrid(*[np.arange(lo[d], hi[d] + 1) for d in range(3)], indexing="ij")
-    keys = cell_keys(np.stack(axes, -1).reshape(-1, 3))
+    cells = np.stack(axes, -1).reshape(-1, 3)
+    if forward is not None:
+        d = (cells + 0.5) * CELL - centre
+        dist = np.linalg.norm(d, axis=1)
+        r = CELL * np.sqrt(3) / 2  # a cell's bounding sphere
+        ang = np.arccos(np.clip(d @ forward / np.maximum(dist, 1e-9), -1, 1))
+        cells = cells[(dist <= r) | (ang <= half_angle + np.arcsin(np.minimum(1, r / np.maximum(dist, 1e-9))))]
+    keys = cell_keys(cells)
     first, last = np.searchsorted(skeys, keys, "left"), np.searchsorted(skeys, keys, "right")
     idx = np.concatenate([order[a:b] for a, b in zip(first, last) if b > a] or [np.empty(0, np.int64)])
     return idx[((pts[idx] - centre) ** 2).sum(1) <= radius * radius]
@@ -147,7 +155,9 @@ def colour_points(pcd, sources, jobs=1):
 
     def project(job):
         walk, meta, kf = job
-        idx = points_near(index, pts, kf["T"][:3, 3], MAX_DEPTH)
+        fx, fy, cx, cy = kf["intrinsics"]
+        half = np.arctan(np.hypot(max(cx, meta["rgb_w"] - cx) / fx, max(cy, meta["rgb_h"] - cy) / fy))  # to the farthest image corner
+        idx = points_near(index, pts, kf["T"][:3, 3], MAX_DEPTH, -kf["T"][:3, 2], half)  # the camera looks along its -z
         if len(idx) == 0:
             return None
         kd, kc = read_depth(walk, meta, kf["i"])
