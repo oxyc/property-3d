@@ -79,7 +79,8 @@
   body.touch #joy, body.small #joy { display: block; }
   body.walking #scale, body.walking #pad { display: none; }
   body.walking #toast { bottom: 200px; }
-  @media (max-width: 600px) { #minimap, #walkinfo { display: none; } #walkbar { right: 8px; bottom: 8px; } #walkhint { top: 60px; } }
+  @media (max-width: 600px) { #minimap, #walkinfo { display: none; } #walkbar { right: 8px; bottom: 8px; flex-wrap: wrap; justify-content: flex-end; max-width: 214px; } #walkhint { top: 60px; } }
+  #walkbar button { touch-action: none; user-select: none; -webkit-user-select: none; }
   .lbl.pt { font-size: 11px; margin-top: -18px; padding: 1px 5px; }
   .lbl.tip { margin-top: 20px; font-size: 11px; padding: 1px 5px; background: rgba(20,22,26,.9); }
   .lbl.sum { margin-top: 18px; background: #5a4a00; }
@@ -239,8 +240,11 @@
   <canvas id="minimap" width="160" height="110" aria-label="Map: you are here"></canvas>
   <div id="walkinfo"></div>
   <div id="walkbar" class="card">
+    <button id="wClimb" type="button" title="Hold to rise over things, let go to land on the highest surface under you (Space)">Climb</button>
     <button id="wFly" type="button" aria-pressed="false" title="Fly: ignore the ground (V). Space / C or Q / E go up and down">Fly</button>
     <button id="wRun" type="button" aria-pressed="false" title="Run (hold Shift)">Run</button>
+    <button id="wStart" type="button" hidden title="Back to this model's starting spot">Start</button>
+    <button id="wCopy" type="button" title="Copy this spot as E,N,heading">Spot</button>
     <button id="wLeave" type="button" title="Back to the orbit view (Esc, then Esc again)">Leave</button>
   </div>
   <div id="joy" aria-label="Move: virtual joystick"><i></i></div>
@@ -441,7 +445,7 @@ async function open(label, getBuffer, opts = {}) {
 function percentile(sorted, p) { return sorted[Math.floor(p * (sorted.length - 1))]; }
 
 // A PLY with faces (a dropped mesh) gives a surface, and its vertices serve as the points.
-function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes }) {
+function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes, walkStart }) {
   let geom = parsed, meshGeom = null;
   if (parsed.index) {
     meshGeom = parsed;
@@ -474,7 +478,7 @@ function show(parsed, label, { local, meshUrl, meshBytes, sunLoc, fullPointsUrl,
   for (let i = 0; i < m; i++) { const j = 3 * Math.floor(i * n / m); sample.set(a.subarray(j, j + 3), 3 * i); }
   cloud = { geom, obj: new THREE.Points(geom, solid), size, center, local, attrs: { rgb: geom.attributes.color },
     ground: percentile(ys, 0.01), top: percentile(ys, 0.995), spacing, meshUrl, meshBytes, sample, label,
-    fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes };
+    fullPointsUrl, fullPointsBytes, fullPointsCount, fullMeshUrl, fullMeshBytes, photoUrl, photoBytes, photoMobileUrl, photoMobileBytes, walkStart };
   region = null;
   analysis = null;
   selecting = false;
@@ -1705,10 +1709,12 @@ addEventListener("drop", (e) => {
 });
 
 // ---- Walk: first person at eye height. The ground and what is in the way come from the terrain grid built in the
-// worker (walkGrid): it keeps the eye 1.6 m above the ground (smoothed), steps up rises of up to 30 cm, stops at walls,
-// trunks and other obstacles taller than 50 cm, and at the edge of the scanned area. Fly ignores all of that.
-const EYE = 1.6, WALK_SPEED = 1.4, RUN_SPEED = 4, STEP_UP = 0.3, MAX_DROP = 0.8, BODY_R = 0.2;
-const walk = { yaw: 0, pitch: 0, pos: new THREE.Vector3(), flyOffset: 0, fly: false, run: false, joy: [0, 0], lastG: 0, looked: false, saved: null, last: 0, info: 0, lockEnd: 0 };
+// worker (walkGrid): it keeps the eye 1.6 m above the ground (smoothed), climbs rises of up to 60 cm (rocks, kerbs, the
+// house platform), stops only at solid, tall things (walls, house, fence, trunks) and at the edge of the scanned area,
+// and just slows you in sparse foliage. Hold Space to rise over things and land on the highest surface under you
+// (a roof or wall top). Fly ignores all of that. If every way is blocked you can still push out slowly.
+const EYE = 1.6, WALK_SPEED = 1.4, RUN_SPEED = 4, STEP_UP = 0.6, MAX_DROP = 1.0, BODY_R = 0.2, SLOW = 0.5;
+const walk = { yaw: 0, pitch: 0, pos: new THREE.Vector3(), flyOffset: 0, fly: false, run: false, hover: false, climbY: 0, onTop: false, joy: [0, 0], lastG: 0, looked: false, saved: null, last: 0, info: 0, lockEnd: 0 };
 const keys = new Set();
 let walkData = null, lookPtr = null, miniMap = null;
 const updateBodyClasses = () => { document.body.classList.toggle("touch", matchMedia("(pointer: coarse)").matches); document.body.classList.toggle("small", innerWidth <= 600); };
@@ -1719,24 +1725,52 @@ function walkCell(x, z) {  // grid index of the cell under world (x, z), or -1 o
   const G = walkData.grid, c = Math.floor((x - G.west) / G.cell), r = Math.floor((G.north + z) / G.cell);
   return r < 0 || c < 0 || r >= G.nr || c >= G.nc ? -1 : r * G.nc + c;
 }
-function groundHeight(x, z) { const k = walkCell(x, z); return k < 0 ? NaN : walkData.grid.a[k]; }
-function walkable(x, z, g0, r = BODY_R) {  // can the body (a small circle) stand at (x, z), given the ground height g0 it came from?
-  for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
-    const k = walkCell(x + dx, z + dz), h = k < 0 ? NaN : walkData.grid.a[k];
-    if (h !== h || walkData.blocked[k] || h - g0 > STEP_UP || g0 - h > MAX_DROP) return false;
-  }
-  return true;
+function cellHeight(k) {  // what you stand on in that cell: the ground, or (after climbing) the highest solid surface there
+  const g = walkData.grid.a[k];
+  if (!walk.onTop) return g;
+  const t = walkData.top[k];
+  return t === t && !(t < g) ? t : g;
 }
-function findSpawn(x0, z0) {  // the nearest free cell to a spot (all five body samples fine)
+function groundHeight(x, z) { const k = walkCell(x, z); return k < 0 ? NaN : cellHeight(k); }
+function walkable(x, z, g0, r = BODY_R) {  // 0: the body (a small circle) can't stand at (x, z); else the speed factor there
+  let f = 1;
+  for (const [dx, dz] of [[0, 0], [r, 0], [-r, 0], [0, r], [0, -r]]) {
+    const k = walkCell(x + dx, z + dz);
+    if (k < 0) return 0;
+    const h = cellHeight(k);
+    if (h !== h || h - g0 > STEP_UP || g0 - h > MAX_DROP) return 0;
+    if (!walk.onTop) { const b = walkData.blocked[k]; if (b === 2) return 0; if (b === 1) f = SLOW; }  // on a roof, what is below doesn't matter
+  }
+  return f;
+}
+function findSpawn(x0, z0) {  // the nearest clear cell to a spot (all five body samples fine, nothing in the way)
   const G = walkData.grid;
   let best = null, bd = Infinity;
   for (let r = 0; r < G.nr; r++) for (let c = 0; c < G.nc; c++) {
     const k = r * G.nc + c, h = G.a[k];
     if (h !== h || walkData.blocked[k]) continue;
     const x = G.west + (c + 0.5) * G.cell, z = -(G.north - (r + 0.5) * G.cell), d = (x - x0) ** 2 + (z - z0) ** 2;
-    if (d < bd && walkable(x, z, h)) { bd = d; best = { x, z, h }; }
+    if (d < bd && walkable(x, z, h) === 1) { bd = d; best = { x, z, h }; }
   }
   return best;
+}
+function startSpot() {  // the model's fixed starting spot (snapped to clear ground), or null
+  const s = cloud.walkStart, spot = s && findSpawn(s.e, -s.n);
+  return spot && { ...spot, yaw: -s.heading * Math.PI / 180, pitch: 0 };
+}
+function walkToStart() {
+  const s = startSpot();
+  if (!s) return;
+  walk.pos.set(s.x, s.h + EYE, s.z);
+  Object.assign(walk, { yaw: s.yaw, pitch: s.pitch, lastG: s.h, fly: false, hover: false, climbY: 0, onTop: false, flyOffset: 0, looked: true });
+  $("wFly").setAttribute("aria-pressed", false);
+  invalidate();
+}
+function landClimb() {  // Space released: come down onto the highest solid surface under you (a roof, a wall top), not into it
+  walk.hover = false;
+  const k = walkCell(walk.pos.x, walk.pos.z);
+  if (k >= 0) { const t = walkData.top[k], g = walkData.grid.a[k]; walk.onTop = t === t && (g !== g || t > g + 0.4); }
+  walk.climbY = 0;
 }
 async function loadWalkData() {
   if (cloud.walkData) return cloud.walkData;
@@ -1744,14 +1778,15 @@ async function loadWalkData() {
   const src = pointSource(false), bb = cloud.geom.boundingBox;
   const r = await kernel("walk", { p: src.p, c: src.c, f: src.f, bounds: { minx: bb.min.x - 0.1, maxx: bb.max.x + 0.1, minz: bb.min.z - 0.1, maxz: bb.max.z + 0.1 } });
   $("loader").hidden = true;
-  return (cloud.walkData = { grid: r.grid, blocked: r.blocked });
+  window.__walkData = r;  // TEMP debug
+  return (cloud.walkData = { grid: r.grid, blocked: r.blocked, top: r.top });
 }
 function buildMiniMap() {  // the scanned ground as a small image: grey = walkable, dark red = blocked
   const G = walkData.grid, img = new ImageData(G.nc, G.nr), s = Math.min(160 / G.nc, 110 / G.nr);
   for (let k = 0; k < G.a.length; k++) {
     const h = G.a[k];
     if (h !== h) continue;
-    const v = walkData.blocked[k] ? [150, 60, 60] : [170, 175, 170];
+    const b = walkData.blocked[k], v = b === 2 ? [150, 60, 60] : b === 1 ? [190, 160, 110] : [170, 175, 170];  // red: solid, tan: slows you
     img.data.set([...v, 255], 4 * k);
   }
   const cvs = Object.assign(document.createElement("canvas"), { width: G.nc, height: G.nr });
@@ -1790,7 +1825,10 @@ async function enterWalk(fromLink = false) {
   setPlan(false);
   const saved = { target: nav.target.clone(), off: nav.off.clone(), fov: persp.fov, near: persp.near };
   let x, z, h, yaw, pitch;
-  if (fromLink) {  // the shared camera is the eye
+  walk.onTop = false;
+  const start = !fromLink && startSpot();
+  if (start) ({ x, z, h, yaw, pitch } = start);  // the model's fixed starting spot
+  else if (fromLink) {  // the shared camera is the eye
     const d = nav.target.clone().sub(camera.position).normalize();
     x = camera.position.x; z = camera.position.z; h = groundHeight(x, z); yaw = Math.atan2(-d.x, -d.z); pitch = Math.asin(d.y);
     if (h !== h) h = camera.position.y - EYE;
@@ -1801,7 +1839,8 @@ async function enterWalk(fromLink = false) {
     yaw = Math.hypot(f.x, f.z) > 0.05 ? Math.atan2(-f.x, -f.z) : 0;
     pitch = clamp(Math.asin(f.y), -0.4, 0.4);
   }
-  Object.assign(walk, { yaw, pitch, saved, fly: false, run: false, flyOffset: 0, joy: [0, 0], lastG: h, looked: true, last: 0 });
+  Object.assign(walk, { yaw, pitch, saved, fly: false, run: false, hover: false, climbY: 0, flyOffset: 0, joy: [0, 0], lastG: h, looked: true, last: 0 });
+  $("wStart").hidden = !cloud.walkStart;
   walk.pos.set(x, fromLink ? camera.position.y : h + EYE, z);
   walking = true;
   anim = null;
@@ -1838,7 +1877,7 @@ function showWalkHint() {
   let seen = false;
   try { seen = localStorage.getItem("walkHint") === "1"; localStorage.setItem("walkHint", "1"); } catch {}
   el.hidden = seen;
-  el.innerHTML = "<b>Walk mode.</b> Click the view to capture the mouse and look around. <b>W A S D</b> or the arrows move, <b>Shift</b> runs, <b>V</b> flies (Space / C or Q / E go up and down). <b>Esc</b> lets the mouse go, <b>Esc</b> again leaves. Trackpad: swipe to look. Phone: the joystick moves you, drag anywhere else to look. <i>(click to dismiss)</i>";
+  el.innerHTML = "<b>Walk mode.</b> Click the view to capture the mouse and look around. <b>W A S D</b> or the arrows move, <b>Shift</b> runs, hold <b>Space</b> to climb over things (let go to land on the highest surface under you), <b>V</b> flies. <b>Spot</b> copies where you stand. <b>Esc</b> lets the mouse go, <b>Esc</b> again leaves. Trackpad: swipe to look. Phone: the joystick moves you, drag anywhere else to look. <i>(click to dismiss)</i>";
   clearTimeout(showWalkHint.t);
   showWalkHint.t = setTimeout(() => { el.hidden = true; }, 12000);
 }
@@ -1856,17 +1895,26 @@ function updateWalk(now) {  // every frame while walking
   const g0 = groundHeight(p.x, p.z), here = g0 === g0 ? g0 : walk.lastG;
   if (fwd || str) {
     const sy = Math.sin(walk.yaw), cy = Math.cos(walk.yaw), step = (run ? RUN_SPEED : WALK_SPEED) * (walk.fly ? 1.5 : 1) * dt;
-    const dx = (-sy * fwd + cy * str) * step, dz = (-cy * fwd - sy * str) * step;
-    if (walk.fly) { p.x += dx; p.z += dz; changed = true; }
+    let dx = (-sy * fwd + cy * str) * step, dz = (-cy * fwd - sy * str) * step;
+    if (walk.fly || walk.hover) { p.x += dx; p.z += dz; changed = true; }  // flying / climbing: nothing is in the way
     else {  // each axis on its own, so you slide along a wall instead of sticking to it
-      const r = walkable(p.x, p.z, here) ? BODY_R : 0;  // squeezed into a tight spot (e.g. after flying): test only the centre, so you can get out
-      if (dx && walkable(p.x + dx, p.z, here, r)) { p.x += dx; changed = true; }
-      if (dz && walkable(p.x, p.z + dz, here, r)) { p.z += dz; changed = true; }
+      const r = walkable(p.x, p.z, here) ? BODY_R : 0, slow = walkable(p.x, p.z, here, 0) || 1;  // squeezed into a tight spot: test only the centre, so you can get out
+      dx *= slow; dz *= slow;
+      let moved = false;
+      for (const [ax, d] of [["x", dx], ["z", dz]]) {
+        if (!d) continue;
+        const f = ax === "x" ? walkable(p.x + d, p.z, here, r) : walkable(p.x, p.z + d, here, r);
+        if (f) { p[ax] += d * f; moved = changed = true; }
+      }
+      if (!moved && !Array.from({ length: 8 }, (_, i) => walkable(p.x + 0.35 * Math.cos(i * Math.PI / 4), p.z + 0.35 * Math.sin(i * Math.PI / 4), here, 0)).some(Boolean)) {
+        p.x += dx * SLOW; p.z += dz * SLOW; changed = true;  // every way is blocked: never trap the player, push on slowly
+      }
     }
   }
   if (walk.fly) walk.flyOffset = Math.max(-1.2, walk.flyOffset + ((key("Space", "KeyQ") ? 1 : 0) - (key("KeyC", "KeyE") ? 1 : 0)) * 2.5 * dt);
+  if (walk.hover) walk.climbY = Math.min(14, walk.climbY + 2.5 * dt);  // Space held: rise over whatever is there
   if (g0 === g0) walk.lastG = g0;
-  const target = walk.lastG + EYE + (walk.fly ? walk.flyOffset : 0), dy = (target - p.y) * (1 - Math.exp(-dt * 10));
+  const target = walk.lastG + EYE + (walk.fly ? walk.flyOffset : 0) + (walk.hover ? walk.climbY : 0), dy = (target - p.y) * (1 - Math.exp(-dt * (target > p.y ? 8 : 12)));  // eased: steps and landings glide
   if (Math.abs(target - p.y) > 1e-4) { p.y += dy; changed = true; }
   if (changed) {
     const cp = Math.cos(walk.pitch), f = new THREE.Vector3(-Math.sin(walk.yaw) * cp, Math.sin(walk.pitch), -Math.cos(walk.yaw) * cp);
@@ -1888,12 +1936,13 @@ function walkKeyDown(e) {
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return;
   if (e.code === "KeyG") return leaveWalk();
-  if (e.code === "KeyV") { walk.fly = !walk.fly; walk.flyOffset = 0; $("wFly").setAttribute("aria-pressed", walk.fly); return; }
+  if (e.code === "KeyV") { walk.fly = !walk.fly; walk.flyOffset = 0; walk.onTop = walk.hover = false; walk.climbY = 0; $("wFly").setAttribute("aria-pressed", walk.fly); return; }
   if (e.key === "?") return $("bHelp").onclick();
+  if (e.code === "Space" && !walk.fly && !keys.has("Space")) { walk.hover = true; walk.onTop = false; }  // climb while held
   if (/^(Key[WASDQEC]|Arrow(Up|Down|Left|Right)|Shift(Left|Right)|Space)$/.test(e.code)) { keys.add(e.code); e.preventDefault(); }
 }
-addEventListener("keyup", (e) => keys.delete(e.code));
-addEventListener("blur", () => keys.clear());
+addEventListener("keyup", (e) => { keys.delete(e.code); if (walking && e.code === "Space" && walk.hover) landClimb(); });
+addEventListener("blur", () => { keys.clear(); if (walking && walk.hover) landClimb(); });
 document.addEventListener("pointerlockchange", () => {
   if (!document.pointerLockElement) { walk.lockEnd = performance.now(); if (walking) toast("Mouse released: click the view to capture it again, Esc to leave", 2500); }
 });
@@ -1932,6 +1981,13 @@ joy.addEventListener("pointermove", (e) => { if (e.pointerId === joyId) joyMove(
 for (const t of ["pointerup", "pointercancel"]) joy.addEventListener(t, (e) => { if (e.pointerId === joyId) { joyId = null; walk.joy = [0, 0]; knob.style.transform = ""; } });
 $("bWalk").onclick = () => (walking ? leaveWalk() : enterWalk());
 $("wLeave").onclick = leaveWalk;
+$("wStart").onclick = walkToStart;
+$("wCopy").onclick = async () => {  // "E,N,heading" in the readout's convention, rounded to 0.1 m and 1 degree
+  const spot = `${walk.pos.x.toFixed(1)},${(-walk.pos.z).toFixed(1)},${Math.round(((-walk.yaw * 180 / Math.PI) % 360 + 360) % 360) % 360}`;
+  try { await navigator.clipboard.writeText(spot); toast(`Copied ${spot} (E, N, heading)`); } catch { toast(`Your spot: ${spot} (E, N, heading)`, 8000); }
+};
+$("wClimb").addEventListener("pointerdown", (e) => { e.preventDefault(); if (!walk.fly) { walk.hover = true; walk.onTop = false; keys.add("Space"); } });  // hold: rise; release: land
+for (const t of ["pointerup", "pointercancel", "pointerleave"]) $("wClimb").addEventListener(t, () => { keys.delete("Space"); if (walking && walk.hover) landClimb(); });
 $("wFly").onclick = () => { walk.fly = !walk.fly; walk.flyOffset = 0; $("wFly").setAttribute("aria-pressed", walk.fly); };
 $("wRun").onclick = () => { walk.run = !walk.run; $("wRun").setAttribute("aria-pressed", walk.run); };
 
@@ -2466,17 +2522,39 @@ function classify(m) {
   return out;
 }
 
-// Walk mode: the cleaned ground grid (10 cm cells) plus a flag for every cell that has something at body height
-// (0.5-1.8 m above the ground: walls, trunks, furniture, dense plants), found by counting points there.
+// Walk mode: the cleaned ground grid (10 cm cells) plus what stands above it, from 20 cm height bins of the points:
+//   blocked = 2: a solid obstacle (wall, house, fence, trunk): dense points over more than ~1.2 m of height above the
+//               ground, in a cluster of at least three cells, so speckle and single branches never count;
+//   blocked = 1: something you can push through slowly (sparse foliage, bushes, low objects);
+//   top: the highest dense surface in the cell (a roof or wall top you can climb onto).
 function walkGrid({ p, c, f, bounds }) {
-  const g = buildTerrain({ p, c, f, bounds, region: null, cell: 0.1, auto: false, px: 0.03, photo: false }).grid, count = new Uint8Array(g.nr * g.nc);
+  const g = buildTerrain({ p, c, f, bounds, region: null, cell: 0.1, auto: false, px: 0.03, photo: false }).grid, n = g.nr * g.nc;
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 1; i < p.length; i += 3) { if (p[i] < lo) lo = p[i]; if (p[i] > hi) hi = p[i]; }
+  const B = Math.min(64, Math.ceil((hi - lo) / 0.2) + 1), hist = new Uint8Array(n * B);
   for (let i = 0; i < p.length; i += 3) {
-    const col = Math.floor((p[i] - g.west) / g.cell), row = Math.floor((g.north + p[i + 2]) / g.cell);
-    if (row < 0 || col < 0 || row >= g.nr || col >= g.nc) continue;
-    const k = row * g.nc + col, dz = p[i + 1] - g.a[k];
-    if (dz > 0.5 && dz < 1.8 && count[k] < 255) count[k]++;
+    const col = Math.floor((p[i] - g.west) / g.cell), row = Math.floor((g.north + p[i + 2]) / g.cell), bin = Math.floor((p[i + 1] - lo) / 0.2);
+    if (row < 0 || col < 0 || row >= g.nr || col >= g.nc || bin >= B) continue;
+    const j = (row * g.nc + col) * B + bin;
+    if (hist[j] < 255) hist[j]++;
   }
-  return { grid: g, blocked: Uint8Array.from(count, (n) => (n >= 3 ? 1 : 0)) };
+  const blocked = new Uint8Array(n), solid = new Uint8Array(n), top = new Float32Array(n).fill(NaN);
+  for (let k = 0; k < n; k++) {
+    for (let b = B - 1; b >= 0; b--) if (hist[k * B + b] >= 3) { top[k] = lo + (b + 0.5) * 0.2; break; }
+    if (g.a[k] !== g.a[k]) continue;
+    const b0 = Math.max(0, Math.ceil((g.a[k] + 0.4 - lo) / 0.2));  // from 40 cm above the ground, eight bins = up to 2 m
+    let occ = 0, tot = 0;
+    for (let b = b0; b < Math.min(B, b0 + 8); b++) { const v = hist[k * B + b]; tot += v; if (v >= 2) occ++; }
+    if (occ >= 6 && tot >= 24) solid[k] = 1; else if (occ >= 2 && tot >= 4) blocked[k] = 1;
+  }
+  for (let r = 0; r < g.nr; r++) for (let q = 0; q < g.nc; q++) {
+    const k = r * g.nc + q;
+    if (!solid[k]) continue;
+    let near = 0;
+    for (const [dr, dc] of D8) { const rr = r + dr, cc = q + dc; if (rr >= 0 && cc >= 0 && rr < g.nr && cc < g.nc && solid[rr * g.nc + cc]) near++; }
+    blocked[k] = near >= 2 ? 2 : 1;
+  }
+  return { grid: g, blocked, top };
 }
 function pointInPoly(x, z, poly) {  // even-odd rule, poly [[x, z], ...]
   let inside = false;
@@ -2824,7 +2902,7 @@ function updateSelBox() {  // called from render()
 }
 
 async function start() {
-  const index = await fetch("models/index.json").then((r) => (r.ok ? r.json() : null)).catch(() => null);
+  const index = await fetch("models/index.json", { cache: "no-cache" }).then((r) => (r.ok ? r.json() : null)).catch(() => null);
   if (!Array.isArray(index) || !index.length) {  // pipeline folder: points.ply, plus mesh.ply if present
     const hasMesh = await fetch("mesh.ply", { method: "HEAD" }).then((r) => r.ok).catch(() => false);
     return open("points.ply", (p) => fetchBuffer("points.ply", 0, p), { meshUrl: hasMesh ? "mesh.ply" : null });
@@ -2835,7 +2913,7 @@ async function start() {
     $("splatRow").hidden = !m.splat;  // splat.html is its own page: Spark needs a newer three than this viewer
     if (m.splat) $("splatLink").href = `models/${m.name}/splat.html`;
     open(m.title, (p) => fetchBuffer(`models/${m.name}/points.ply`, m.bytes, p),
-      { ...(m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {}), sunLoc: m.sun_location,
+      { ...(m.mesh ? { meshUrl: `models/${m.name}/mesh.ply`, meshBytes: m.mesh_bytes } : {}), sunLoc: m.sun_location, walkStart: m.walk_start,
         ...(m.photo ? { photoUrl: `models/${m.name}/photo.glb`, photoBytes: m.photo_bytes, ...(m.photo_mobile_bytes ? { photoMobileUrl: `models/${m.name}/photo_mobile.glb`, photoMobileBytes: m.photo_mobile_bytes } : {}) } : {}),
         ...(m.points_full ? { fullPointsUrl: `models/${m.name}/points_full.ply`, fullPointsBytes: m.points_full_bytes, fullPointsCount: m.points_full_count } : {}),
         ...(m.mesh_full ? { fullMeshUrl: `models/${m.name}/mesh_full.ply`, fullMeshBytes: m.mesh_full_bytes } : {}) });

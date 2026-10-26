@@ -106,6 +106,8 @@ ap.add_argument("--max-full-points", type=int, default=5_900_000, help="points_f
 ap.add_argument("--max-full-faces", type=int, default=4_000_000, help="mesh_full.ply is decimated only above this")
 ap.add_argument("--no-full", action="store_true", help="skip the full-resolution sources")
 ap.add_argument("--utc", type=float, help="the site's UTC offset in hours for the viewer's sun (e.g. -3 for Uruguay)")
+ap.add_argument("--walk-start", metavar="E,N,HEADING", help="where Walk mode starts: metres in the published frame as the walk readout shows "
+                "(E ... N ...) and the heading in degrees as in 'facing ...'; kept on re-publish when omitted")
 ap.add_argument("--site", default=str(HERE.parent / "site"))
 a = ap.parse_args()
 FULL_LIMIT = 90_000_000  # bytes per file, GitHub rejects 100 MB
@@ -185,6 +187,13 @@ if splat.exists() and splat.stat().st_size <= FULL_LIMIT:
 
 index_path = site / "models" / "index.json"
 index = json.loads(index_path.read_text()) if index_path.exists() else []
+old = next((m for m in index if m["name"] == a.name), {})
+if a.walk_start:
+    e, n, heading = (float(v) for v in a.walk_start.split(","))
+    entry["walk_start"] = {"e": e, "n": n, "heading": heading}
+for key in ("walk_start", "splat", "splat_bytes"):  # set by other steps: don't lose them when the model is re-published
+    if key not in entry and key in old:
+        entry[key] = old[key]
 index = [m for m in index if m["name"] != a.name] + [entry]
 index_path.write_text(json.dumps(index, indent=1) + "\n")
 shutil.copy(HERE / "viewer.html", site / "index.html")

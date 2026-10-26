@@ -48,6 +48,8 @@ def colmap_pose(T):
 
 
 def thin(pcd, max_points):
+    if len(pcd.points) > 8 * max_points:  # a merged cloud is tens of millions of points: don't voxel-copy all of it
+        pcd = pcd.random_down_sample(8 * max_points / len(pcd.points))
     voxel = 0.01
     while len(pcd.points) > max_points:
         voxel += 0.01
