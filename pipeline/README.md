@@ -56,7 +56,7 @@ Bad-tracking stretches (ARKit sliding, then relocalising) are cut out first and 
 uv run python publish.py ../out/<walk> <name> "<title>"   # thins to <=3M points into ../site/models/<name>/, updates the index
 ```
 
-Only `points.ply` (local frame, metres from the walk start) is published, never the georeferenced outputs. Commit `site/` and push; the Pages workflow deploys it. The published model is public.
+Only `points.ply` (local frame, metres from the walk start) is published, never the georeferenced outputs. Then run `./push_models.sh`: `site/models/` goes to the `site-models` branch as its only commit (replacing the previous one, so model versions don't pile up in history) and Pages redeploys. Viewer changes (`site/index.html`) are committed to `main` as usual. The published model is public.
 
 ## SketchUp
 

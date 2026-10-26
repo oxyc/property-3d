@@ -3,6 +3,9 @@ walks/
 out/
 data/
 
+# Published models live on the site-models branch (pipeline/push_models.sh)
+site/models/
+
 # Downloaded third-party binaries (e.g. splat trainer)
 tools/
 

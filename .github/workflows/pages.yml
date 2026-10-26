@@ -23,6 +23,12 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      # models live on their own single-commit branch (pipeline/push_models.sh), not in main's history
+      - uses: actions/checkout@v4
+        with:
+          ref: site-models
+          path: site/models
+      - run: rm -rf site/models/.git
       - uses: actions/upload-pages-artifact@v3
         with:
           path: site
