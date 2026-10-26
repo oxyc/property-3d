@@ -78,13 +78,18 @@ def write_mesh_ply(path, verts, cols, faces):
         f.write(frec.tobytes())
 
 
-def publish_mesh(src, dest, pcd, max_faces, min_cluster):
-    """Clean, decimate and colour src; write it to dest. Returns the face count."""
+def read_mesh(src, min_cluster):
+    """src without its clusters of fewer than min_cluster triangles."""
     mesh = o3d.io.read_triangle_mesh(str(src))
     cluster, sizes, _ = mesh.cluster_connected_triangles()
     cluster, sizes = np.asarray(cluster), np.asarray(sizes)
     mesh.remove_triangles_by_mask(sizes[cluster] < min_cluster)
     mesh.remove_unreferenced_vertices()
+    return mesh
+
+
+def publish_mesh(mesh, dest, pcd, max_faces):
+    """Decimate and colour mesh; write it to dest. Returns (the decimated mesh, its face count)."""
     if max_faces and len(mesh.triangles) > max_faces:
         mesh = mesh.simplify_quadric_decimation(max_faces)
     mesh.remove_degenerate_triangles()
@@ -92,7 +97,7 @@ def publish_mesh(src, dest, pcd, max_faces, min_cluster):
     verts = np.asarray(mesh.vertices)
     cols = colour_from_points(verts, np.asarray(pcd.points), np.asarray(pcd.colors))
     write_mesh_ply(dest, verts, cols, np.asarray(mesh.triangles))
-    return len(mesh.triangles)
+    return mesh, len(mesh.triangles)
 
 
 ap = argparse.ArgumentParser()
@@ -117,7 +122,9 @@ dest = site / "models" / a.name
 dest.mkdir(parents=True, exist_ok=True)
 
 raw = o3d.io.read_point_cloud(str(Path(a.out_dir) / "points.ply"))
-pcd = thin(raw, a.max_points)
+full = thin(raw, a.max_full_points)  # a merged cloud is tens of millions of points: thin it once, the published cloud from that
+del raw
+pcd = thin(full, a.max_points)
 write_ply(dest / "points.ply", np.asarray(pcd.points), np.asarray(pcd.colors))
 size = (dest / "points.ply").stat().st_size
 entry = {"name": a.name, "title": a.title, "points": len(pcd.points), "bytes": size}
@@ -135,14 +142,11 @@ if georef.exists():
 mesh_src = Path(a.out_dir) / "mesh.ply"
 for f in ("mesh.ply", "points_full.ply", "mesh_full.ply"):
     (dest / f).unlink(missing_ok=True)
-if mesh_src.exists():
-    faces = publish_mesh(mesh_src, dest / "mesh.ply", pcd, a.max_faces, a.min_cluster)
-    entry |= {"mesh": True, "mesh_bytes": (dest / "mesh.ply").stat().st_size}
-    print(f"mesh: {faces:,} faces, {entry['mesh_bytes'] / 1e6:.1f} MB")
+mesh = read_mesh(mesh_src, a.min_cluster) if mesh_src.exists() else None
 
 # Full-resolution sources for fine exports; the viewer fetches them only when asked for more detail than the defaults.
+# First, so that the default mesh is decimated from the full one instead of again from the (much larger) source.
 if not a.no_full:
-    full = thin(raw, a.max_full_points)
     if len(full.points) > len(pcd.points):
         write_ply(dest / "points_full.ply", np.asarray(full.points), np.asarray(full.colors))
         n = (dest / "points_full.ply").stat().st_size
@@ -152,8 +156,8 @@ if not a.no_full:
         else:
             entry |= {"points_full": True, "points_full_bytes": n, "points_full_count": len(full.points)}
             print(f"points_full: {len(full.points):,} points, {n / 1e6:.1f} MB")
-    if mesh_src.exists():
-        faces = publish_mesh(mesh_src, dest / "mesh_full.ply", full, a.max_full_faces, a.min_cluster)
+    if mesh is not None:
+        mesh, faces = publish_mesh(mesh, dest / "mesh_full.ply", full, a.max_full_faces)
         n = (dest / "mesh_full.ply").stat().st_size
         if n > FULL_LIMIT:
             (dest / "mesh_full.ply").unlink()
@@ -161,6 +165,10 @@ if not a.no_full:
         else:
             entry |= {"mesh_full": True, "mesh_full_bytes": n, "mesh_full_faces": faces}
             print(f"mesh_full: {faces:,} faces, {n / 1e6:.1f} MB")
+if mesh is not None:
+    _, faces = publish_mesh(mesh, dest / "mesh.ply", pcd, a.max_faces)
+    entry |= {"mesh": True, "mesh_bytes": (dest / "mesh.ply").stat().st_size}
+    print(f"mesh: {faces:,} faces, {entry['mesh_bytes'] / 1e6:.1f} MB")
 
 # Photo-textured mesh from texture.py (unlit GLB with an embedded JPEG atlas): a full and a smaller one for phones.
 for src_name, dst_name, key in (("model.glb", "photo.glb", "photo_bytes"), ("model_mobile.glb", "photo_mobile.glb", "photo_mobile_bytes")):
