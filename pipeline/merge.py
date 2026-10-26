@@ -1,6 +1,6 @@
 """Merge several walks into one model in the first walk's frame.
 
-usage: merge.py <out_dir> <walk_dir> [<walk_dir> ...] [--jobs 3] [--no-visual]
+usage: merge.py <out_dir> <walk_dir> [<walk_dir> ...] [--jobs 3] [--no-visual] [--cache DIR | --no-cache] [--stride 1]
 
 Bad tracking is cut out first (optimize.find_failures: ARKit sliding for seconds then relocalising, jumps too
 big to ramp, long tracking loss; each padded by a second). A walk with such stretches is split into its clean
@@ -40,6 +40,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))  # python -I drops the script dir from sys.path
 
+import cache  # noqa: E402
 import cores  # noqa: E402
 
 if __name__ == "__main__":
@@ -58,6 +59,7 @@ STRUCT_MIN = 0.15  # vertical extent per cell that counts as ground relief, not 
 SEARCH = 25.0  # translation search radius around the GPS guess (m): GPS placements of two walks can be 15 m apart
 VISUAL_REGISTER_MIN = 3  # visual registration of a piece needs this many constraints that agree on one placement
 VISUAL_REGISTER_RADIUS, VISUAL_REGISTER_PAIRS = 18.0, 1500  # m, keyframe pairs: GPS can put a piece 15 m off, so look that far
+RETRY_VISUAL_RADIUS = 8.0  # m: the search of a retried piece (second chance after the first pass) starts this close
 VISUAL_PAIR_RADIUS = 20.0  # m: pieces whose placed camera paths come closer than this get visual loops between them
 VISUAL_MAX_CORRECTION = 5.0  # m: a visual edge may not ask a fragment to move further than this from its placement
 YAW_RANGE, YAW_STEP = 20.0, 1.0  # degrees
@@ -235,11 +237,25 @@ def cloud_of(points, normals):
 def unit_job(args):
     """Worker: optimise one unit on its own, then build its fragments from the result. Returns (log lines, fragment
     data with each cloud as a (points, normals) pair: Open3D clouds cannot be pickled)."""
-    walk, out, frag_frames, ids, visual, jobs = args
+    walk, out, frag_frames, ids, visual, jobs, cache_dir = args
+    entry = None
+    if cache_dir:
+        code = [optimize, fuse, fragment_data]
+        if visual:
+            import visual as vis
+            cache.install(cache_dir)  # photo features and visual pair results are cached too (this runs in a worker process)
+            code.append(vis)
+        entry = cache.unit_dir(cache_dir, walk, ids, frag_frames, visual, cache.source(*code))
+        hit = cache.load_unit(entry, out)
+        if hit:
+            return hit[0] + ["(this unit came from the cache)"], hit[1]
     lines = []
     optimize.optimize(walk, out, frag_frames, log=lines.append, frame_ids=ids, visual=visual, jobs=jobs)
     d = fragment_data(walk, Path(out) / "poses.npz", frag_frames)
-    d["clouds"] = [(np.asarray(c.points), np.asarray(c.normals)) for c in d["clouds"]]
+    # float32 is what the cache stores and plenty for 5 cm fragments (8 um at 100 m); a cold run rounds the same way
+    d["clouds"] = [(np.asarray(c.points, np.float32), np.asarray(c.normals, np.float32)) for c in d["clouds"]]
+    if entry:
+        cache.store_unit(entry, out, lines, d)
     return lines, d
 
 
@@ -268,7 +284,7 @@ def continuity(k, anchored, units, data):
     return None
 
 
-def visual_register(k, registered, walks, own, G, jobs, log):
+def visual_register(k, registered, walks, own, G, jobs, log, radius=VISUAL_REGISTER_RADIUS):
     """Place unit k by photo features when ICP could not (too little structure to match, or further off than the search
     radius): visual constraints between k and every registered unit j each imply a placement of k's world in the
     reference frame (G_j @ H); the placement most of them agree on, if at least VISUAL_REGISTER_MIN do, wins. The first
@@ -283,7 +299,7 @@ def visual_register(k, registered, walks, own, G, jobs, log):
         for j in registered:
             cons, summ = visual.visual_loops(walks[j], walks[k], poses_a=own[j], poses_b=own[k], init=np.linalg.inv(G[j]) @ guess,
                                              max_pairs=VISUAL_REGISTER_PAIRS, workers=max(1, jobs), log=log,
-                                             radius=VISUAL_REGISTER_RADIUS, max_angle=90.0)  # GPS placements are metres off
+                                             radius=radius, max_angle=90.0)  # GPS placements are metres off
             if cons:
                 Gs += [G[j] @ H for H in visual.world_alignments(cons, visual.keyframes(walks[j], own[j]), kfs_k)]
                 inl += [c[6]["n_inliers"] for c in cons]
@@ -299,6 +315,7 @@ def visual_register(k, registered, walks, own, G, jobs, log):
     Gs = np.array(Gs)
     best, mask = optimize.agreeing(Gs, at)
     report["agreeing"] = int(mask.sum())
+    report["placements"] = [{"at_m": (g[:3, :3] @ at + g[:3, 3]).round(2).tolist(), "yaw_deg": round(float(np.degrees(yaw_of(g[:3, :3]))), 2)} for g in Gs]
     if mask.sum() < VISUAL_REGISTER_MIN:
         report["why"] = f"{len(Gs)} visual constraints but only {int(mask.sum())} agree on a placement (need {VISUAL_REGISTER_MIN})"
         return None, report
@@ -340,10 +357,13 @@ def split_inputs(walks, log):
     return units, plans
 
 
-def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visual=False):
+def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visual=False, cache_dir=None, stride=1):
     """visual: use photo-feature constraints (visual.py): to register a piece ICP could not place, and as loop edges in
-    the joint graph (optimize.py adds them within each walk too)."""
+    the joint graph (optimize.py adds them within each walk too). cache_dir: reuse / store what depends on one walk only
+    (see cache.py). stride: fuse every stride-th depth frame (see fuse.py)."""
     t0 = time.time()
+    if cache_dir and visual:
+        cache.install(cache_dir)
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     warnings = []
@@ -355,11 +375,14 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
 
     # every unit is optimised on its own and its fragments built: independent, so one worker process each
     each = max(1, jobs // min(jobs, n))  # Open3D / SIFT threads per worker: the workers share the jobs budget
-    done = cores.pmap(unit_job, [(u["walk"], out / f"walk{k}", frag_frames, u["ids"], visual, each) for k, u in enumerate(units)], jobs)
+    done = cores.pmap(unit_job, [(u["walk"], out / f"walk{k}", frag_frames, u["ids"], visual, each, cache_dir) for k, u in enumerate(units)], jobs)
+    from_cache = [k for k, (_, d) in enumerate(done) if d.pop("from_cache", False)]
     for k, (u, (lines, _)) in enumerate(zip(units, done)):
         log(f"walk {k}: optimising on its own" if not u["split"] else f"walk {k}: optimising {u['label']} on its own")
         for line in lines:
             log(f"  [{k}] {line}")
+    if cache_dir:
+        log(f"cache {cache_dir}: {len(from_cache)} of {n} units came from it ({time.time() - t0:.0f} s)")
     own = [out / f"walk{k}" / "poses.npz" for k in range(n)]
 
     fits = [georef.fit_translation(w, p) for w, p in zip(walks, own)]  # (E0, N0, dz, ...) per walk
@@ -468,8 +491,60 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
                 warnings.append(msg)
                 log("WARNING: " + msg)
 
+    # ---- second chance: the first pass registers in order, against what was registered so far. A piece that was placed
+    # by continuity / GPS or excluded then may overlap pieces registered after it: retry it against every piece that has
+    # real evidence (ICP, then photos), until nothing changes.
+    weak_methods = ("continuity_placement", "gps_fallback", "excluded")
+    changed, retries = True, {}
+    while changed:
+        changed = False
+        for k in range(1, n):
+            if reports[k]["method"] not in weak_methods:
+                continue
+            strong = [s for s in range(n) if reports[s]["method"] not in weak_methods]
+            log(f"retrying {units[k]['label'] if units[k]['split'] else f'walk {k}'} ({reports[k]['method']}) against {strong}")
+            ref_k = join([place(join(data[s]["clouds"]), G[s]) for s in strong])
+            src = join(data[k]["clouds"])
+            old = reports[k]
+            T, rep, name = None, {}, "GPS"
+            for name, tg in [("current placement", G[k][:3, 3].copy()), ("GPS", gps_t[k])]:
+                T, rep = register_walk(src, ref_k, tg, log)
+                if T is not None:
+                    break
+            if T is not None:
+                new = {"method": "registered", "initial_guess": name, **rep}
+            elif visual:
+                # the piece already sits near where it belongs (continuity), so first look close by, where the pairs are
+                # dense enough to be all tried; then as wide as for a piece with only a GPS guess
+                for radius in (RETRY_VISUAL_RADIUS, VISUAL_REGISTER_RADIUS):
+                    Gk, vrep = visual_register(k, strong, walks, own, G, jobs, lambda s, k=k: log(f"  [{k}] {s}"), radius=radius)
+                    if Gk is not None:
+                        T, new = Gk, {"method": "visual", "visual": vrep}
+                        break
+                    log(f"  retry by photos within {radius:.0f} m failed: {vrep['why']}" + (f"; placements {vrep['placements']}" if "placements" in vrep else ""))
+                    retries.setdefault(k, []).append({"radius_m": radius, **vrep})
+            if T is None:
+                if k in retries:
+                    reports[k]["retries"] = retries[k]
+                continue
+            for m in old.get("warnings", []):
+                if m in warnings:
+                    warnings.remove(m)
+            G[k] = T
+            new["retried_after"] = old["method"]
+            reports[k] = new
+            excluded.discard(k)
+            anchored.add(k)
+            if k not in registered:
+                registered.append(k)
+            changed = True
+            log(f"  {units[k]['label']} now placed by {new['method']} (was {old['method']})")
+            for j in range(1, n):  # pieces placed in this one's frame by continuity follow it
+                if reports[j]["method"] == "continuity_placement" and reports[j]["sibling"] == k:
+                    G[j] = G[k].copy()
+
     # ---- joint pose graph over the registered walks' fragments
-    nodes = [(k, f) for k in registered for f in range(len(data[k]["clouds"]))]
+    nodes =[(k, f) for k in registered for f in range(len(data[k]["clouds"]))]
     node_of = {kf: i for i, kf in enumerate(nodes)}
     placed = [place(data[k]["clouds"][f], G[k]) for k, f in nodes]
     pyrs = [optimize.pyramid(p) for p in placed]
@@ -628,14 +703,15 @@ def merge(out, walks, frag_frames=optimize.FRAG_FRAMES, log=print, jobs=1, visua
                 "max_yaw_deg": float(max(abs(np.degrees(yaw_of((np.linalg.inv(G[k]) @ c)[:3, :3]))) for c in C[k]))}})
 
     stats = {"frame": "walk 0's ARKit frame; transforms map each walk's own frame into it (yaw about +Y, then translation)",
-             "visual": visual, "visual_graph": visual_graph, "pieces_tied_weakly_to_the_reference": tied, "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
+             "cache": {"dir": str(cache_dir) if cache_dir else None, "units_from_cache": from_cache},
+             "fuse_stride": stride, "visual": visual, "visual_graph": visual_graph, "pieces_tied_weakly_to_the_reference": tied, "input_walks": plans, "walks": reports, "excluded": [units[k]["label"] for k in sorted(excluded)],
              "inter_walk_loops": loops, "rejected_loops": rejected, "candidates": len(candidates),
              "kept_loops": sum(lp["kept"] for lp in loops), "pruned_loops": sum(not lp["kept"] for lp in loops),
              "warnings": warnings}
     log(f"{stats['kept_loops']}/{len(loops)} inter-walk loops kept after pruning ({time.time() - t0:.0f} s)")
 
     used = [k for k in range(n) if k not in excluded]
-    fuse.fuse_many([(walks[k], merged[k]) for k in used], out, jobs=jobs)
+    fuse.fuse_many([(walks[k], merged[k]) for k in used], out, jobs=jobs, stride=stride)
     georef.georef(out, [walks[k] for k in used], [merged[k] for k in used])
     subprocess.run([sys.executable, "-I", str(HERE / "preview.py"), str(out)], check=True)
     shutil.copy(HERE / "viewer.html", out / "viewer.html")
@@ -650,8 +726,12 @@ if __name__ == "__main__":
     ap.add_argument("walk_dirs", nargs="+")
     ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores to use (default %(default)s)")
     ap.add_argument("--no-visual", action="store_true", help="no photo-feature constraints (registration fallback, loop edges)")
+    ap.add_argument("--cache", help="per-walk cache directory (default: cache/ next to out_dir)")
+    ap.add_argument("--no-cache", action="store_true", help="recompute everything, store nothing")
+    ap.add_argument("--stride", type=int, default=1, help="fuse every N-th depth frame (default %(default)s)")
     a = ap.parse_args()
-    s = merge(a.out_dir, a.walk_dirs, jobs=a.jobs, visual=not a.no_visual)
+    cache_dir = None if a.no_cache else Path(a.cache) if a.cache else Path(a.out_dir).resolve().parent / "cache"
+    s = merge(a.out_dir, a.walk_dirs, jobs=a.jobs, visual=not a.no_visual, cache_dir=cache_dir, stride=a.stride)
     print(f"\nDone: {a.out_dir}")
     for w in s["warnings"]:
         print("WARNING:", w, file=sys.stderr)

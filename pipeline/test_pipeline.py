@@ -14,6 +14,7 @@ import numpy as np
 import open3d as o3d
 
 sys.path.insert(0, str(Path(__file__).parent))  # not on sys.path when run with -I
+import cache
 import fuse
 import georef
 import merge
@@ -334,8 +335,12 @@ def test_visual_registration():
             (b / "frames.jsonl").write_text("".join(json.dumps(l) + "\n" for l in lines))
             for w, T in ((a, cams_a), (b, true_b)):  # the GPS sees the true positions (in A's frame); B's is 6 m east of the truth
                 gps_lines(w / "gps.jsonl", [t[:3, 3] for t in T], (0.0, 0.0) if w is a else (6.0, 0.0), rng)
-            stats = merge.merge(tmp / "m", [a, b], 8, log=quiet, visual=True)
+            stats = merge.merge(tmp / "m", [a, b], 8, log=quiet, visual=True, cache_dir=tmp / "cache")
             w = stats["walks"][1]
+            warm = merge.merge(tmp / "m2", [a, b], 8, log=quiet, visual=True, cache_dir=tmp / "cache")  # photo features and pairs cached
+            w2 = warm["walks"][1]
+            assert warm["cache"]["units_from_cache"] == [0, 1] and list((tmp / "cache" / "pairs").glob("*.pkl"))
+            assert w2["method"] == "visual" and np.allclose(w2["translation_m"], w["translation_m"], atol=1e-9) and w2["yaw_deg"] == w["yaw_deg"]
             v = w.get("visual", {})
             yaw, shift = w["yaw_deg"], np.array(w["translation_m"])
             c = np.mean([T[:3, 3] for T in cams_b], axis=0)  # compare where B's own centre lands
@@ -349,6 +354,35 @@ def test_visual_registration():
             assert abs(yaw - 6.0) < 0.5 and err < 0.15 and gps_err > 5.0
     finally:
         merge.register_walk = real_register
+        cache.uninstall()
+
+
+def test_cache():
+    """A re-merge with a warm per-walk cache gives the same result as the cold run and redoes only the walks that changed
+    (what depends on one walk is read back from disk: its optimised poses and fragments)."""
+    quiet = lambda *_: None  # noqa: E731
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        a, b = tmp / "a", tmp / "b"
+        synth.generate(a, 240, seed=0)
+        synth.generate(b, 240, seed=1, phase=2.0, yaw_deg=4.0)
+        cache_dir = tmp / "cache"
+        runs = {}
+        for name in ("cold", "warm"):
+            runs[name] = merge.merge(tmp / name, [a, b], 40, log=quiet, cache_dir=cache_dir)
+        assert runs["cold"]["cache"]["units_from_cache"] == [] and runs["warm"]["cache"]["units_from_cache"] == [0, 1]
+        for k in (0, 1):
+            own = [np.load(tmp / name / f"walk{k}" / "poses.npz")["T"] for name in ("cold", "warm")]
+            merged = [np.load(tmp / name / f"walk{k}" / "poses_merged.npz")["T"] for name in ("cold", "warm")]
+            assert np.array_equal(*own) and np.abs(merged[0] - merged[1]).max() < 1e-6
+        # touching walk b (any change to its files changes its hash) recomputes b only; a still comes from the cache
+        (b / "frames.jsonl").write_text((b / "frames.jsonl").read_text() + "\n")
+        runs["touched"] = merge.merge(tmp / "touched", [a, b], 40, log=quiet, cache_dir=cache_dir)
+        assert runs["touched"]["cache"]["units_from_cache"] == [0]
+        size = sum(f.stat().st_size for f in cache_dir.rglob("*") if f.is_file())
+        print(f"cache:  warm run gives the same poses (own: identical, merged: within 1e-6 m); units from cache cold/warm/touched "
+              f"{runs['cold']['cache']['units_from_cache']} / {runs['warm']['cache']['units_from_cache']} / {runs['touched']['cache']['units_from_cache']}; "
+              f"{runs['cold']['seconds']:.0f} s cold, {runs['warm']['seconds']:.0f} s warm, {runs['touched']['seconds']:.0f} s touched; cache {size / 1e6:.0f} MB")
 
 
 def test_jobs():
@@ -453,6 +487,6 @@ def test_consensus():
 
 
 if __name__ == "__main__":
-    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_visual_registration", "test_jobs", "test_consensus"]:  # optionally just some of them
+    for test in sys.argv[1:] or ["test_pipeline", "test_drift", "test_snap", "test_merge", "test_slide", "test_visual_registration", "test_cache", "test_jobs", "test_consensus"]:  # optionally just some of them
         globals()[test]()
     print("OK")

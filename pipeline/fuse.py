@@ -1,6 +1,6 @@
 """Fuse a walk (FORMAT.md) into a point cloud, a TSDF mesh and a ground height grid.
 
-usage: fuse.py <walk_dir> <out_dir> [--voxel 0.02] [--poses poses.npz] [--consensus] [--jobs 3]
+usage: fuse.py <walk_dir> <out_dir> [--voxel 0.02] [--poses poses.npz] [--consensus] [--jobs 3] [--stride 1]
 
 Outputs in out_dir (all in the ARKit world frame: X east, Y up, Z south, metres):
   points.ply   voxel-downsampled, outlier-filtered, coloured from the closest unoccluded RGB keyframe.
@@ -259,9 +259,9 @@ def save_preview(height, path):
     Image.fromarray(img).resize((img.shape[1] * 4, img.shape[0] * 4), Image.NEAREST).save(path)
 
 
-def fuse(walk, out, voxel=0.02, poses=None, consensus=False, jobs=1):
+def fuse(walk, out, voxel=0.02, poses=None, consensus=False, jobs=1, stride=1):
     """poses: optional poses.npz from optimize.py; its transforms replace the recorded ones."""
-    return fuse_many([(walk, poses)], out, voxel, consensus, jobs)
+    return fuse_many([(walk, poses)], out, voxel, consensus, jobs, stride)
 
 
 def load_frames(walk, poses):
@@ -278,9 +278,9 @@ def load_frames(walk, poses):
     return meta, frames
 
 
-def build_mesh(walks, out):
-    """TSDF mesh (depth only) of [(walk_dir, poses.npz or None)] -> out/mesh.ply. Returns (triangles, seconds).
-    Reads the walks from disk itself, so it can run in a separate process."""
+def build_mesh(walks, out, stride=1):
+    """TSDF mesh (depth only) of [(walk_dir, poses.npz or None)] -> out/mesh.ply, from every stride-th frame. Returns
+    (triangles, seconds). Reads the walks from disk itself, so it can run in a separate process."""
     t0 = time.perf_counter()
     tsdf = o3d.pipelines.integration.ScalableTSDFVolume(
         TSDF_VOXEL, 4 * TSDF_VOXEL, o3d.pipelines.integration.TSDFVolumeColorType.NoColor)
@@ -290,7 +290,7 @@ def build_mesh(walks, out):
         dw, dh = meta["depth_w"], meta["depth_h"]
         sx, sy = dw / meta["rgb_w"], dh / meta["rgb_h"]
         dummy_rgb = o3d.geometry.Image(np.zeros((dh, dw, 3), np.uint8))
-        for f in frames:
+        for f in frames[::stride]:
             if f["tracking"] != "normal":
                 continue
             depth, conf = read_depth(walk, meta, f["i"])
@@ -321,18 +321,19 @@ def reduce_cells(keys, sums, counts):
     return uk, s, np.bincount(inv, weights=counts, minlength=len(uk))
 
 
-def fuse_many(walks, out, voxel=0.02, consensus=False, jobs=1):
+def fuse_many(walks, out, voxel=0.02, consensus=False, jobs=1, stride=1):
     """walks: [(walk_dir, poses.npz or None)], all in one common world frame through their poses.
     Frame indices only need to be unique within a walk. consensus: drop points the other frames saw through
     (see consensus_filter). jobs > 1: the mesh is built in its own process while the points are fused, and the
-    colouring uses that many threads. Returns the consensus stats ({} if off)."""
+    colouring uses that many threads. stride: fuse (points and mesh) only every stride-th frame; colours still come
+    from all keyframes. Returns the consensus stats ({} if off)."""
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     specs = [(str(w), None if p is None else str(p)) for w, p in walks]
     mesh_job = None
     if jobs > 1:  # the TSDF mesh needs nothing from the points: build it in another process, meanwhile
         pool = multiprocessing.get_context("spawn").Pool(1)
-        mesh_job = pool.apply_async(build_mesh, (specs, str(out)))
+        mesh_job = pool.apply_async(build_mesh, (specs, str(out), stride))
     sources, voters, parts = [], [], []
     spent = {}  # seconds per stage, printed at the end
 
@@ -346,7 +347,8 @@ def fuse_many(walks, out, voxel=0.02, consensus=False, jobs=1):
         sources.append((walk, meta, [f for f in frames if f["rgb"]]))
         voters.append((walk, meta, [f for f in frames if f["tracking"] == "normal"]))
         pend = []
-        for n, f in enumerate(frames):
+        used = frames[::stride]
+        for n, f in enumerate(used):
             if f["tracking"] != "normal":
                 continue
             t = time.perf_counter()
@@ -354,7 +356,7 @@ def fuse_many(walks, out, voxel=0.02, consensus=False, jobs=1):
             t = lap("read depth", t)
             pend.append(unproject(depth, conf, f, meta))
             t = lap("unproject", t)
-            if len(pend) == CHUNK or n == len(frames) - 1:
+            if len(pend) == CHUNK or n == len(used) - 1:
                 parts.append(voxel_sums(np.vstack(pend), voxel))
                 pend = []
                 if sum(len(p[0]) for p in parts) >= max(2_000_000, 1.5 * len(parts[0][0])):  # fold geometrically: linear in all
@@ -393,7 +395,7 @@ def fuse_many(walks, out, voxel=0.02, consensus=False, jobs=1):
         pool.close()
         lap("wait for the mesh process", t)
     else:
-        triangles, mesh_seconds = build_mesh(specs, str(out))
+        triangles, mesh_seconds = build_mesh(specs, str(out), stride)
     spent["mesh (own process)" if mesh_job is not None else "mesh"] = mesh_seconds
     print(f"points: {n_before} -> {len(acc.points)} after outlier removal, {coloured:.0%} coloured; "
           f"mesh: {triangles} triangles; ground grid {height.shape[1]}x{height.shape[0]} cells")
@@ -409,5 +411,6 @@ if __name__ == "__main__":
     ap.add_argument("--poses", help="poses.npz from optimize.py")
     ap.add_argument("--consensus", action="store_true", help="experimental: drop points other frames saw straight through")
     ap.add_argument("--jobs", type=int, default=cores.DEFAULT_JOBS, help="cores to use (default %(default)s)")
+    ap.add_argument("--stride", type=int, default=1, help="fuse every N-th depth frame (default %(default)s)")
     a = ap.parse_args()
-    fuse(a.walk_dir, a.out_dir, a.voxel, a.poses, a.consensus, a.jobs)
+    fuse(a.walk_dir, a.out_dir, a.voxel, a.poses, a.consensus, a.jobs, a.stride)
