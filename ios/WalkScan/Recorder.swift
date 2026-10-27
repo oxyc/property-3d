@@ -481,6 +481,7 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
 
         // Return-to-start prompts, motion.jsonl buffer, marker sightings
         var loop = LoopMonitor()
+        var homeSince: Double?  // past the time limit and back at the start since then
         var motionBuf = Data()
         var markerLastLogged: [String: Double] = [:]
         var markerLastSeen: [String: Double] = [:]
@@ -875,8 +876,15 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         // Back at the start mark: tell the pipeline (loops.jsonl, not events.jsonl: this is good, not bad, tracking).
         if w.loop.update(t: now - w.startUptime, pos: w.pos) {
             w.logLine(["t": ((now - w.startUptime) * 1000).rounded() / 1000, "kind": "start_revisit"], to: w.loopsFile)
-            // Past the time limit and back at the start: the walk is done (the loop is closed).
-            if now - w.startUptime >= LoopConfig.homeSeconds { return finish(w, reason: "back_at_start") }
+        }
+        // Past the time limit and back at the start: after a few seconds of looking around there (so the pipeline sees
+        // the start view again and can close the loop precisely), the walk is done.
+        if now - w.startUptime >= LoopConfig.homeSeconds, w.loop.start != nil,
+           w.loop.distanceToStart(from: w.pos) <= LoopConfig.revisitRadius {
+            if w.homeSince == nil { w.homeSince = now }
+            if now - w.homeSince! >= LoopConfig.homeDwellSeconds { return finish(w, reason: "back_at_start") }
+        } else {
+            w.homeSince = nil
         }
 
         if let t = w.target {

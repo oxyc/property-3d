@@ -75,8 +75,9 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 `end_reason` says how the walk ended:
 
 - `user`: Stop was pressed.
-- `back_at_start`: after 20 minutes the user walked back to within 1.5 m of the start pose, so the app ended
-  the walk with its loop closed (the last `start_revisit` in `loops.jsonl` is that moment).
+- `back_at_start`: after 20 minutes the user walked back to within 1.5 m of the start pose and stayed there,
+  looking around, for 5 s; the app then ended the walk. The last seconds re-observe the start view, for the
+  pipeline to close the loop on (the 1.5 m is only the app's "you are back" test, not the closure accuracy).
 - `low_space` (free space fell below 500 MB), `write_failed` (a file write failed), `thermal` (the phone
   reached the critical heat state; iOS would have paused the camera): the app closed the walk itself,
   cleanly, with `ended_at` and an exact `frame_count`; every frame listed in `frames.jsonl` has its files.

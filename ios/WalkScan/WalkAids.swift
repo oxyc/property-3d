@@ -131,6 +131,8 @@ enum LoopConfig {
     static let promptMetres: Float = 250
     /// After this long the walk should end: head back to the start mark (short walks drift less and stay within memory).
     static let homeSeconds = 20.0 * 60
+    /// ...and once back at the start, look around there this long before the walk ends.
+    static let homeDwellSeconds = 5.0
     /// Back within this distance of the start counts as a revisit...
     static let revisitRadius: Float = 1.5
     /// ...once the user has been at least this far away since the last one.

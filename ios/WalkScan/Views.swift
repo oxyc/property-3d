@@ -37,7 +37,9 @@ struct ContentView: View {
             VStack(spacing: 10) {
                 if rec.isRecording {
                     if homeTime {
-                        Text("\(Int(LoopConfig.homeSeconds / 60)) min: head back to the start mark and finish (\(Int(rec.loopDistance)) m)")
+                        Text(rec.loopDistance <= LoopConfig.revisitRadius
+                             ? "Back at the start: stay here and slowly look around it as you did at the start, the walk ends in a few seconds"
+                             : "\(Int(LoopConfig.homeSeconds / 60)) min: head back to the start mark and finish (\(Int(rec.loopDistance)) m)")
                             .font(.subheadline.bold())
                             .foregroundStyle(.white)
                             .frame(maxWidth: .infinity)
