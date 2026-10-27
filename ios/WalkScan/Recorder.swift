@@ -290,9 +290,11 @@ final class Recorder: ObservableObject {
         warnings = []
         trackingLost = false
         refreshFreeSpace()
-        haptics.notificationOccurred(.error)
+        haptics.notificationOccurred(reason == "back_at_start" ? .success : .error)
         let free = freeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) } ?? "little"
         switch reason {
+        case "back_at_start":
+            errorMessage = "Back at the start mark after \(Int(LoopConfig.homeSeconds / 60)) min: the walk is saved and closed. Send it to your Mac (and charge) before the next walk; start the next one on the same mark."
         case "thermal":
             errorMessage = "Recording stopped: the phone is critically hot and iOS was about to shut the camera down. The walk so far was saved and closed cleanly. Let the phone cool in the shade, then start a new walk (use Continue a site to carry on)."
         case "low_space":
@@ -873,6 +875,8 @@ final class Engine: NSObject, ARSessionDelegate, CLLocationManagerDelegate, @unc
         // Back at the start mark: tell the pipeline (loops.jsonl, not events.jsonl: this is good, not bad, tracking).
         if w.loop.update(t: now - w.startUptime, pos: w.pos) {
             w.logLine(["t": ((now - w.startUptime) * 1000).rounded() / 1000, "kind": "start_revisit"], to: w.loopsFile)
+            // Past the time limit and back at the start: the walk is done (the loop is closed).
+            if now - w.startUptime >= LoopConfig.homeSeconds { return finish(w, reason: "back_at_start") }
         }
 
         if let t = w.target {

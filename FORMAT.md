@@ -56,7 +56,7 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
   "device": "iPhone16,1",
   "started_at": "2026-10-19T15:00:00Z",   // ISO 8601 UTC
   "ended_at": "2026-10-19T15:45:00Z",      // null while recording, or if the app died and was never reopened
-  "end_reason": "user",                    // optional: "user" | "low_space" | "write_failed" | "thermal" | "interrupted"
+  "end_reason": "user",                    // optional: "user" | "back_at_start" | "low_space" | "write_failed" | "thermal" | "interrupted"
   "last_checkpoint": "2026-10-19T15:44:40Z", // optional: last 30 s metadata rewrite while recording
   "world_alignment": "gravityAndHeading",
   "depth_w": 256, "depth_h": 192,
@@ -75,6 +75,8 @@ ARKit session with `worldAlignment = .gravityAndHeading`:
 `end_reason` says how the walk ended:
 
 - `user`: Stop was pressed.
+- `back_at_start`: after 20 minutes the user walked back to within 1.5 m of the start pose, so the app ended
+  the walk with its loop closed (the last `start_revisit` in `loops.jsonl` is that moment).
 - `low_space` (free space fell below 500 MB), `write_failed` (a file write failed), `thermal` (the phone
   reached the critical heat state; iOS would have paused the camera): the app closed the walk itself,
   cleanly, with `ended_at` and an exact `frame_count`; every frame listed in `frames.jsonl` has its files.

@@ -29,13 +29,21 @@ struct ContentView: View {
             if rec.isRecording, rec.target != nil, !rec.targetOnScreen {
                 GuideArrow(angle: rec.targetAngle, distance: rec.targetDistance)
             }
-            if rec.isRecording, rec.loopPrompt {
-                GuideArrow(angle: rec.loopAngle, distance: rec.loopDistance, color: .blue)
+            let homeTime = rec.duration >= LoopConfig.homeSeconds
+            if rec.isRecording, rec.loopPrompt || homeTime {
+                GuideArrow(angle: rec.loopAngle, distance: rec.loopDistance, color: homeTime ? .orange : .blue)
             }
 
             VStack(spacing: 10) {
                 if rec.isRecording {
-                    if rec.loopPrompt {
+                    if homeTime {
+                        Text("\(Int(LoopConfig.homeSeconds / 60)) min: head back to the start mark and finish (\(Int(rec.loopDistance)) m)")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.white)
+                            .frame(maxWidth: .infinity)
+                            .padding(10)
+                            .background(Color.orange.opacity(0.9), in: RoundedRectangle(cornerRadius: 10))
+                    } else if rec.loopPrompt {
                         Text("Close the loop: walk back to the start mark (\(Int(rec.loopDistance)) m)")
                             .font(.subheadline.bold())
                             .foregroundStyle(.white)
