@@ -1,0 +1,52 @@
+[
+ {
+  "name": "garden",
+  "title": "Garden walk (8 min, iPhone 15 Pro LiDAR)",
+  "points": 1452096,
+  "bytes": 21781621,
+  "sun_location": {
+   "lat": -35.0,
+   "lon": -56.0,
+   "utc": -3.0
+  },
+  "mesh": true,
+  "mesh_bytes": 10550089,
+  "points_full": true,
+  "points_full_bytes": 45399871,
+  "points_full_count": 3026646,
+  "mesh_full": true,
+  "mesh_full_bytes": 50483501,
+  "mesh_full_faces": 2424130,
+  "photo": true,
+  "photo_bytes": 17851776,
+  "photo_mobile_bytes": 14364068,
+  "splat": true,
+  "splat_bytes": 23019264
+ },
+ {
+  "name": "plot",
+  "title": "Plot - 3 walks (work in progress)",
+  "points": 2022698,
+  "bytes": 30340651,
+  "sun_location": {
+   "lat": -35.0,
+   "lon": -55.0,
+   "utc": -3.0
+  },
+  "points_full": true,
+  "points_full_bytes": 81200566,
+  "points_full_count": 5413359,
+  "mesh_full": true,
+  "mesh_full_bytes": 84281666,
+  "mesh_full_faces": 4000000,
+  "mesh": true,
+  "mesh_bytes": 10449546,
+  "walk_start": {
+   "e": 24.47,
+   "n": -31.47,
+   "heading": 303.3
+  },
+  "splat": true,
+  "splat_bytes": 24812256
+ }
+]
